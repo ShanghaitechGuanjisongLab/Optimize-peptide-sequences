@@ -1,0 +1,796 @@
+"""
+蒙特卡洛优化小肽序列 — AlphaFold3 本地推理入口
+=============================================================
+与 optimize_peptide_AF3.py（官方服务器版）的区别：
+  - 结构预测在本集群 GPU 计算节点上运行（自动用 sbatch 提交作业）
+  - 复用本机已下载的 AlphaFold3 代码、模型权重与数据库（见下方路径）
+  - 无每日配额限制，无需 Google 账号，任务全部并行排队在集群上
+
+复用的部分（来自公共库 peptide_common）：
+  - 序列常量（SEQ_202 / HTR1A_SEQ / UNC13C_SEQ / BIN1_SEQ）
+  - generate_mutant() 突变规则、run_monte_carlo() 蒙特卡洛主循环（后端无关）
+  本文件提供本地集群推理的预测实现：生成 .sbatch → sbatch 提交 → 计算节点推理。
+
+工作目录约定：
+  af3_local_results/<任务名>/
+      input.json          ← AlphaFold3 输入（与服务器版相同格式）
+      af3_local.sbatch    ← 生成的作业脚本
+      slurm_<jobid>.out/err
+      <任务名>/           ← run_alphafold.py 的输出（*_summary_confidences.json 等）
+  完成的任务会打包为 af3_local_results/<任务名>.zip，供优化主循环读取评分与保存最佳结构。
+
+使用步骤：
+  1. 首次准备（一次性，大部分已自动处理）：
+     a) 推理环境: conda 环境 af3_old 已含 alphafold3 + jax
+        若缺 hmm 工具: conda install -n af3_old -c bioconda hmmer
+     b) 驱动依赖: 运行本脚本的环境需要 pandas / matplotlib / openpyxl
+        pip install pandas matplotlib openpyxl
+     c) 数据库: 共享目录中是压缩的 .zst 文件; 首次运行会自动提交一个
+        解压作业到计算节点异步执行，无需保持 SSH 连接，
+        解压完成后重跑本脚本即可继续。
+  2. 运行:
+        conda activate base      # 或任意装好驱动依赖的环境
+        python optimize_peptide_local.py
+     首次运行会为初始序列×3 个靶标提交推理作业；作业完成后重跑本脚本即可
+     自动评分并继续推进（支持断点续跑）。
+
+检查策略：入口的预检查只做提示、不会退出——即使资源尚未就绪也会照常
+运行流程：已完成的旧结果仍可被评分复用，新的提交失败会打印原因，
+补齐条件后重跑即可。
+
+数据库自动准备（异步在计算节点解压，无需保持 SSH 连接）:
+  预检查发现数据库缺失时:
+    1. 先读取各 .zst 帧头汇总预计解压体积，用 statvfs 检查目标盘剩余空间，
+       不足（低于预计体积×1.05）则中止并提示；
+    2. 通过后把解压作为 SLURM 作业提交到计算节点异步执行（--prepare-db 模式），
+       提交后即可断开 SSH；用 tail -f db_prep_<jobid>.out 查看进度，完成后重跑继续。
+  解压目标: /public_bme2/Share200T/v-jiamh_af3_databases/alphafold3
+  （家目录有 ~500G NFS 配额放不下, 用共享大容量目录, 计算节点可见）。
+  环境变量: SKIP_DB_PREPARE=1 跳过自动解压。
+
+合规提示：AlphaFold3 模型权重与输出受官方条款约束
+（见 /public/slst/home/v-jiamh/alphafold3/WEIGHTS_TERMS_OF_USE.md），
+仅限非商业学术用途。
+"""
+
+import os
+import sys
+import json
+import glob
+import shutil
+import zipfile
+import subprocess
+
+import numpy as np
+import random
+import time
+
+# ---- 驱动依赖检查（缺失时给出明确提示）----
+_missing = []
+for _m in ("pandas", "matplotlib", "openpyxl"):
+    try:
+        __import__(_m)
+    except ImportError:
+        _missing.append(_m)
+if _missing:
+    sys.exit(f"驱动环境缺少依赖: {_missing}，请先执行: pip install {' '.join(_missing)}")
+
+# 导入公共库（导入零副作用，不含任何预测后端逻辑）
+from peptide_common import create_af3_json, run_monte_carlo, ROOT_DIR
+
+# ===================== 本地模式配置区域 =====================
+
+AF3_CODE_DIR   = "/public/slst/home/v-jiamh/alphafold3"         # 本地 AF3 代码目录
+LOCAL_MODEL_DIR = os.path.expanduser("~/yhb")                    # 含 af3.bin 权重文件的目录
+
+# 数据库: 共享目录中是压缩的 .zst 文件（只读）; 预检查发现缺失时会先检查磁盘空间,
+# 再把解压作为作业提交到计算节点异步执行。
+# 注意: 家目录有 ~500G NFS 配额(不够放全量数据库), 必须放共享大容量目录。
+SHARED_DB_SRC = "/public_bme2/Share200T/AlphaFold3/DB_DIR/alphafold3"
+LOCAL_DB_DIR  = "/public_bme2/Share200T/v-jiamh_af3_databases/alphafold3"
+
+# AF3 的数据管线构造时会解析全部数据库路径, 即使纯蛋白体系也要求 RNA 库文件存在
+# （仅在含 RNA 链时真正参与搜索）, 因此下列文件均为必需。
+DB_FASTA_FILES = [
+    "uniref90_2022_05.fa",                       # 主 MSA 库 (UniRef90)
+    "bfd-first_non_consensus_sequences.fasta",   # 深度补充 MSA 库 (BFD)
+    "mgy_clusters_2022_05.fa",                   # 宏基因组补充库 (MGnify)
+    "uniprot_all_2021_04.fa",                    # 链间 MSA 配对 (UniProt全量)
+    "pdb_seqres_2022_09_28.fasta",               # 模板搜索序列索引 (PDB)
+    "nt_rna_2023_02_23_clust_seq_id_90_cov_80_rep_seq.fasta",     # RNA 库
+    "rfam_14_9_clust_seq_id_90_cov_80_rep_seq.fasta",             # RNA 库
+    "rnacentral_active_seq_id_90_cov_80_linclust.fasta",          # RNA 库
+]
+DB_MMCIF_ARCHIVE = "pdb_2022_09_28_mmcif_files.tar.zst"   # 解压为目录: <DB>/mmcif_files/
+
+LOCAL_RESULTS_DIR = "af3_local_results"     # 本地推理结果目录
+
+# SLURM 资源配置（每个"序列×靶标"为一个推理任务, 多任务打包进单个作业）
+LOCAL_PARTITION = "bme_gpupub"
+LOCAL_ACCOUNT   = "v-jiamh"                   # SLURM 账户（无此分区/账户组合会被拒）
+LOCAL_MEMORY    = "64G"
+LOCAL_CPUS      = 8
+LOCAL_TIME      = "48:00:00"                  # 单个作业最长时限（打包模式下含多个任务）
+
+# 集群每用户在途作业上限（实测 QOS=2）: 多任务打包进单作业以提高吞吐
+BUNDLE_SIZE     = 6                       # 单个作业串行处理的任务数（序列×靶标）
+MAX_INFLIGHT    = 2                       # 队列内在途作业数上限（超过则攒批等待）
+
+# hmm 工具（jackhmmer/nhmmer/hmmalign/hmmsearch/hmmbuild）所在目录；
+# 留空则依赖作业节点 PATH 中可直接找到
+LOCAL_HMMER_DIR = ""
+
+CONDA_ENV       = "af3_old"                 # 推理用 conda 环境（含 alphafold3+jax）
+
+FORCE_RESUBMIT  = os.environ.get("FORCE_RESUBMIT", "0") == "1"   # 强制重提交失败作业
+
+# =====================================================================
+
+
+# ---------------- 数据库自动解压 ----------------
+
+def zstd_content_size(path):
+    """从 zstd 帧头解析解压后体积（只读文件前 ≤18 字节, 瞬时完成）。
+    解析失败返回 None（帧头未记录内容大小时会发生）。"""
+    try:
+        with open(path, "rb") as f:
+            header = f.read(18)
+    except OSError:
+        return None
+    if len(header) < 5 or int.from_bytes(header[:4], "little") != 0xFD2FB528:
+        return None
+    fhd = header[4]
+    fcs_flag = fhd >> 6                    # Frame_Content_Size_Flag
+    single_segment = bool(fhd & 0x20)      # Single_Segment_Flag
+    dict_flag = fhd & 0x03                 # Dictionary_ID_Flag
+    pos = 5
+    if not single_segment:
+        pos += 1                           # Window_Descriptor (1 字节)
+    pos += {0: 0, 1: 1, 2: 2, 3: 4}[dict_flag]
+    if fcs_flag == 0:
+        if not single_segment:
+            return None
+        if len(header) < pos + 1:
+            return None
+        return header[pos]
+    widths = {1: 2, 2: 4, 3: 8}
+    w = widths[fcs_flag]
+    if len(header) < pos + w:
+        return None
+    value = int.from_bytes(header[pos:pos + w], "little")
+    return value + 256 if fcs_flag == 1 else value
+
+
+# PDB 2022-09 全量约 20 万个 .cif; 顶层铺开的 .cif 少于此数视为解压不完整
+MMCIF_MIN_CIFS = 100000
+
+
+def mmcif_ready():
+    """mmCIF 模板库就绪判定: 有完成标记, 或顶层已铺开足够 .cif
+    （仅看目录存在会把残缺解压误判为就绪）。"""
+    mmcif_dir = os.path.join(LOCAL_DB_DIR, "mmcif_files")
+    if not os.path.isdir(mmcif_dir):
+        return False
+    if os.path.isfile(os.path.join(LOCAL_DB_DIR, ".mmcif_done")):
+        return True
+    n = 0
+    try:
+        with os.scandir(mmcif_dir) as it:
+            for e in it:
+                if e.name.endswith(".cif"):
+                    n += 1
+                    if n >= MMCIF_MIN_CIFS:
+                        return True
+    except OSError:
+        return False
+    return False
+
+
+def database_ready():
+    """检查 LOCAL_DB_DIR 中所需数据库是否齐备。返回 (ok, missing)。"""
+    missing = [n for n in DB_FASTA_FILES
+               if not os.path.isfile(os.path.join(LOCAL_DB_DIR, n))]
+    if not mmcif_ready():
+        missing.append("mmcif_files/ (目录)")
+    return (not missing), missing
+
+
+def prepare_database():
+    """解压共享目录中的压缩数据库: 先检查磁盘空间, 不足则中止；
+    够用则逐项解压（中断后重跑自动续作, 不留半个文件）。返回是否全部就绪。
+    本函数在计算节点上由 '--prepare-db' 作业调用（见 submit_db_prep_job）。"""
+    os.makedirs(LOCAL_DB_DIR, exist_ok=True)
+
+    if not shutil.which("zstd"):
+        print("❌ 未找到 zstd 命令行工具, 无法解压数据库")
+        return database_ready()[0]
+
+    # ---- 收集缺失项及解压后体积 ----
+    todo = []   # (kind, src, dst, expected_bytes)
+    for name in DB_FASTA_FILES:
+        dst = os.path.join(LOCAL_DB_DIR, name)
+        if os.path.isfile(dst):
+            continue
+        src = os.path.join(SHARED_DB_SRC, name + ".zst")
+        if not os.path.isfile(src):
+            print(f"⚠️  共享目录缺少源文件: {src}")
+            continue
+        todo.append(("fasta", src, dst, zstd_content_size(src)))
+
+    mmcif_src = os.path.join(SHARED_DB_SRC, DB_MMCIF_ARCHIVE)
+    mmcif_dir = os.path.join(LOCAL_DB_DIR, "mmcif_files")
+    mmcif_marker = os.path.join(LOCAL_DB_DIR, ".mmcif_done")
+    if not mmcif_ready():
+        if os.path.isfile(mmcif_src):
+            size = zstd_content_size(mmcif_src)
+            if size is not None:
+                size = int(size * 1.10)   # 文件系统额外开销余量（小文件多）
+            todo.append(("mmcif", mmcif_src, mmcif_dir, size))
+        else:
+            print(f"⚠️  共享目录缺少 mmCIF 归档: {mmcif_src}")
+
+    if not todo:
+        return database_ready()[0]
+
+    # ---- 磁盘空间检查（解压前必须通过）----
+    unknown = [os.path.basename(t[1]) for t in todo if t[3] is None]
+    if unknown:
+        print(f"⚠️  无法从帧头读取体积, 未计入空间核算: {unknown}")
+    required = sum(t[3] for t in todo if t[3] is not None)
+    st = os.statvfs(LOCAL_DB_DIR)
+    avail = st.f_bavail * st.f_frsize
+    print(f"📦 数据库准备: 需解压 {len(todo)} 项, 预计占用 {required / 2**30:.0f} GB；"
+          f"目标盘当前可用 {avail / 2**30:.0f} GB ({LOCAL_DB_DIR})")
+    if avail < int(required * 1.05):
+        print(f"❌ 磁盘空间不足: 需要 ≥ {int(required * 1.05) / 2**30:.0f} GB, 中止解压。"
+              f"请把 LOCAL_DB_DIR 改到容量更大的目录后重试。")
+        return False
+
+    # ---- 逐项解压 ----
+    print("⏳ 开始解压（总体积较大, 可能耗时数小时）", flush=True)
+    for kind, src, dst, size in todo:
+        size_gb = f" ({size / 2**30:.1f} GB)" if size else ""
+        if kind == "fasta":
+            tmp = dst + ".partial"
+            print(f"   解压 {os.path.basename(src)}{size_gb} → {dst}", flush=True)
+            rc = subprocess.run(["zstd", "-d", "-f", "-T4", src, "-o", tmp]).returncode
+            if rc != 0 or not os.path.isfile(tmp):
+                print(f"   ❌ 解压失败: {os.path.basename(src)}")
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+                continue
+            os.replace(tmp, dst)   # 原子改名, 避免残留半个文件被误认为就绪
+        else:
+            os.makedirs(dst, exist_ok=True)
+            log_path = os.path.join(LOCAL_DB_DIR, ".mmcif_uncompress.log")
+            print(f"   解压 mmCIF 归档{size_gb} → {dst}/", flush=True)
+            try:
+                with open(log_path, "w") as logf:
+                    p1 = subprocess.Popen(["zstd", "-dc", src], stdout=subprocess.PIPE)
+                    p2 = subprocess.Popen(["tar", "-xf", "-", "-C", dst],
+                                          stdin=p1.stdout, stderr=logf)
+                    p1.stdout.close()
+                    rc = p2.wait()
+                    p1.wait()
+            except Exception as e:
+                print(f"   ❌ mmCIF 解压异常: {e}")
+                continue
+            if rc != 0 or p1.returncode != 0:
+                print(f"   ❌ mmCIF 解压失败（见 {log_path}）")
+                continue
+            with open(mmcif_marker, "w") as f:
+                f.write("done\n")
+        print(f"   ✅ 完成: {os.path.basename(src)}", flush=True)
+    return database_ready()[0]
+
+
+def db_prep_job_state():
+    """查询数据库解压作业状态。返回 (state, jobid)，
+    state ∈ none/pending/running/done/failed/unknown。"""
+    marker = os.path.join(LOCAL_DB_DIR, ".db_prep_submitted")
+    if not os.path.isfile(marker):
+        return "none", None
+    try:
+        with open(marker) as f:
+            jobid = f.read().strip().splitlines()[0].strip()
+    except OSError:
+        return "none", None
+    if not jobid:
+        return "none", None
+    # 先查 squeue（活动作业的权威来源, 无记账延迟）; 不在队列再用 sacct 查终态
+    try:
+        out = subprocess.run(["squeue", "-j", jobid, "-h", "-o", "%T"],
+                             capture_output=True, text=True, timeout=15)
+        q = out.stdout.strip().splitlines()
+        if q:
+            s = q[0].strip()
+            return ("running" if s == "RUNNING" else "pending"), jobid
+    except Exception:
+        pass
+    try:
+        out = subprocess.run(["sacct", "-j", jobid, "-n", "-P", "-o", "State"],
+                             capture_output=True, text=True, timeout=15)
+        states = [s.strip() for s in out.stdout.splitlines() if s.strip()]
+    except Exception:
+        return "unknown", jobid
+    if not states:
+        return "unknown", jobid
+    s = states[0]
+    if s == "RUNNING":
+        return "running", jobid
+    if s in ("PENDING", "CONFIGURING", "COMPLETING"):
+        return "pending", jobid
+    if s == "COMPLETED":
+        return "done", jobid
+    return "failed", jobid
+
+
+def follow_db_prep_job(jobid):
+    """实时跟踪解压作业进度直到结束（Ctrl+C 退出跟踪不影响作业运行）。
+    检测到解压作业在运行时应转入本函数的进度回报, 而不是继续后续步骤。"""
+    out_file = os.path.join(LOCAL_DB_DIR, f"db_prep_{jobid}.out")
+    print(f"\n⏳ 检测到解压作业正在运行 (jobid={jobid})，转入实时进度跟踪…")
+    print(f"   日志: {out_file}")
+    print("   （Ctrl+C 仅退出跟踪, 解压作业继续运行；完成后重跑本脚本继续）")
+    tail_proc = None
+    if os.path.isfile(out_file):
+        tail_proc = subprocess.Popen(["tail", "-f", "-n", "+1", out_file])
+    try:
+        while True:
+            state, _ = db_prep_job_state()
+            if state not in ("pending", "running"):
+                break
+            time.sleep(15)
+    except KeyboardInterrupt:
+        if tail_proc:
+            tail_proc.terminate()
+        print("\n👀 已停止进度跟踪, 解压作业仍在运行；完成后重跑本脚本继续。")
+        return
+    if tail_proc:
+        time.sleep(1)
+        tail_proc.terminate()
+    state, _ = db_prep_job_state()
+    ready, missing = database_ready()
+    print(f"\n{'✅ 解压作业完成' if state == 'done' and ready else '⚠️ 解压作业结束: ' + state}")
+    if not ready:
+        print(f"   仍缺: {missing}；排查日志: {out_file}")
+
+
+def submit_db_prep_job():
+    """把数据库解压作为 SLURM 作业提交到计算节点异步执行；
+    提交后即可断开 SSH，无需维持连接。返回正在执行/新提交的 jobid, 否则 None。"""
+    os.makedirs(LOCAL_DB_DIR, exist_ok=True)
+    marker = os.path.join(LOCAL_DB_DIR, ".db_prep_submitted")
+
+    state, jobid = db_prep_job_state()
+    if state in ("pending", "running"):
+        return jobid                      # 已在跑, 由调用方转入进度跟踪
+    if state in ("done", "failed", "unknown") and os.path.isfile(marker):
+        print(f"📦 上次解压作业已结束 ({state}, jobid={jobid})，清理陈旧标记后重新提交。")
+        os.remove(marker)
+
+    sbatch_path = os.path.join(LOCAL_DB_DIR, "db_prep.sbatch")
+    repo_dir = os.path.dirname(os.path.abspath(__file__))
+    sb = f"""#!/bin/bash
+#SBATCH --job-name=af3_db_prep
+#SBATCH --output={LOCAL_DB_DIR}/db_prep_%j.out
+#SBATCH --error={LOCAL_DB_DIR}/db_prep_%j.err
+#SBATCH --partition={LOCAL_PARTITION}
+#SBATCH --account={LOCAL_ACCOUNT}
+#SBATCH --nodes=1
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=16G
+#SBATCH --time=24:00:00
+
+date
+source ~/miniconda3/etc/profile.d/conda.sh
+conda activate base
+cd {repo_dir}
+python -u optimize_peptide_local.py --prepare-db
+rc=$?
+echo "数据库准备结束, 退出码: $rc"
+date
+exit $rc
+"""
+    with open(sbatch_path, "w") as f:
+        f.write(sb)
+    try:
+        out = subprocess.run(["sbatch", sbatch_path], capture_output=True, text=True, check=True)
+        jobid = out.stdout.strip().split()[-1]
+        with open(marker, "w") as f:
+            f.write(jobid + "\n")
+        print(f"🚀 数据库解压作业已提交到计算节点 (jobid={jobid})，提交后无需保持 SSH 连接。")
+        print(f"   进度查看: tail -f {LOCAL_DB_DIR}/db_prep_{jobid}.out")
+        print(f"   体积约 330+ GB, 预计数小时, 磁盘不足会自动中止。")
+        return jobid
+    except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        print(f"❌ 提交数据库解压作业失败: {e}")
+        return None
+
+
+# =====================================================================
+
+# 预检查状态: 未通过时 submit_local_job 会跳过提交，
+# 避免向队列投递注定失败的 GPU 作业
+PREFLIGHT_OK = False
+
+
+def preflight_check():
+    """启动前检查本地推理所需资源是否齐备。
+    只打印提示、绝不中断流程；返回 (ok, errors)，并把结果记入 PREFLIGHT_OK。"""
+    global PREFLIGHT_OK
+    errors = []
+
+    script = os.path.join(AF3_CODE_DIR, "run_alphafold.py")
+    if not os.path.isfile(script):
+        errors.append(f"AF3 代码不存在: {script}")
+
+    weights = os.path.join(LOCAL_MODEL_DIR, "af3.bin")
+    if not os.path.isfile(weights):
+        errors.append(f"模型权重不存在: {weights}")
+
+    # 数据库：要求解压后的文件（AF3 不接受 .zst）；缺失时把解压提交为
+    # 计算节点异步作业，无需在登录节点维持 SSH 连接，也不占用登录节点资源。
+    ready, missing_db = database_ready()
+    if not ready and os.environ.get("SKIP_DB_PREPARE") != "1":
+        submit_db_prep_job()
+        ready, missing_db = database_ready()
+    if not ready:
+        errors.append(
+            f"数据库缺少: {missing_db}\n"
+            f"   目录: {LOCAL_DB_DIR}\n"
+            f"   解压作业在计算节点运行中, 新的推理作业会跳过提交"
+        )
+
+    # hmm 工具检查（数据管线必需；推理用环境为 CONDA_ENV）
+    env_bin = os.path.expanduser(f"~/miniconda3/envs/{CONDA_ENV}/bin")
+    if not shutil.which("jackhmmer") and not os.path.isfile(os.path.join(env_bin, "jackhmmer")) \
+            and not LOCAL_HMMER_DIR:
+        errors.append(
+            f"未找到 jackhmmer（数据管线搜索 MSA 必需）\n"
+            f"   解决其一: conda install -n {CONDA_ENV} -c bioconda hmmer\n"
+            f"   或将现有目录写入 LOCAL_HMMER_DIR / 确保计算节点 PATH 可用"
+        )
+
+    if errors:
+        PREFLIGHT_OK = False
+        print("⚠️  本地推理预检查发现以下问题（不阻断运行，相关步骤可能失败）：")
+        for e in errors:
+            print("   -", e)
+        return False, errors
+
+    PREFLIGHT_OK = True
+    print("✅ 预检查通过（代码/权重/数据库）")
+    return True, []
+
+
+def ensure_local_ready():
+    """本地推理就绪保障: 预检查 → 若解压作业运行中则转入其实时进度回报
+    （不继续后续步骤）→ 完成后复查。返回 (ok, errors)。
+    本地入口与 BO 入口共用此函数。"""
+    ok, errors = preflight_check()
+    state, jobid = db_prep_job_state()
+    if state in ("pending", "running") and jobid:
+        follow_db_prep_job(jobid)
+        ok, errors = preflight_check()      # 解压结束后重新检查
+    return ok, errors
+
+
+def extract_scores_from_summary(summary_path):
+    """从 _summary_confidences.json 提取评分（字段与服务器版结果一致）。"""
+    try:
+        with open(summary_path) as f:
+            conf = json.load(f)
+
+        iptm = conf.get("iptm", 0.0)
+        chain_pair_iptm = conf.get("chain_pair_iptm", [])
+        chain_pair_iptm_AB = 0.0
+        if len(chain_pair_iptm) > 1 and len(chain_pair_iptm[0]) > 1:
+            chain_pair_iptm_AB = chain_pair_iptm[0][1]
+
+        return {
+            "iptm": iptm,
+            "ptm": conf.get("ptm", 0.0),
+            "ranking_score": conf.get("ranking_score", 0.0),
+            "chain_pair_iptm_AB": chain_pair_iptm_AB,
+            "fraction_disordered": conf.get("fraction_disordered", 0.0),
+            "has_clash": conf.get("has_clash", False),
+        }
+    except Exception as e:
+        print(f"  ❌ 解析 {summary_path} 失败: {e}")
+        return None
+
+
+def find_summary_json(result_dir):
+    """在 AF3 输出目录中查找 *_summary_confidences.json。"""
+    hits = glob.glob(os.path.join(result_dir, "**", "*_summary_confidences.json"),
+                     recursive=True)
+    return hits[0] if hits else None
+
+
+def pack_result_zip(result_dir, job_name):
+    """把完成的输出目录打包成 <任务名>.zip（与服务器版下载包命名一致）。"""
+    zip_path = os.path.join(LOCAL_RESULTS_DIR, f"{job_name}.zip")
+    if os.path.exists(zip_path):
+        return zip_path
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for root, _, files in os.walk(result_dir):
+            for fn in files:
+                if fn.startswith("slurm_") or fn == ".submitted":
+                    continue
+                full = os.path.join(root, fn)
+                zf.write(full, os.path.join(job_name, os.path.relpath(full, result_dir)))
+    return zip_path
+
+
+def job_state(jobid):
+    """查询任意 SLURM 作业状态 ∈ pending/running/done/failed/unknown。
+    squeue 为活动作业权威来源（sacct 对新作业有记账延迟）。"""
+    if not jobid:
+        return "none"
+    try:
+        out = subprocess.run(["squeue", "-j", jobid, "-h", "-o", "%T"],
+                             capture_output=True, text=True, timeout=15)
+        q = out.stdout.strip().splitlines()
+        if q:
+            return "running" if q[0].strip() == "RUNNING" else "pending"
+    except Exception:
+        pass
+    try:
+        out = subprocess.run(["sacct", "-j", jobid, "-n", "-P", "-o", "State"],
+                             capture_output=True, text=True, timeout=15)
+        states = [s.strip() for s in out.stdout.splitlines() if s.strip()]
+    except Exception:
+        return "unknown"
+    if not states:
+        return "unknown"
+    s = states[0]
+    if s == "COMPLETED":
+        return "done"
+    if s in ("PENDING", "CONFIGURING", "COMPLETING"):
+        return "pending"
+    return "failed"
+
+
+def queue_depth():
+    """当前用户名下在途作业数。"""
+    try:
+        out = subprocess.run(["squeue", "-u", os.environ.get("USER", ""), "-h"],
+                             capture_output=True, text=True, timeout=15)
+        return len([l for l in out.stdout.splitlines() if l.strip()])
+    except Exception:
+        return 0
+
+
+def write_bundle_sbatch(bundle_id, bundle_dir):
+    """生成打包作业脚本: 用 --input_dir 一次处理 bundle_dir 中的多个 JSON。"""
+    sbatch_path = os.path.join(bundle_dir, "af3_bundle.sbatch")
+    hmmer_line = f'export PATH="{LOCAL_HMMER_DIR}:$PATH"' if LOCAL_HMMER_DIR else ""
+    content = f"""#!/bin/bash
+#SBATCH --job-name=af3l_{bundle_id}
+#SBATCH --output={bundle_dir}/slurm_%j.out
+#SBATCH --error={bundle_dir}/slurm_%j.err
+#SBATCH --partition={LOCAL_PARTITION}
+#SBATCH --account={LOCAL_ACCOUNT}
+#SBATCH --nodes=1
+#SBATCH --cpus-per-task={LOCAL_CPUS}
+#SBATCH --mem={LOCAL_MEMORY}
+#SBATCH --gres=gpu:1
+#SBATCH --time={LOCAL_TIME}
+
+echo "AF3 打包推理开始: $(date) | 节点: $(hostname)"
+source ~/miniconda3/etc/profile.d/conda.sh
+conda activate {CONDA_ENV}
+{hmmer_line}
+# 7.x 计算能力 GPU (V100/T4 等) 必须禁用该 HLO 融合通道, 否则 JAX 启动即报错
+export XLA_FLAGS="${{XLA_FLAGS:+$XLA_FLAGS }}--xla_disable_hlo_passes=custom-kernel-fusion-rewriter"
+
+python {AF3_CODE_DIR}/run_alphafold.py \\
+    --input_dir={bundle_dir} \\
+    --output_dir={LOCAL_RESULTS_DIR} \\
+    --model_dir={LOCAL_MODEL_DIR} \\
+    --db_dir={LOCAL_DB_DIR} \\
+    --flash_attention_implementation=xla \\
+    --jackhmmer_n_cpu={LOCAL_CPUS - 2} \\
+    --nhmmer_n_cpu={LOCAL_CPUS - 2}
+rc=$?
+
+echo "AF3 打包推理结束: $(date) | 退出码: $rc"
+exit $rc
+"""
+    with open(sbatch_path, "w") as f:
+        f.write(content)
+    return sbatch_path
+
+
+def submit_pending_bundle():
+    """把积压任务打包成一个作业提交（集群每用户在途作业有限, 打包提高吞吐）。
+    自动跳过在途任务; 作业已终结但无结果的任务会清理标记后重新排队（失败自动重试）。
+    返回新提交的作业号, 无提交则 None。"""
+    if not PREFLIGHT_OK:
+        print("  ⏸️  预检查未通过, 跳过提交, 请先补齐数据库/工具条件")
+        return None
+
+    pending = []
+    if os.path.isdir(LOCAL_RESULTS_DIR):
+        for name in sorted(os.listdir(LOCAL_RESULTS_DIR)):
+            d = os.path.join(LOCAL_RESULTS_DIR, name)
+            if not os.path.isdir(d) or name.startswith("_"):
+                continue
+            if find_summary_json(d) or not os.path.isfile(os.path.join(d, "input.json")):
+                continue
+            marker = os.path.join(d, ".submitted")
+            if os.path.isfile(marker):
+                try:
+                    jid = open(marker).read().strip().splitlines()[0]
+                except OSError:
+                    jid = ""
+                st = job_state(jid)
+                if st in ("pending", "running") and not FORCE_RESUBMIT:
+                    continue                  # 在途, 不重复打包
+                os.remove(marker)             # 终结但无结果 → 失败, 重新排队
+            pending.append((name, d))
+
+    if not pending:
+        return None
+    if queue_depth() >= MAX_INFLIGHT:
+        print(f"  ⏸️  在途作业已达上限 {MAX_INFLIGHT}, 暂不提交（已有作业完成后重跑即续作）")
+        return None
+
+    bundle = pending[:BUNDLE_SIZE]
+    # 攒批: 未满一包且队列仍有作业在跑时, 继续积压以提高单作业吞吐
+    if len(bundle) < BUNDLE_SIZE and queue_depth() > 0:
+        print(f"  📦 攒批中: 已积压 {len(pending)}/{BUNDLE_SIZE} 个任务"
+              "（满包或队列空闲时提交）")
+        return None
+    bundle_id = f"bundle_{int(time.time())}"
+    bundle_dir = os.path.join(LOCAL_RESULTS_DIR, "_bundles", bundle_id)
+    os.makedirs(bundle_dir, exist_ok=True)
+    for name, d in bundle:
+        shutil.copy(os.path.join(d, "input.json"),
+                    os.path.join(bundle_dir, f"{name}.json"))
+    sbatch_path = write_bundle_sbatch(bundle_id, bundle_dir)
+    try:
+        out = subprocess.run(["sbatch", sbatch_path], capture_output=True,
+                             text=True, check=True)
+        jobid = out.stdout.strip().split()[-1]
+    except subprocess.CalledProcessError as e:
+        print(f"  ❌ sbatch 提交失败: {(e.stderr or '').strip() or e}")
+        return None
+    except FileNotFoundError as e:
+        print(f"  ❌ sbatch 提交失败: {e}")
+        return None
+
+    for name, d in bundle:
+        with open(os.path.join(d, ".submitted"), "w") as f:
+            f.write(jobid)
+    print(f"  🚀 打包提交 {len(bundle)} 个任务 → jobid={jobid}: "
+          f"{[n for n, _ in bundle]}")
+    return jobid
+
+
+def write_input_json(peptide_seq, target_seq, job_name, result_dir):
+    """写入单任务的 AF3 输入 JSON（提交由打包机制统一处理）。"""
+    input_json = os.path.join(result_dir, "input.json")
+    job = create_af3_json(peptide_seq, target_seq, job_name)
+    with open(input_json, "w") as f:
+        json.dump(job, f, indent=2)
+    return input_json
+
+
+def local_predict_and_score(peptide_seq, target_seq, target_name, out_dir, auto_submit=True):
+    """
+    服务器版 predict_and_score 的本地替身：
+      - 已有结果 → 提取评分并返回 (score, iptm, zip路径)
+      - 已提交未完成 → 返回 (None, None, None)，等下次重跑
+      - 未提交 → 生成并提交本地作业，返回 (None, None, None)
+    """
+    job_name = os.path.basename(out_dir).lower()   # AF3 的 sanitised_name() 转小写, 必须一致
+    result_dir = os.path.join(LOCAL_RESULTS_DIR, job_name)
+    os.makedirs(result_dir, exist_ok=True)
+
+    # ---- 已完成：提取评分 ----
+    summary = find_summary_json(result_dir)
+    if summary:
+        scores = extract_scores_from_summary(summary)
+        if scores:
+            iptm = scores["iptm"]
+            score = round(1.0 - iptm, 4)
+            print(f"  📊 [{target_name}] 该靶标界面 ipTM={iptm:.3f} | "
+                  f"score={score} (=1-ipTM, 优化目标, 越小越好) | "
+                  f"ranking={scores['ranking_score']:.3f} (AF3综合分, 仅供参考)")
+            zip_path = pack_result_zip(result_dir, job_name)
+            return score, iptm, zip_path
+
+    # ---- 未完成：写入输入并触发打包提交（含失败自动重试）----
+    write_input_json(peptide_seq, target_seq, job_name, result_dir)
+    marker = os.path.join(result_dir, ".submitted")
+    if os.path.isfile(marker) and not FORCE_RESUBMIT:
+        try:
+            jid = open(marker).read().strip().splitlines()[0]
+        except OSError:
+            jid = ""
+        if job_state(jid) in ("pending", "running"):
+            print(f"  ⏳ [{target_name}] {job_name} 在集群上计算中, 等待结果…")
+            return None, None, None
+    submit_pending_bundle()      # 本任务连同其他积压任务一起打包提交
+    return None, None, None
+
+
+def job_queue_info(jobid):
+    """查询作业的排队/运行信息: 状态 + SLURM 预计启动时间。"""
+    state = job_state(jobid)
+    start = ""
+    try:
+        out = subprocess.run(["squeue", "--start", "-j", jobid, "-h",
+                              "-o", "%S %r"],
+                             capture_output=True, text=True, timeout=15)
+        parts = out.stdout.strip().split(None, 1)
+        if parts:
+            start = parts[0]
+    except Exception:
+        pass
+    desc = {"running": "运行中", "pending": f"排队中(预计启动 {start})" if start else "排队中",
+            "done": "已结束", "failed": "已失败"}.get(state, state)
+    return state, desc
+
+
+def check_local_status():
+    """汇报本地任务的完成/进行中状态（含排队位置与预计启动时间）。"""
+    os.makedirs(LOCAL_RESULTS_DIR, exist_ok=True)
+    completed, running = [], []
+    for name in sorted(os.listdir(LOCAL_RESULTS_DIR)):
+        d = os.path.join(LOCAL_RESULTS_DIR, name)
+        if not os.path.isdir(d) or name.startswith("_"):
+            continue
+        if find_summary_json(d):
+            completed.append(name)
+        elif os.path.exists(os.path.join(d, ".submitted")):
+            running.append(name)
+
+    print("\n📊 本地任务状态报告")
+    print(f"   已完成: {len(completed)} | 运行中/排队中: {len(running)}")
+    shown = set()
+    for n in running[:20]:
+        try:
+            jid = open(os.path.join(LOCAL_RESULTS_DIR, n, ".submitted")).read().strip().splitlines()[0]
+        except OSError:
+            jid = ""
+        _, desc = job_queue_info(jid)
+        key = (jid, desc)
+        suffix = f" [{jid} {desc}]" if jid and key not in shown else ""
+        shown.add(key)
+        print(f"     ⏳ {n}{suffix}")
+    return len(completed), len(running)
+
+
+if __name__ == "__main__":
+    # ---- 计算节点上的数据库准备作业入口 ----
+    if "--prepare-db" in sys.argv:
+        ok = prepare_database()
+        sys.exit(0 if ok else 1)
+
+    random.seed(42)
+    np.random.seed(42)
+
+    print("=" * 60)
+    print("🧬 AlphaFold3 本地推理 — 蒙特卡洛肽优化")
+    print("=" * 60)
+
+    # 就绪保障: 预检查 + 解压作业实时进度跟随（运行中则等待，不继续后续步骤）
+    ok, errors = ensure_local_ready()
+
+    if not ok:
+        print("\n⚠️  存在未满足的条件，仍将尝试运行流程：")
+        print("   - 资源就绪前，已完成的旧结果仍可被评分复用；")
+        print("   - 新的提交会跳过（见上方提示），请补齐条件后重跑。\n")
+
+    # 蒙特卡洛主循环（后端无关的公共循环 + 本地推理预测函数）
+    best_seq, best_score = run_monte_carlo(local_predict_and_score, ROOT_DIR)
+
+    check_local_status()
+    if best_seq is None:
+        print("\n⏳ 尚无可用结果。等集群作业完成后重新运行本脚本即可继续。")
+        print("   查看作业: squeue -u $USER")
+    else:
+        print("\n🏆 优化完成，详见 output_af3/202_htr1a/")

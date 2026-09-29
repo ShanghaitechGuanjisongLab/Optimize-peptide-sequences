@@ -1,0 +1,16 @@
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 运行产物与预测结果（体积大，属数据而非代码）
+af3_jobs/
+af3_results/
+af3_local_results/
+output_af3/
+output_bo/
+
+# SLURM 作业日志
+slurm_watch_*
+pepopt_*.out
+pepopt_*.err
+db_prep_*
