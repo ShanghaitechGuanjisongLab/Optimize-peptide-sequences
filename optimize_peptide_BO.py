@@ -182,7 +182,13 @@ def select_batch(acq, X_cand, indices, batch_size):
 # ---------------- 评估流程 ----------------
 
 def evaluate_sequence(seq, seq_tag, out_root, predict_fn):
-    """对单个序列评估 3 个靶标。全部就绪时返回 dict，否则 None。"""
+    """对单个序列评估 3 个靶标，三个都就绪时返回 dict，否则 None。
+
+    关键: 先遍历三个靶标、逐个创建并提交预测任务, **不因某个靶标结果未就绪就提前
+    return**。否则该靶标后面的靶标任务永远不会被创建——例如 UNC13C 因 token 超限被
+    拦截而始终未就绪时, 排在它后面的 BIN1 会被连带锁死, 表现为"BIN1 尚未生成任务"。
+    三个靶标任务都创建/提交后, 只要有任一未就绪就返回 None（已创建的任务下次重跑
+    继续, 不会重复提交）。"""
     res = {}
     for target_name, target_seq in [("HTR1A", HTR1A_SEQ),
                                     ("UNC13C", UNC13C_SEQ),
@@ -190,9 +196,11 @@ def evaluate_sequence(seq, seq_tag, out_root, predict_fn):
         out_dir = os.path.join(out_root, f"{seq_tag}_{target_name}")
         score, iptm, path = predict_fn(seq, target_seq, target_name, out_dir,
                                        auto_submit=True)
-        if iptm is None:
-            return None
-        res[target_name] = {"score": score, "iptm": iptm, "path": path}
+        # 未就绪不 return, 继续把后续靶标任务创建出来
+        res[target_name] = None if iptm is None else {
+            "score": score, "iptm": iptm, "path": path}
+    if any(v is None for v in res.values()):
+        return None
     return res
 
 

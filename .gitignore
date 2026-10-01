@@ -13,4 +13,5 @@ output_bo/
 slurm_watch_*
 pepopt_*.out
 pepopt_*.err
-db_prep_*
+db_prep_*.out
+db_prep_*.err

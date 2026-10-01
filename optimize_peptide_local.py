@@ -105,6 +105,9 @@ DB_MMCIF_ARCHIVE = "pdb_2022_09_28_mmcif_files.tar.zst"   # 解压为目录: <DB
 
 LOCAL_RESULTS_DIR = "af3_local_results"     # 本地推理结果目录
 
+# 外置作业脚本目录: SLURM 实际执行的 .sh 脚本存放处, 不再把 shell 内嵌进 Python 字符串
+SCRIPTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts")
+
 # SLURM 资源配置（每个"序列×靶标"为一个推理任务, 多任务打包进单个作业）
 LOCAL_PARTITION = "bme_gpupub"
 LOCAL_ACCOUNT   = "v-jiamh"                   # SLURM 账户（无此分区/账户组合会被拒）
@@ -115,6 +118,26 @@ LOCAL_TIME      = "48:00:00"                  # 单个作业最长时限（打�
 # 集群每用户在途作业上限（实测 QOS=2）: 多任务打包进单作业以提高吞吐
 BUNDLE_SIZE     = 6                       # 单个作业串行处理的任务数（序列×靶标）
 MAX_INFLIGHT    = 2                       # 队列内在途作业数上限（超过则攒批等待）
+
+# 单个任务的最大 token 数。超出者注定显存溢出, 提交前直接拦截, 避免白烧机时。
+# 依据 AlphaFold3 官方 docs/performance.md 的硬件上限（均指已启用 unified memory）:
+#   V100 (CUDA 算力 7.x) -> 1,280 tokens   <- 当前 bme_gpupub 分区全是 V100 32GB
+#   A100 40GB            -> 4,352 tokens（还需改 model_config.py 的 pair_transition_shard_spec）
+#   A100/H100 80GB       -> 官方支持全尺寸（默认最大 bucket 5,120 tokens）
+# 若申请到 A100/H100-80G: 把此值改为 5120, 并把下面的 FLASH_ATTENTION_IMPL
+# 由 "xla" 改为 "triton", 同时可去掉为 7.x 设备设置的 XLA_FLAGS。
+GPU_MAX_TOKENS  = 1280
+
+# flash attention 实现（对应 run_alphafold.py 的 --flash_attention_implementation）:
+#   "xla"    : 不用 flash attention, 跨设备可用, 但注意力显存 O(N^2)。
+#              CUDA 算力 7.x（V100/T4）**必须**用此值（AF3 会强制校验）。
+#   "triton" : 真正的 flash attention, 显存 O(N) 且更快, 但需 Ampere（算力 8.0+,
+#              即 A100/H100）。A100-80G 上换成 triton 后, 大体系不再受显存平方律限制。
+#   "cudnn"  : cuDNN 实现, 同样需 Ampere, 测试不如 triton 充分。
+FLASH_ATTENTION_IMPL = "xla"
+
+# token 数超限的任务不提交, 写入此标记, 以免每次重跑都重复刷警告
+OOM_SKIP_MARKER = ".oom_skipped"
 
 # hmm 工具（jackhmmer/nhmmer/hmmalign/hmmsearch/hmmbuild）所在目录；
 # 留空则依赖作业节点 PATH 中可直接找到
@@ -369,33 +392,31 @@ def submit_db_prep_job():
         print(f"📦 上次解压作业已结束 ({state}, jobid={jobid})，清理陈旧标记后重新提交。")
         os.remove(marker)
 
-    sbatch_path = os.path.join(LOCAL_DB_DIR, "db_prep.sbatch")
+    # 作业脚本外置于 scripts/db_prep_runner.sh；SLURM 资源走参数, 配置走 --export,
+    # Python 侧不再内嵌 shell, 也不生成临时 .sbatch 文件。
     repo_dir = os.path.dirname(os.path.abspath(__file__))
-    sb = f"""#!/bin/bash
-#SBATCH --job-name=af3_db_prep
-#SBATCH --output={LOCAL_DB_DIR}/db_prep_%j.out
-#SBATCH --error={LOCAL_DB_DIR}/db_prep_%j.err
-#SBATCH --partition={LOCAL_PARTITION}
-#SBATCH --account={LOCAL_ACCOUNT}
-#SBATCH --nodes=1
-#SBATCH --cpus-per-task=4
-#SBATCH --mem=16G
-#SBATCH --time=24:00:00
-
-date
-source ~/miniconda3/etc/profile.d/conda.sh
-conda activate base
-cd {repo_dir}
-python -u optimize_peptide_local.py --prepare-db
-rc=$?
-echo "数据库准备结束, 退出码: $rc"
-date
-exit $rc
-"""
-    with open(sbatch_path, "w") as f:
-        f.write(sb)
+    runner = os.path.join(SCRIPTS_DIR, "db_prep_runner.sh")
+    env_pairs = [
+        f"PEPOPT_WORK_DIR={repo_dir}",
+        "PEPOPT_CONDA_ENV=base",
+        "PEPOPT_ENTRY=optimize_peptide_local.py",
+    ]
+    cmd = [
+        "sbatch",
+        "--job-name=af3_db_prep",
+        f"--output={LOCAL_DB_DIR}/db_prep_%j.out",
+        f"--error={LOCAL_DB_DIR}/db_prep_%j.err",
+        f"--partition={LOCAL_PARTITION}",
+        f"--account={LOCAL_ACCOUNT}",
+        "--nodes=1",
+        "--cpus-per-task=4",
+        "--mem=16G",
+        "--time=24:00:00",
+        "--export=ALL," + ",".join(env_pairs),
+        runner,
+    ]
     try:
-        out = subprocess.run(["sbatch", sbatch_path], capture_output=True, text=True, check=True)
+        out = subprocess.run(cmd, capture_output=True, text=True, check=True)
         jobid = out.stdout.strip().split()[-1]
         with open(marker, "w") as f:
             f.write(jobid + "\n")
@@ -562,50 +583,69 @@ def queue_depth():
         return 0
 
 
-def write_bundle_sbatch(bundle_id, bundle_dir):
-    """生成打包作业脚本: 用 --input_dir 一次处理 bundle_dir 中的多个 JSON。"""
-    sbatch_path = os.path.join(bundle_dir, "af3_bundle.sbatch")
-    hmmer_line = f'export PATH="{LOCAL_HMMER_DIR}:$PATH"' if LOCAL_HMMER_DIR else ""
-    content = f"""#!/bin/bash
-#SBATCH --job-name=af3l_{bundle_id}
-#SBATCH --output={bundle_dir}/slurm_%j.out
-#SBATCH --error={bundle_dir}/slurm_%j.err
-#SBATCH --partition={LOCAL_PARTITION}
-#SBATCH --account={LOCAL_ACCOUNT}
-#SBATCH --nodes=1
-#SBATCH --cpus-per-task={LOCAL_CPUS}
-#SBATCH --mem={LOCAL_MEMORY}
-#SBATCH --gres=gpu:1
-#SBATCH --time={LOCAL_TIME}
+def build_bundle_sbatch_cmd(bundle_id, bundle_dir):
+    """构建提交打包推理作业的 sbatch 命令（返回 argv 列表）。
 
-echo "AF3 打包推理开始: $(date) | 节点: $(hostname)"
-source ~/miniconda3/etc/profile.d/conda.sh
-conda activate {CONDA_ENV}
-{hmmer_line}
-# 7.x 计算能力 GPU (V100/T4 等) 必须禁用该 HLO 融合通道, 否则 JAX 启动即报错
-export XLA_FLAGS="${{XLA_FLAGS:+$XLA_FLAGS }}--xla_disable_hlo_passes=custom-kernel-fusion-rewriter"
+    作业脚本外置于 scripts/af3_bundle_runner.sh（两阶段容错逻辑见该文件头注释）;
+    SLURM 资源指令走命令行参数, 作业配置走 --export 环境变量,
+    因此 Python 侧不再内嵌任何 shell 脚本字符串, 也无需生成临时 .sbatch 文件。"""
+    work_dir = os.path.dirname(os.path.abspath(__file__))
+    runner = os.path.join(SCRIPTS_DIR, "af3_bundle_runner.sh")
+    env_pairs = [
+        f"AF3_CODE_DIR={AF3_CODE_DIR}",
+        f"AF3_BUNDLE_DIR={os.path.abspath(bundle_dir)}",
+        f"AF3_OUT_DIR={os.path.abspath(LOCAL_RESULTS_DIR)}",
+        f"AF3_MODEL_DIR={LOCAL_MODEL_DIR}",
+        f"AF3_DB_DIR={LOCAL_DB_DIR}",
+        f"AF3_WORK_DIR={work_dir}",
+        f"AF3_CONDA_ENV={CONDA_ENV}",
+        f"AF3_FLASH_ATTN={FLASH_ATTENTION_IMPL}",
+        f"AF3_MSA_CPUS={LOCAL_CPUS - 2}",
+    ]
+    if LOCAL_HMMER_DIR:
+        env_pairs.append(f"AF3_HMMER_DIR={LOCAL_HMMER_DIR}")
+    return [
+        "sbatch",
+        f"--job-name=af3l_{bundle_id}",
+        f"--output={os.path.abspath(bundle_dir)}/slurm_%j.out",
+        f"--error={os.path.abspath(bundle_dir)}/slurm_%j.err",
+        f"--partition={LOCAL_PARTITION}",
+        f"--account={LOCAL_ACCOUNT}",
+        "--nodes=1",
+        f"--cpus-per-task={LOCAL_CPUS}",
+        f"--mem={LOCAL_MEMORY}",
+        "--gres=gpu:1",
+        f"--time={LOCAL_TIME}",
+        "--export=ALL," + ",".join(env_pairs),
+        runner,
+    ]
 
-python {AF3_CODE_DIR}/run_alphafold.py \\
-    --input_dir={bundle_dir} \\
-    --output_dir={LOCAL_RESULTS_DIR} \\
-    --model_dir={LOCAL_MODEL_DIR} \\
-    --db_dir={LOCAL_DB_DIR} \\
-    --flash_attention_implementation=xla \\
-    --jackhmmer_n_cpu={LOCAL_CPUS - 2} \\
-    --nhmmer_n_cpu={LOCAL_CPUS - 2}
-rc=$?
 
-echo "AF3 打包推理结束: $(date) | 退出码: $rc"
-exit $rc
-"""
-    with open(sbatch_path, "w") as f:
-        f.write(content)
-    return sbatch_path
+def estimate_tokens(input_json_path):
+    """从 AF3 输入 JSON 估算 token 数（蛋白/核酸链按序列长度计）。
+    用于提交前判断是否会超出 GPU 的 token 上限而 OOM。无法解析时返回 0（不拦截）。"""
+    try:
+        with open(input_json_path, encoding="utf-8") as f:
+            job = json.load(f)
+    except (OSError, ValueError):
+        return 0
+    total = 0
+    for item in job.get("sequences", []) or []:
+        for val in item.values():
+            if not isinstance(val, dict):
+                continue
+            seq = val.get("sequence", "")
+            if isinstance(seq, str):
+                total += len(seq)
+            elif isinstance(seq, list):        # 配体/修饰等非字符串条目
+                total += len(seq)
+    return total
 
 
 def submit_pending_bundle():
     """把积压任务打包成一个作业提交（集群每用户在途作业有限, 打包提高吞吐）。
     自动跳过在途任务; 作业已终结但无结果的任务会清理标记后重新排队（失败自动重试）。
+    token 数超过 GPU_MAX_TOKENS 的任务注定 OOM, 直接拦截不提交, 避免白烧机时。
     返回新提交的作业号, 无提交则 None。"""
     if not PREFLIGHT_OK:
         print("  ⏸️  预检查未通过, 跳过提交, 请先补齐数据库/工具条件")
@@ -618,6 +658,18 @@ def submit_pending_bundle():
             if not os.path.isdir(d) or name.startswith("_"):
                 continue
             if find_summary_json(d) or not os.path.isfile(os.path.join(d, "input.json")):
+                continue
+            # token 预检: 超出当前 GPU 官方上限者必然 OOM, 拦截并留痕（仅首次警告）
+            oom_marker = os.path.join(d, OOM_SKIP_MARKER)
+            tk = estimate_tokens(os.path.join(d, "input.json"))
+            if tk > GPU_MAX_TOKENS:
+                if not os.path.isfile(oom_marker):
+                    with open(oom_marker, "w") as f:
+                        f.write(f"{tk}\n")
+                    print(f"  ⛔ {name}: {tk} tokens > 当前 GPU 上限 {GPU_MAX_TOKENS}"
+                          "（V100 官方仅支持 ≤1280 tokens）, 必然显存溢出, 已跳过未提交。")
+                    print("     对策: 换 A100/H100-80G 并调高 GPU_MAX_TOKENS;"
+                          " 或把该靶标截断到与小肽相关的结构域（会改变约束语义, 需组内确认）。")
                 continue
             marker = os.path.join(d, ".submitted")
             if os.path.isfile(marker):
@@ -649,10 +701,9 @@ def submit_pending_bundle():
     for name, d in bundle:
         shutil.copy(os.path.join(d, "input.json"),
                     os.path.join(bundle_dir, f"{name}.json"))
-    sbatch_path = write_bundle_sbatch(bundle_id, bundle_dir)
+    cmd = build_bundle_sbatch_cmd(bundle_id, bundle_dir)
     try:
-        out = subprocess.run(["sbatch", sbatch_path], capture_output=True,
-                             text=True, check=True)
+        out = subprocess.run(cmd, capture_output=True, text=True, check=True)
         jobid = out.stdout.strip().split()[-1]
     except subprocess.CalledProcessError as e:
         print(f"  ❌ sbatch 提交失败: {(e.stderr or '').strip() or e}")
