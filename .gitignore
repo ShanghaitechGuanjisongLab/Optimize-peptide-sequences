@@ -8,6 +8,7 @@ af3_results/
 af3_local_results/
 output_af3/
 output_bo/
+output_bo_*/
 
 # SLURM 作业日志
 slurm_watch_*

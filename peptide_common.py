@@ -106,6 +106,59 @@ def generate_mutant(orig_tail):
     return "".join(cur)
 
 
+# ===================== 搜索空间穷尽枚举 =====================
+
+_SPACE_CACHE = None   # ((center,max_edit,min_len,max_len), [序列...])
+
+
+def ball_edit1(word, aa=AA_LIST):
+    """编辑距离 ≤1 的球（含 word 自身）。aa 默认 20 种标准氨基酸。"""
+    out = {word}
+    n = len(word)
+    for i in range(n):                                # 替换
+        base = word[i]
+        for a in aa:
+            if a != base:
+                out.add(word[:i] + a + word[i + 1:])
+    for i in range(n):                                # 删除
+        out.add(word[:i] + word[i + 1:])
+    for i in range(n + 1):                            # 插入
+        for a in aa:
+            out.add(word[:i] + a + word[i:])
+    return out
+
+
+def enumerate_space(center=ORIG_TAIL, max_edit=2, min_len=6, max_len=10):
+    """**穷尽枚举**以 center 为中心、编辑距离 ≤max_edit、长度落在
+    [min_len, max_len] 内的全部可变区, 按字典序返回 list（确定性、可复现）。
+
+    与随机采样 generate_mutant() 的关系与区别:
+      - generate_mutant 每次随机产出球内一个成员, 上层靠"重试 + 排除已评估"
+        间接采样。实测球内 **665 个序列采样不可达**（模式B 的 delta=±1 分支
+        只做单次插入或删除, 因而"净长度不变的插入+删除"两步编辑生成不出来）。
+      - 本函数是精确构造, 覆盖全集（含那 665 个）, 且**输出顺序固定**,
+        使调度器能做"不重复、有限步内全覆盖"的游标推进。
+      - 长度过滤只在最后一步做一次（而非每轮迭代都过滤）, 否则会误剪
+        "经由越界中间态再回到界内"的合法路径 → 少算成员。
+
+    规模: max_edit=2, len 6~10, 20 种氨基酸 → **51091** 条（已实测）。
+    代价: 枚举约 0.1s; 结果按参数缓存于 _SPACE_CACHE, 进程内只算一次。
+    """
+    global _SPACE_CACHE
+    key = (center, max_edit, min_len, max_len)
+    if _SPACE_CACHE is not None and _SPACE_CACHE[0] == key:
+        return _SPACE_CACHE[1]
+    cur = {center}
+    for _ in range(max_edit):
+        nxt = set()
+        for w in cur:
+            nxt |= ball_edit1(w)
+        cur = nxt
+    out = sorted(w for w in cur if min_len <= len(w) <= max_len)
+    _SPACE_CACHE = (key, out)
+    return out
+
+
 def create_af3_json(peptide_seq, target_seq, job_name, model_seeds=[1]):
     """
     创建 AlphaFold3 Web Server 格式的 JSON 任务。
