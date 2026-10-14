@@ -68,7 +68,7 @@ TARGET_SEQS   = {"ASIC1A": ASIC1A_SEQ, "HTR1A": HTR1A_SEQ,
 TARGET_ORDER  = ["ASIC1A", "HTR1A", "BIN1", "UNC13C"]  # 固定评估顺序
 OFF_TARGETS   = ["UNC13C", "BIN1"]               # 旧阶段底线蛋白（越低越好）
 OFF_COL       = {"UNC13C": "iptm_unc13c", "BIN1": "iptm_bin1"}
-# 同源多聚体靶标的拷贝数（AF3 输入挂几个链 ID）; 新阶段目标乘积的三因子
+# 同源多聚体靶标的拷贝数（AF3 输入挂几个链 ID）；新阶段目标乘积的三因子
 TARGET_COPIES = {"ASIC1A": 3}
 PRODUCT_TARGETS = ["ASIC1A", "HTR1A", "BIN1"]   # 目标乘积 = 三者 ipTM 之积
 
@@ -124,10 +124,9 @@ class CandidateStream:
 # ===================== 数据库视图辅助 =====================
 
 def db_evaluated_rows(active_targets):
-    """已评估行（含目标乘积与各因子）: [dict]。
+    """已评估行（含目标乘积与各因子）：[dict]。
 
-    row["objective"] = ipTM(ASIC1A)×ipTM(HTR1A)×ipTM(BIN1)（越大越好,
-    三因子齐备才算）; row["score_htr1a"] 保留供旧阶段兼容。"""
+    row["objective"] = ipTM(ASIC1A)×ipTM(HTR1A)×ipTM(BIN1)（越大越好，三因子齐备才算）；row["score_htr1a"] 保留供旧阶段兼容。"""
     by_tag = db.load_database()
     rows = []
     for tag, r in by_tag.items():
@@ -482,7 +481,7 @@ def harvest_and_report(active_targets):
         cons = [r["cons"].get(OFF_COL[t]) for t in active_targets if t in OFF_COL]
         if all(v is not None and v < OFF_THRESHOLD for v in cons):
             evaluable.append(r)
-    # 排名: 新阶段看目标乘积（降序）; 乘积未齐(缺因子)的排后面按 score 兼容
+    # 排名：新阶段看目标乘积（降序）；乘积未齐（缺因子）的排后面按 score 兼容
     def _key(r):
         if r.get("objective") is not None:
             return (0, -r["objective"])

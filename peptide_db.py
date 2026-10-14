@@ -48,7 +48,7 @@ SUMMARY_SUFFIX = "_summary_confidences.json"
 TARGETS_ALL = ("ASIC1A", "HTR1A", "BIN1", "UNC13C")
 
 # 同源多聚体靶标的链数（AF3 输入里挂几个链 ID）。单体为 1（缺省）。
-# 影响评分提取: 多聚体的"肽-靶标界面 ipTM"= chain_pair_iptm[0][1..N] 的组合，而非全局 iptm（全局会被多聚体自身亚基间界面抬高, 稀释肽结合信号）。
+# 影响评分提取：多聚体的“肽-靶标界面 ipTM”= chain_pair_iptm[0][1..N] 的组合，而非全局 iptm（全局会被多聚体自身亚基间界面抬高，稀释肽结合信号）。
 TARGET_COPIES = {"ASIC1A": 3}
 
 MASTER_FIELDS = ["tag", "peptide", "var_region",
@@ -56,7 +56,12 @@ MASTER_FIELDS = ["tag", "peptide", "var_region",
                  "iptm_htr1a", "score_htr1a", "ranking_htr1a",
                  "iptm_bin1", "ranking_bin1",
                  "iptm_unc13c", "ranking_unc13c",
-                 "objective_product", "source", "created_at", "updated_at"]
+                 "objective_product", "source", "created_at", "updated_at",
+                 # --- 序贯采样的 β 分布统计量（供数据库整理阶段查阅）---
+                 # 充分统计量 (obj_n,obj_sum,obj_sum2) → 方法矩拟合,
+                 # 追加拟合 == 全数据批式拟合, 无需存全数据（见 peptide_stats.py）
+                 "obj_n", "obj_sum", "obj_sum2",
+                 "obj_max", "obj_alpha", "obj_beta", "obj_extra", "obj_pool"]
 
 SEQREG_FIELDS = ["tag", "var_region", "peptide", "first_seen"]
 
@@ -327,14 +332,21 @@ def load_database():
             "iptm_unc13c": _to_float(r["iptm_unc13c"]),
             "ranking_unc13c": _to_float(r["ranking_unc13c"]),
             "objective_product": _to_float(r["objective_product"]),
+            # 序贯采样的 β 统计量（原始字符串/数值混合，供整理阶段重建 BetaFit）
+            "obj_n": _to_float(r["obj_n"]),
+            "obj_sum": _to_float(r["obj_sum"]),
+            "obj_sum2": _to_float(r["obj_sum2"]),
+            "obj_max": _to_float(r["obj_max"]),
+            "obj_alpha": _to_float(r["obj_alpha"]),
+            "obj_beta": _to_float(r["obj_beta"]),
         }
     return by_tag
 
 
 def objective_product(row):
-    """新阶段目标函数: ipTM(肽-Asic1a) × ipTM(肽-HTR1A) × ipTM(肽-BIN1),
+    """新阶段目标函数：ipTM(肽-Asic1a) × ipTM(肽-HTR1A) × ipTM(肽-BIN1)，
     **越大越好**。任一因子缺失返回 None（不参与排名）。
-    兼容两种输入: load_database() 的 float dict 与 CSV 原始字符串行。"""
+    兼容两种输入：load_database() 的 float dict 与 CSV 原始字符串行。"""
     vals = [_to_float(row.get(k))
             for k in ("iptm_asic1a", "iptm_htr1a", "iptm_bin1")]
     if any(v is None for v in vals):
@@ -376,7 +388,7 @@ def upsert_result(tag, target, iptm, ranking=None, peptide=None, var=None,
         rows[idx]["peptide"] = peptide
     if var and not rows[idx]["var_region"]:
         rows[idx]["var_region"] = var
-    # 自动维护目标乘积列（三因子齐备才填, 否则留空）
+    # 自动维护目标乘积列（三因子齐备才填，否则留空）
     if "objective_product" in MASTER_FIELDS:
         prod = objective_product(rows[idx])
         rows[idx]["objective_product"] = f"{prod:.6f}" if prod is not None else ""
@@ -398,9 +410,9 @@ def find_summary(result_dir):
 def extract_scores(summary_path, target=None):
     """从磁盘上的 *_summary_confidences.json 提取评分。
 
-    target: 靶标名（如 'ASIC1A'）。决定用哪个 ipTM 作主值:
-      - 单体靶标: 主值 = chain_pair_iptm[0][1]（肽-靶标二元界面, 与全局一致）;
-      - 同源多聚体靶标(TARGET_COPIES): 主值 = 肽链(A)对各亚基(B,C,...)的chain_pair_iptm[0][1..N] **取最大**（肽结合在哪个亚基界面, 哪个就是真实结合信号）。全局 iptm 会被多聚体自身亚基间界面抬高, 不能用。同时返回 mean（辅助诊断）。
+    target：靶标名（如 'ASIC1A'）。决定用哪个 ipTM 作主值：
+      - 单体靶标：主值 = chain_pair_iptm[0][1]（肽-靶标二元界面，与全局一致）；
+      - 同源多聚体靶标（TARGET_COPIES）：主值 = 肽链（A）对各亚基（B，C……）的chain_pair_iptm[0][1..N] **取最大**（肽结合在哪个亚基界面，哪个就是真实结合信号）。全局 iptm 会被多聚体自身亚基间界面抬高，不能用。同时返回 mean（辅助诊断）。
     """
     try:
         with open(summary_path) as f:
@@ -411,13 +423,13 @@ def extract_scores(summary_path, target=None):
     global_iptm = c.get("iptm", 0.0)
     cpm = c.get("chain_pair_iptm", [])
     n_copies = TARGET_COPIES.get((target or "").upper(), 1)
-    # 肽=链0; 靶标各亚基=链1..n_copies（AF3 输出链序与输入 id 顺序一致）
+    # 肽=链0；靶标各亚基=链1..n_copies（AF3 输出链序与输入 id 顺序一致）
     if cpm and len(cpm) > 0 and len(cpm[0]) >= 1 + n_copies:
         iface = [cpm[0][i] for i in range(1, 1 + n_copies)]
         iptm_main = max(iface)          # 最佳肽-亚基界面 = 真实结合位点置信度
         iptm_mean = sum(iface) / len(iface)
     else:
-        # 矩阵缺失/尺寸不符 → 回退全局(二元体系下二者等价)
+        # 矩阵缺失/尺寸不符 → 回退全局（二元体系下二者等价）
         iptm_main = iptm_mean = global_iptm
 
     return {"iptm": iptm_main,
@@ -427,6 +439,80 @@ def extract_scores(summary_path, target=None):
             "ranking_score": c.get("ranking_score", 0.0),
             "fraction_disordered": c.get("fraction_disordered", 0.0),
             "has_clash": c.get("has_clash", False)}
+
+
+# ---------------------------------------------------------------------
+# 逐样本提取（序贯采样：每个 seed-*_sample-*/ 目录是一次独立扩散抽样）
+# ---------------------------------------------------------------------
+
+_SAMPLE_DIR_RE = re.compile(r"^seed-(\d+)_sample-(\d+)$")
+
+
+def extract_sample_iptms(result_dir, target=None):
+    """从 AF3 输出的每个 seed-K_sample-J/ 目录提取**逐样本**界面 ipTM，
+    按（seed，sample）升序返回列表（即序贯消费的自然顺序）。
+
+    与 extract_scores 同口径：多聚体靶标取 chain_pair_iptm[0][1..N] 的 max
+    （肽-靶标界面，排除多聚体自身亚基界面）。找不到逐样本目录时返回 []
+    （旧结果只有汇总文件，无法拆分）。"""
+    if not os.path.isdir(result_dir):
+        return []
+    entries = []
+    for name in os.listdir(result_dir):
+        m = _SAMPLE_DIR_RE.match(name)
+        if not m:
+            continue
+        sm = os.path.join(result_dir, name, "summary_confidences.json")
+        if not os.path.isfile(sm):
+            continue
+        try:
+            with open(sm) as f:
+                c = json.load(f)
+        except (OSError, ValueError):
+            continue
+        cpm = c.get("chain_pair_iptm", [])
+        n_copies = TARGET_COPIES.get((target or "").upper(), 1)
+        if cpm and len(cpm) > 0 and len(cpm[0]) >= 1 + n_copies:
+            iface = [cpm[0][i] for i in range(1, 1 + n_copies)]
+            iptm = max(iface)
+        else:
+            iptm = c.get("iptm", 0.0)
+        entries.append(((int(m.group(1)), int(m.group(2))), float(iptm)))
+    entries.sort()
+    return [v for _, v in entries]
+
+
+# ---------------------------------------------------------------------
+# 序贯采样统计量的读写（供数据库整理阶段查阅/增量续算）
+# ---------------------------------------------------------------------
+
+_OBJ_COLS = ["obj_n", "obj_sum", "obj_sum2", "obj_max",
+             "obj_alpha", "obj_beta", "obj_extra", "obj_pool"]
+
+
+def save_obj_stats(tag, fit, source="seq"):
+    """把 BetaFit 的充分统计量写入主表（不写原始样本，符合“不存全数据”）。"""
+    d = fit.stats_dict()
+    rows = _read_csv(paths()["master_csv"], MASTER_FIELDS)
+    idx = next((i for i, r in enumerate(rows) if r["tag"] == tag), None)
+    if idx is None:
+        return None
+    for col in _OBJ_COLS:
+        if col in d:
+            rows[idx][col] = d[col]
+    rows[idx]["updated_at"] = _now()
+    _rewrite_master(rows)
+    return rows[idx]
+
+
+def load_obj_fit(tag):
+    """从主表恢复 BetaFit（含 pool），支持整理阶段增量续算。找不到返回 None。"""
+    rows = _read_csv(paths()["master_csv"], MASTER_FIELDS)
+    r = next((x for x in rows if x["tag"] == tag), None)
+    if r is None or not r.get("obj_n"):
+        return None
+    from peptide_stats import BetaFit
+    return BetaFit.from_stats(r)
 
 
 _AA3TO1 = {
@@ -551,29 +637,29 @@ def harvest_results(results_root=None):
 
 
 # ---------------------------------------------------------------------
-# 归档数据导入（复用旧库已算好的 HTR1A/BIN1, 避免重复计算）
+# 归档数据导入（复用旧库已算好的 HTR1A/BIN1，避免重复计算）
 # ---------------------------------------------------------------------
 
 def import_archived(archive_csv, source="archived", dry_run=False):
-    """把归档主表的行导入当前库, **复用已算好的 ipTM 数值**。
+    """把归档主表的行导入当前库，**复用已算好的 ipTM 数值**。
 
-    场景: 新阶段目标改为 ipTM(Asic1a)×ipTM(HTR1A)×ipTM(BIN1) 的乘积，而旧库已有 653 个序列的 HTR1A/BIN1（占目标三因子中的两个）→导入后 gap-fill 只需为它们补算 Asic1a 一项（省 2/3 算力）。
+    场景：新阶段目标改为 ipTM(Asic1a)×ipTM(HTR1A)×ipTM(BIN1) 的乘积，而旧库已有 653 个序列的 HTR1A/BIN1（占目标三因子中的两个）→导入后 gap-fill 只需为它们补算 Asic1a 一项（省 2/3 算力）。
 
-    关键点:
-      - 标签按**当前 make_tag 重新派生**（旧库是 5 位十进制旧规则, 新规则是 crc32 全 hex）; 若直接沿用旧标签, 未来 make_tag(var) 会得到不同标签 → 同一序列被视为新候选重复计算（正是要避免的）。
-      - 只导数值不导结构包（结构在归档目录, 不占新库空间）。
-      - iptm_asic1a 留空 → 目标乘积留空, 待 Asic1a 补算后自动填。
+    关键点：
+      - 标签按**当前 make_tag 重新派生**（旧库是 5 位十进制旧规则，新规则是 crc32 全 hex）；若直接沿用旧标签，未来 make_tag(var) 会得到不同标签 → 同一序列被视为新候选重复计算（正是要避免的）。
+      - 只导数值不导结构包（结构在归档目录，不占新库空间）。
+      - iptm_asic1a 留空 → 目标乘积留空，待 Asic1a 补算后自动填。
 
-    返回 (导入行数, 跳过原因列表)。"""
+    返回（导入行数，跳过原因列表）。"""
     if not os.path.isfile(archive_csv):
         return 0, [f"归档文件不存在: {archive_csv}"]
 
-    # 归档 CSV 用旧列名（无 asic1a 列）; 兼容读取
+    # 归档 CSV 用旧列名（无 asic1a 列）；兼容读取
     import csv as _csv
     with open(archive_csv, newline="", encoding="utf-8") as f:
         rows = list(_csv.DictReader(f))
 
-    # 去重: 同一 var 只取第一条（归档不应有重复, 但防御）
+    # 去重：同一 var 只取第一条（归档不应有重复，但防御）
     seen_var, plans = set(), []
     skipped = []
     for r in rows:

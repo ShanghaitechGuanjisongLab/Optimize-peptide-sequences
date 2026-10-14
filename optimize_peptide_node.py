@@ -105,12 +105,12 @@ import optimize_peptide_infinite as inf          # 复用候选流/启发式挑�
 
 # ===================== 配置 =====================
 
-# 靶标真源在 optimize_peptide_infinite（已含 ASIC1A 同源三聚体）, 此处不重复定义
+# 靶标真源在 optimize_peptide_infinite（已含 ASIC1A 同源三聚体），此处不重复定义
 TARGET_ORDER      = inf.TARGET_ORDER
-DEFAULT_TARGETS   = "HTR1A,BIN1,ASIC1A"  # 新阶段: 目标 = 三 ipTM 乘积最大
+DEFAULT_TARGETS   = "HTR1A,BIN1,ASIC1A"  # 新阶段：目标 = 三 ipTM 乘积最大
 CYCLE_SEQS        = 8                  # 每轮序列数（×靶标数 = 每轮任务数）
-CYCLE_FIXED_SEC   = 4703.0             # 每轮固定开销: 三个 chain B 的 MSA（实测 2026-10-13）ASIC1a 526aa=1410s + HTR1A 422aa=1738s + BIN1 593aa=1555s ≈ 78min（同源多聚体的拷贝链 MSA 被 functools.cache 缓存: chain C/D 实测仅 0.02s）
-CYCLE_PER_SEQ_SEC = 3500.0             # 每序列边际（实测）: 肽链A MSA 708s +ASIC1a 理 2735s(1597 tokens×5 samples, 显存99%溢出) + HTR1A/BIN1 推理 ~400s gap-fill 行（只缺 ASIC1A）约 3440s/序列; 新序列（三靶标）约 3970s/序列
+CYCLE_FIXED_SEC   = 4703.0             # 每轮固定开销：三个 chain B 的 MSA（实测 2026-10-13）ASIC1a 526aa=1410s + HTR1A 422aa=1738s + BIN1 593aa=1555s ≈ 78min（同源多聚体的拷贝链 MSA 被 functools.cache 缓存：chain C/D 实测仅 0.02s）
+CYCLE_PER_SEQ_SEC = 3500.0             # 每序列边际（实测）：肽链A MSA 708s +ASIC1a 理 2735s（1597 tokens×5 samples，显存99%溢出）+ HTR1A/BIN1 推理 ~400s gap-fill 行（只缺 ASIC1A）约 3440s/序列；新序列（三靶标）约 3970s/序列
 SAFETY_MARGIN_SEC = 1200               # 距 SLURM 时限的安全余量（20min）
 MAX_HOURS_DEFAULT = 118.0              # 5 天(120h)上限减去 2h 余量
 EMPTY_CYCLE_LIMIT = 3                  # 连续 N 轮零产出即退出（避免空烧 5 天）

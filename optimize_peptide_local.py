@@ -851,7 +851,7 @@ def build_loop_job_cmd(targets, cycle_seqs, max_hours=None):
         f"PEPOPT_MAX_HOURS={budget_h}",
         f"PEPOPT_GPUS_PER_JOB={n_gpu}",           # banner 展示用（权威值）
         f"PEPOPT_TIME_REQUESTED={limit_h}h",
-        # ⭐ token 上限必须透传到作业内: 否则作业里 GPU_MAX_TOKENS 回到默认 1280，Asic1a 三聚体(1598 tokens)会被 prepare_cycle/gap-fill 静默跳过，表现为\"排入 0 个任务\"的空转循环（2026-10-13 dry-run 实测踩到）。
+        # ⭐ token 上限必须透传到作业内：否则作业里 GPU_MAX_TOKENS 回到默认 1280，Asic1a 三聚体（1598 tokens）会被 prepare_cycle/gap-fill 静默跳过，表现为“排入 0 个任务”的空转循环（2026-10-13 dry-run 实测踩到）。
         f"PEPOPT_GPU_MAX_TOKENS={GPU_MAX_TOKENS}",
         # 以下两项仅在迁移 A100/H100 时需要改（triton flash attn + 关 7.x XLA 补丁）
         f"PEPOPT_FLASH_ATTN={FLASH_ATTENTION_IMPL}",
@@ -902,7 +902,7 @@ def submit_loop_job(targets, cycle_seqs, max_hours=None):
 def estimate_tokens(input_json_path):
     """从 AF3 输入 JSON 估算 token 数（蛋白/核酸链按序列长度计）。用于提交前判断是否会超出 GPU 的 token 上限而 OOM。无法解析时返回 0（不拦截）。
 
-    同源多聚体（同一序列挂多个链 ID, 如 Asic1a 三聚体 id ['B','C','D']）**按链数倍乘**——AF3 的 token 预算按残基数算, 3 份拷贝 = 3× 残基。"""
+    同源多聚体（同一序列挂多个链 ID，如 Asic1a 三聚体 id ['B','C','D']）**按链数倍乘**——AF3 的 token 预算按残基数算，3 份拷贝 = 3× 残基。"""
     try:
         with open(input_json_path, encoding="utf-8") as f:
             job = json.load(f)
@@ -1005,7 +1005,7 @@ def write_input_json(peptide_seq, target_seq, job_name, result_dir,
                     target_copies=1):
     """写入单任务的 AF3 输入 JSON（提交由打包机制统一处理）。
 
-    target_copies: 靶标链数（同源多聚体）; 3 = Asic1a 同源三聚体（详见peptide_common.create_af3_json）。"""
+    target_copies：靶标链数（同源多聚体）；3 = Asic1a 同源三聚体（详见peptide_common.create_af3_json）。"""
     input_json = os.path.join(result_dir, "input.json")
     job = create_af3_json(peptide_seq, target_seq, job_name,
                           target_copies=target_copies)
