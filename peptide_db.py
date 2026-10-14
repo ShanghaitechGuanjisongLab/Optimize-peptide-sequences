@@ -45,13 +45,18 @@ from datetime import datetime
 
 DEFAULT_DB_ROOT = "/public_bme2/Share200T/管吉松/peptide_opt_db"
 SUMMARY_SUFFIX = "_summary_confidences.json"
-TARGETS_ALL = ("HTR1A", "BIN1", "UNC13C")
+TARGETS_ALL = ("ASIC1A", "HTR1A", "BIN1", "UNC13C")
+
+# 同源多聚体靶标的链数（AF3 输入里挂几个链 ID）。单体为 1（缺省）。
+# 影响评分提取: 多聚体的"肽-靶标界面 ipTM"= chain_pair_iptm[0][1..N] 的组合，而非全局 iptm（全局会被多聚体自身亚基间界面抬高, 稀释肽结合信号）。
+TARGET_COPIES = {"ASIC1A": 3}
 
 MASTER_FIELDS = ["tag", "peptide", "var_region",
+                 "iptm_asic1a", "iptm_asic1a_mean", "ranking_asic1a",
                  "iptm_htr1a", "score_htr1a", "ranking_htr1a",
                  "iptm_bin1", "ranking_bin1",
                  "iptm_unc13c", "ranking_unc13c",
-                 "source", "created_at", "updated_at"]
+                 "objective_product", "source", "created_at", "updated_at"]
 
 SEQREG_FIELDS = ["tag", "var_region", "peptide", "first_seen"]
 
@@ -311,6 +316,9 @@ def load_database():
         by_tag[r["tag"]] = {
             "peptide": r["peptide"],
             "var": r["var_region"],
+            "iptm_asic1a": _to_float(r["iptm_asic1a"]),
+            "iptm_asic1a_mean": _to_float(r["iptm_asic1a_mean"]),
+            "ranking_asic1a": _to_float(r["ranking_asic1a"]),
             "iptm_htr1a": _to_float(r["iptm_htr1a"]),
             "score_htr1a": _to_float(r["score_htr1a"]),
             "ranking_htr1a": _to_float(r["ranking_htr1a"]),
@@ -318,14 +326,27 @@ def load_database():
             "ranking_bin1": _to_float(r["ranking_bin1"]),
             "iptm_unc13c": _to_float(r["iptm_unc13c"]),
             "ranking_unc13c": _to_float(r["ranking_unc13c"]),
+            "objective_product": _to_float(r["objective_product"]),
         }
     return by_tag
 
 
+def objective_product(row):
+    """新阶段目标函数: ipTM(肽-Asic1a) × ipTM(肽-HTR1A) × ipTM(肽-BIN1),
+    **越大越好**。任一因子缺失返回 None（不参与排名）。
+    兼容两种输入: load_database() 的 float dict 与 CSV 原始字符串行。"""
+    vals = [_to_float(row.get(k))
+            for k in ("iptm_asic1a", "iptm_htr1a", "iptm_bin1")]
+    if any(v is None for v in vals):
+        return None
+    return vals[0] * vals[1] * vals[2]
+
+
 def upsert_result(tag, target, iptm, ranking=None, peptide=None, var=None,
-                  source="local"):
+                  source="local", iptm_mean=None):
     """写入/更新某序列某靶标的 ipTM（行不存在则新建）。iptm/ranking 为 None
-    时对应字段留空。返回该行 dict。"""
+    时对应字段留空。iptm_mean 供多聚体靶标存辅助均值（iptm_<t>_mean）。
+    每次写入后自动重算 objective_product 列。返回该行 dict。"""
     target = target.upper()
     col = f"iptm_{target.lower()}"
     rk_col = f"ranking_{target.lower()}"
@@ -346,11 +367,19 @@ def upsert_result(tag, target, iptm, ranking=None, peptide=None, var=None,
             rows[idx]["score_htr1a"] = f"{round(1.0 - float(iptm), 4):.4f}"
     if rk_col in MASTER_FIELDS and ranking is not None:
         rows[idx][rk_col] = f"{float(ranking):.4f}"
+    if iptm_mean is not None:
+        mean_col = f"iptm_{target.lower()}_mean"
+        if mean_col in MASTER_FIELDS:
+            rows[idx][mean_col] = f"{float(iptm_mean):.4f}"
     rows[idx]["updated_at"] = _now()
     if peptide and not rows[idx]["peptide"]:
         rows[idx]["peptide"] = peptide
     if var and not rows[idx]["var_region"]:
         rows[idx]["var_region"] = var
+    # 自动维护目标乘积列（三因子齐备才填, 否则留空）
+    if "objective_product" in MASTER_FIELDS:
+        prod = objective_product(rows[idx])
+        rows[idx]["objective_product"] = f"{prod:.6f}" if prod is not None else ""
     _rewrite_master(rows)
     return rows[idx]
 
@@ -366,18 +395,38 @@ def find_summary(result_dir):
     return hits[0] if hits else None
 
 
-def extract_scores(summary_path):
-    """从磁盘上的 *_summary_confidences.json 提取 iptm/ptm/ranking。"""
+def extract_scores(summary_path, target=None):
+    """从磁盘上的 *_summary_confidences.json 提取评分。
+
+    target: 靶标名（如 'ASIC1A'）。决定用哪个 ipTM 作主值:
+      - 单体靶标: 主值 = chain_pair_iptm[0][1]（肽-靶标二元界面, 与全局一致）;
+      - 同源多聚体靶标(TARGET_COPIES): 主值 = 肽链(A)对各亚基(B,C,...)的chain_pair_iptm[0][1..N] **取最大**（肽结合在哪个亚基界面, 哪个就是真实结合信号）。全局 iptm 会被多聚体自身亚基间界面抬高, 不能用。同时返回 mean（辅助诊断）。
+    """
     try:
         with open(summary_path) as f:
             c = json.load(f)
-        return {"iptm": c.get("iptm", 0.0),
-                "ptm": c.get("ptm", 0.0),
-                "ranking_score": c.get("ranking_score", 0.0),
-                "fraction_disordered": c.get("fraction_disordered", 0.0),
-                "has_clash": c.get("has_clash", False)}
     except (OSError, ValueError):
         return None
+
+    global_iptm = c.get("iptm", 0.0)
+    cpm = c.get("chain_pair_iptm", [])
+    n_copies = TARGET_COPIES.get((target or "").upper(), 1)
+    # 肽=链0; 靶标各亚基=链1..n_copies（AF3 输出链序与输入 id 顺序一致）
+    if cpm and len(cpm) > 0 and len(cpm[0]) >= 1 + n_copies:
+        iface = [cpm[0][i] for i in range(1, 1 + n_copies)]
+        iptm_main = max(iface)          # 最佳肽-亚基界面 = 真实结合位点置信度
+        iptm_mean = sum(iface) / len(iface)
+    else:
+        # 矩阵缺失/尺寸不符 → 回退全局(二元体系下二者等价)
+        iptm_main = iptm_mean = global_iptm
+
+    return {"iptm": iptm_main,
+            "iptm_mean": iptm_mean,
+            "iptm_global": global_iptm,
+            "ptm": c.get("ptm", 0.0),
+            "ranking_score": c.get("ranking_score", 0.0),
+            "fraction_disordered": c.get("fraction_disordered", 0.0),
+            "has_clash": c.get("has_clash", False)}
 
 
 _AA3TO1 = {
@@ -482,7 +531,7 @@ def harvest_results(results_root=None):
         if summary is None:
             skipped[key] = "无 summary_confidences.json"
             continue
-        scores = extract_scores(summary)
+        scores = extract_scores(summary, target)
         if not scores:
             skipped[key] = "评分解析失败"
             continue
@@ -490,7 +539,7 @@ def harvest_results(results_root=None):
         upsert_result(tag, target, scores["iptm"],
                       ranking=scores.get("ranking_score"),
                       peptide=info.get("peptide"), var=info.get("var"),
-                      source="local")
+                      source="local", iptm_mean=scores.get("iptm_mean"))
         n_new += 1
         try:
             os.makedirs(canon, exist_ok=True)
@@ -499,6 +548,76 @@ def harvest_results(results_root=None):
         except OSError:
             pass
     return n_new, skipped
+
+
+# ---------------------------------------------------------------------
+# 归档数据导入（复用旧库已算好的 HTR1A/BIN1, 避免重复计算）
+# ---------------------------------------------------------------------
+
+def import_archived(archive_csv, source="archived", dry_run=False):
+    """把归档主表的行导入当前库, **复用已算好的 ipTM 数值**。
+
+    场景: 新阶段目标改为 ipTM(Asic1a)×ipTM(HTR1A)×ipTM(BIN1) 的乘积，而旧库已有 653 个序列的 HTR1A/BIN1（占目标三因子中的两个）→导入后 gap-fill 只需为它们补算 Asic1a 一项（省 2/3 算力）。
+
+    关键点:
+      - 标签按**当前 make_tag 重新派生**（旧库是 5 位十进制旧规则, 新规则是 crc32 全 hex）; 若直接沿用旧标签, 未来 make_tag(var) 会得到不同标签 → 同一序列被视为新候选重复计算（正是要避免的）。
+      - 只导数值不导结构包（结构在归档目录, 不占新库空间）。
+      - iptm_asic1a 留空 → 目标乘积留空, 待 Asic1a 补算后自动填。
+
+    返回 (导入行数, 跳过原因列表)。"""
+    if not os.path.isfile(archive_csv):
+        return 0, [f"归档文件不存在: {archive_csv}"]
+
+    # 归档 CSV 用旧列名（无 asic1a 列）; 兼容读取
+    import csv as _csv
+    with open(archive_csv, newline="", encoding="utf-8") as f:
+        rows = list(_csv.DictReader(f))
+
+    # 去重: 同一 var 只取第一条（归档不应有重复, 但防御）
+    seen_var, plans = set(), []
+    skipped = []
+    for r in rows:
+        var = (r.get("var_region") or "").strip()
+        pep = (r.get("peptide") or "").strip()
+        if not var or not pep:
+            skipped.append(f"缺序列字段: {r.get('tag')}")
+            continue
+        if var in seen_var:
+            continue
+        seen_var.add(var)
+        h = _to_float(r.get("iptm_htr1a"))
+        b = _to_float(r.get("iptm_bin1"))
+        u = _to_float(r.get("iptm_unc13c"))
+        if h is None and b is None:
+            skipped.append(f"无任何 ipTM 数值, 跳过: {var}")
+            continue
+        plans.append({"var": var, "peptide": pep,
+                      "htr1a": h, "bin1": b, "unc13c": u,
+                      "rank_htr1a": _to_float(r.get("ranking_htr1a")),
+                      "rank_bin1": _to_float(r.get("ranking_bin1"))})
+
+    if dry_run:
+        return len(plans), skipped
+
+    n = 0
+    for p in plans:
+        tag = make_tag(p["var"])           # 新规则标签（非旧库的 5 位）
+        try:
+            register_sequence(tag, p["var"], p["peptide"])
+        except RuntimeError as e:
+            skipped.append(str(e))
+            continue
+        if p["htr1a"] is not None:
+            upsert_result(tag, "HTR1A", p["htr1a"], ranking=p["rank_htr1a"],
+                          peptide=p["peptide"], var=p["var"], source=source)
+        if p["bin1"] is not None:
+            upsert_result(tag, "BIN1", p["bin1"], ranking=p["rank_bin1"],
+                          peptide=p["peptide"], var=p["var"], source=source)
+        if p["unc13c"] is not None:
+            upsert_result(tag, "UNC13C", p["unc13c"],
+                          peptide=p["peptide"], var=p["var"], source=source)
+        n += 1
+    return n, skipped
 
 
 # ---------------------------------------------------------------------
@@ -577,9 +696,11 @@ def stats():
     by_tag = load_database()
     return {
         "total": len(by_tag),
+        "asic1a": sum(1 for r in by_tag.values() if r.get("iptm_asic1a") is not None),
         "htr1a": sum(1 for r in by_tag.values() if r.get("iptm_htr1a") is not None),
         "bin1": sum(1 for r in by_tag.values() if r.get("iptm_bin1") is not None),
         "unc13c": sum(1 for r in by_tag.values() if r.get("iptm_unc13c") is not None),
+        "product": sum(1 for r in by_tag.values() if r.get("objective_product") is not None),
         "root": db_root(),
     }
 

@@ -59,18 +59,20 @@ import optimize_peptide_BO as bo              # 特征化 + GP + cEI 采集函�
 # 防御: 无论 loc 以何种顺序被导入, 都把其结果目录强制对齐到共享库, 保证推理任务的 input.json 与结果一定落在共享盘（而非家目录 af3_local_results）。
 loc.LOCAL_RESULTS_DIR = db.results_dir()
 
-from peptide_common import (SEQ_202, FIXED_A, ORIG_TAIL,
-                            HTR1A_SEQ, UNC13C_SEQ, BIN1_SEQ, generate_mutant,
-                            enumerate_space)
+from peptide_common import (SEQ_202, FIXED_A, ORIG_TAIL,HTR1A_SEQ, UNC13C_SEQ, BIN1_SEQ, ASIC1A_SEQ,generate_mutant, enumerate_space)
 
 # ===================== 配置 =====================
 
-TARGET_SEQS   = {"HTR1A": HTR1A_SEQ, "UNC13C": UNC13C_SEQ, "BIN1": BIN1_SEQ}
-TARGET_ORDER  = ["HTR1A", "UNC13C", "BIN1"]      # 固定评估顺序
-OFF_TARGETS   = ["UNC13C", "BIN1"]               # 底线蛋白（越低越好）
+TARGET_SEQS   = {"ASIC1A": ASIC1A_SEQ, "HTR1A": HTR1A_SEQ,
+                 "UNC13C": UNC13C_SEQ, "BIN1": BIN1_SEQ}
+TARGET_ORDER  = ["ASIC1A", "HTR1A", "BIN1", "UNC13C"]  # 固定评估顺序
+OFF_TARGETS   = ["UNC13C", "BIN1"]               # 旧阶段底线蛋白（越低越好）
 OFF_COL       = {"UNC13C": "iptm_unc13c", "BIN1": "iptm_bin1"}
+# 同源多聚体靶标的拷贝数（AF3 输入挂几个链 ID）; 新阶段目标乘积的三因子
+TARGET_COPIES = {"ASIC1A": 3}
+PRODUCT_TARGETS = ["ASIC1A", "HTR1A", "BIN1"]   # 目标乘积 = 三者 ipTM 之积
 
-DEFAULT_TARGETS      = "HTR1A,BIN1"              # V100 现状: 搁置 UNC13C
+DEFAULT_TARGETS      = "HTR1A,BIN1"              # 旧阶段默认（V100 搁置 UNC13C）
 OFF_THRESHOLD        = 0.8                       # 底线蛋白可行阈值
 MIN_GP_SAMPLES       = 12                        # 冷启动评估数（不足时纯随机探索）
 EXPLORE_FRAC         = 0.25                      # 每轮随机探索比例（攒数据库多样性）
@@ -122,15 +124,23 @@ class CandidateStream:
 # ===================== 数据库视图辅助 =====================
 
 def db_evaluated_rows(active_targets):
-    """已评估(所有激活靶标齐备)的行: [(peptide, score_htr1a, {约束值})]"""
+    """已评估行（含目标乘积与各因子）: [dict]。
+
+    row["objective"] = ipTM(ASIC1A)×ipTM(HTR1A)×ipTM(BIN1)（越大越好,
+    三因子齐备才算）; row["score_htr1a"] 保留供旧阶段兼容。"""
     by_tag = db.load_database()
     rows = []
     for tag, r in by_tag.items():
         if r.get("iptm_htr1a") is None or not r.get("peptide"):
             continue
         cons = {OFF_COL[t]: r.get(OFF_COL[t]) for t in active_targets if t in OFF_COL}
+        obj = db.objective_product(r)
         rows.append({"tag": tag, "peptide": r["peptide"],
-                     "score_htr1a": r["score_htr1a"], "cons": cons})
+                     "score_htr1a": r["score_htr1a"], "cons": cons,
+                     "objective": obj,
+                     "iptm_asic1a": r.get("iptm_asic1a"),
+                     "iptm_htr1a": r.get("iptm_htr1a"),
+                     "iptm_bin1": r.get("iptm_bin1")})
     return rows
 
 
@@ -472,15 +482,25 @@ def harvest_and_report(active_targets):
         cons = [r["cons"].get(OFF_COL[t]) for t in active_targets if t in OFF_COL]
         if all(v is not None and v < OFF_THRESHOLD for v in cons):
             evaluable.append(r)
-    best3 = sorted(rows, key=lambda r: r["score_htr1a"])[:3]
-    print(f"  🗄️  数据库: 总 {s['total']} 序列 | HTR1A {s['htr1a']} | "
-          f"BIN1 {s['bin1']} | UNC13C {s['unc13c']} | 完整评估 {len(rows)} | "
-          f"当前可行 {len(evaluable)}", flush=True)
+    # 排名: 新阶段看目标乘积（降序）; 乘积未齐(缺因子)的排后面按 score 兼容
+    def _key(r):
+        if r.get("objective") is not None:
+            return (0, -r["objective"])
+        return (1, r["score_htr1a"])
+    best3 = sorted(rows, key=_key)[:3]
+    print(f"  🗄️  数据库: 总 {s['total']} 序列 | ASIC1A {s.get('asic1a', '-')} | "
+          f"HTR1A {s['htr1a']} | BIN1 {s['bin1']} | UNC13C {s['unc13c']} | "
+          f"完整评估 {len(rows)} | 当前可行 {len(evaluable)}", flush=True)
     for r in best3:
-        cons = " ".join(f"{t}={r['cons'].get(OFF_COL[t])}" for t in active_targets
-                        if t in OFF_COL)
-        print(f"     🏅 {r['peptide']}  ipTM_HTR1A={1 - r['score_htr1a']:.3f}  {cons}",
-              flush=True)
+        if r.get("objective") is not None:
+            print(f"     🏅 {r['peptide']}  乘积={r['objective']:.4f}  "
+                  f"(Asic1a={r['iptm_asic1a']:.2f} HTR1A={r['iptm_htr1a']:.2f} "
+                  f"BIN1={r['iptm_bin1']:.2f})", flush=True)
+        else:
+            cons = " ".join(f"{t}={r['cons'].get(OFF_COL[t])}" for t in active_targets
+                            if t in OFF_COL)
+            print(f"     🏅 {r['peptide']}  ipTM_HTR1A={1 - r['score_htr1a']:.3f}  {cons}",
+                  flush=True)
     return n_new
 
 

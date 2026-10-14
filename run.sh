@@ -84,13 +84,18 @@ install_watchdog() {
     # cron 环境 PATH 极简, 不含 SLURM(/opt/gridview/slurm/bin) 与 conda,
     # 而驱动要调 sbatch/squeue/scontrol → 必须把登录时的完整 PATH 写进来。
     echo "PATH=$PATH"
-    echo "*/$WATCHDOG_INTERVAL * * * * $wd >/dev/null 2>&1"
+    # 战役参数必须烙进 crontab 行: cron 无登录环境, 缺省会读到默认 DB/靶标→续交的作业会打回旧库或跑错靶标（多战役并存时串库）。
+    echo "PEPOPT_DB_ROOT=${PEPOPT_DB_ROOT:-/public_bme2/Share200T/管吉松/peptide_opt_db}"
+    echo "PEPOPT_TARGETS=${PEPOPT_TARGETS:-HTR1A,BIN1}"
+    echo "PEPOPT_CYCLE_SEQS=${PEPOPT_CYCLE_SEQS:-24}"
+    echo "*/$WATCHDOG_INTERVAL * * * * $WATCHDOG >/dev/null 2>&1"
     echo "$BLOCK_END"
   } >> "$tmp"
   if crontab "$tmp"; then
     [[ "$wd" == "$LOOP_WATCHDOG" ]] \
       && echo "🩺 cron 看门狗已装: 每 ${WATCHDOG_INTERVAL} 分钟检查（循环作业不在队列就续交）" \
       || echo "🩺 cron 看门狗已装(legacy 驱动形态): 每 ${WATCHDOG_INTERVAL} 分钟自愈一次"
+    echo "   📌 烙入的战役参数: DB_ROOT=${PEPOPT_DB_ROOT:-默认} | TARGETS=${PEPOPT_TARGETS:-HTR1A,BIN1}"
     echo "   卸载: ./run.sh no-watchdog"
   else
     echo "⚠️  crontab 安装失败"
