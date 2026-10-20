@@ -1,36 +1,36 @@
 """
-小肽序列优化 — 无限搜索入口（V100 现状: HTR1A + BIN1, 结果无限追加进共享数据库）
+小肽序列优化 — 无限搜索入口（V100 现状：HTR1A + BIN1，结果无限追加进共享数据库）
 =============================================================
 背景（2026-10 决策）：
-  - bme_gpupub 分区全是 V100-32GB（官方上限 ~1280 tokens）：肽×HTR1A ≈ 441、肽×BIN1 ≈ 612 可算；肽×UNC13C ≈ 2233 超限, 暂时搁置。
-  - 因此现阶段搜索目标调整为: **HTR1A ipTM 尽量大, BIN1 ipTM < 0.8**（UNC13C 约束去掉；由此得到的"最佳"未来可能部分因 UNC13C 越线被筛除, 所以策略是**多算多存**——结果持续追加进共享数据库, 等 A100/H100 到位后直接从数据库里补算 UNC13C 并筛选, 已完成结果不重算）。
+  - bme_gpupub 分区全是 V100-32GB（官方上限 ~1280 tokens）：肽×HTR1A ≈ 441、肽×BIN1 ≈ 612 可算；肽×UNC13C ≈ 2233 超限，暂时搁置。
+  - 因此现阶段搜索目标调整为：**HTR1A ipTM 尽量大，BIN1 ipTM < 0.8**（UNC13C 约束去掉；由此得到的“最佳”未来可能部分因 UNC13C 越线被筛除，所以策略是**多算多存**——结果持续追加进共享数据库，等 A100/H100 到位后直接从数据库里补算 UNC13C 并筛选，已完成结果不重算）。
 
 与 optimize_peptide_BO.py（有限预算）的关系：
-  本入口是 BO 的"无限 + 数据库化"变体: 复用其序列特征化/高斯过程/约束期望改进采集函数, 但
-    1) 单一真源改为共享数据库（peptide_db.py, 存于共享目录, 计算节点可见）;
-    2) 无预算上限: 候选来自 **精确穷尽枚举**（`enumerate_space()`, 51091 条）;
-    3) 每轮: 收割新完成结果入库 → 刷新 BEST_TOP10 → 按启发式挑选新候选提交→无进展则轮询等待；直到手动终止（SIGINT/SIGTERM 优雅退出）。
+  本入口是 BO 的“无限 + 数据库化”变体：复用其序列特征化/高斯过程/约束期望改进采集函数，但
+    1）单一真源改为共享数据库（peptide_db.py，存于共享目录，计算节点可见）；
+    2）无预算上限：候选来自 **精确穷尽枚举**（`enumerate_space()`，51091 条）；
+    3）每轮：收割新完成结果入库 → 刷新 BEST_TOP10 → 按启发式挑选新候选提交→无进展则轮询等待；直到手动终止（SIGINT/SIGTERM 优雅退出）。
 
-候选调度（2026-10-04 第二次定案: 穷尽队列取代随机采样）：
-  现在的主调度器是 `ExhaustiveQueue` —— 全集为 `peptide_common.enumerate_space()`精确构造的 51091 条（编辑距离 ≤2、长 6~10、20 种标准氨基酸）, 每轮从「全集 − 已派发台账(sequences.csv)」中取 n 条。由此得到三条可证明的性质：
-  **不重复**、待办集合每轮精确定量递减、至多 ⌈51091/24⌉=2129 轮 ≈680 天必然全覆盖（取空后 next_batch 返回 [] = 明确的完成信号）。GP只决定"先跑谁"（cEI 把预测 HTR1A 分高、BIN1 可行的排前面）, 对上述性质零贡献；GP 失效则退化为字典序游标推进, 覆盖与不重复依然成立。
-  取代随机采样的理由（均实测）: 旧 `CandidateStream` 每周期只撒 ~720 个随机点供 GP 排序（argmax 在子集上取, 不在整个空间上）, 且 `generate_mutant` 有**665 条序列永远采不到**（模式B 的 delta=±1 只做单次插入或删除）。退回旧行为: `PEPOPT_SWEEP=0`。
+候选调度（2026-10-04 第二次定案：穷尽队列取代随机采样）：
+  现在的主调度器是 `ExhaustiveQueue` —— 全集为 `peptide_common.enumerate_space()`精确构造的 51091 条（编辑距离 ≤2、长 6~10、20 种标准氨基酸），每轮从「全集 − 已派发台账（sequences.csv）」中取 n 条。由此得到三条可证明的性质：
+  **不重复**、待办集合每轮精确定量递减、至多 ⌈51091/24⌉=2129 轮 ≈680 天必然全覆盖（取空后 next_batch 返回 [] = 明确的完成信号）。GP只决定“先跑谁”（cEI 把预测 HTR1A 分高、BIN1 可行的排前面），对上述性质零贡献；GP 失效则退化为字典序游标推进，覆盖与不重复依然成立。
+  取代随机采样的理由（均实测）：旧 `CandidateStream` 每周期只撒 ~720 个随机点供 GP 排序（argmax 在子集上取，不在整个空间上），且 `generate_mutant` 有**665 条序列永远采不到**（模式B 的 delta=±1 只做单次插入或删除）。退回旧行为：`PEPOPT_SWEEP=0`。
 
-仍保留的启发式先后顺序（只影响次序, 不影响覆盖保证）：
-  1) 先评估初始序列 SEQ_202（基线锚点）;
-  2) 评估数 < MIN_GP_SAMPLES(默认 12) 时, 整批走字典序游标（冷启动）;
-  3) 之后每轮 batch 中 ~EXPLORE_FRAC(默认 25%) 配额仍按字典序游标推进（游标 = 已派发数, 跨作业重启自动接续）, 其余按约束期望改进cEI = EI(score=1-ipTM_HTR1A) × P(ipTM_BIN1 < 0.8) 挑选;
-  4) GP 训练集超 TRAIN_CAP(默认 2000) 时做确定性分层子采样 —— 因为拟合是O(n³)（实测 4000 条已 52s, 外推 5 万条 ≈9.6h > 周期预算）, 而全空间打分实测仅 ≈1s, 故瓶颈在训练侧不在候选侧。
+仍保留的启发式先后顺序（只影响次序，不影响覆盖保证）：
+  1）先评估初始序列 SEQ_202（基线锚点）；
+  2）评估数 < MIN_GP_SAMPLES（默认 12）时，整批走字典序游标（冷启动）；
+  3）之后每轮 batch 中 ~EXPLORE_FRAC（默认 25%）配额仍按字典序游标推进（游标 = 已派发数，跨作业重启自动接续），其余按约束期望改进cEI = EI(score=1-ipTM_HTR1A) × P(ipTM_BIN1 < 0.8) 挑选；
+  4）GP 训练集超 TRAIN_CAP（默认 2000）时做确定性分层子采样 —— 因为拟合是O(n³)（实测 4000 条已 52s，外推 5 万条 ≈9.6h > 周期预算），而全空间打分实测仅 ≈1s，故瓶颈在训练侧不在候选侧。
 
-用法（登录节点, 建议经 run.sh infinite 后台运行）：
+用法（登录节点，建议经 run.sh infinite 后台运行）：
     python optimize_peptide_infinite.py                  # 默认 --targets HTR1A,BIN1
     python optimize_peptide_infinite.py --migrate       # 先把家目录旧结果迁入共享库再开跑
     python optimize_peptide_infinite.py --batch 6 --poll 300
-    python optimize_peptide_infinite.py --status         # 只打印数据库统计与最佳结果, 不开跑
-终止：kill <PID>（或 Ctrl+C）；已提交的 SLURM 作业不受影响, 重跑即续作。
+    python optimize_peptide_infinite.py --status         # 只打印数据库统计与最佳结果，不开跑
+终止：kill <PID>（或 Ctrl+C）；已提交的 SLURM 作业不受影响，重跑即续作。
 
-共享数据库（peptide_db, 默认 /public_bme2/Share200T/管吉松/peptide_opt_db）：
-    peptide_database.csv  每序列一行: iptm_htr1a / iptm_bin1 / iptm_unc13c(现为空)
+共享数据库（peptide_db，默认 /public_bme2/Share200T/管吉松/peptide_opt_db）：
+    peptide_database.csv  每序列一行：iptm_htr1a / iptm_bin1 / iptm_unc13c（现为空）
     sequences.csv         tag → 序列注册表
     af3_results/<tag>_<target>/   全部 AF3 结果（输入/输出/评分）
     BEST_TOP10/           当前 top10 的 HTR1A 结构包 + BEST_TOP10.csv
@@ -38,7 +38,7 @@
 将来 UNC13C 解锁（申请到 A100/H100-80G）：
     PEPOPT_GPU_MAX_TOKENS=5120 PEPOPT_FLASH_ATTN=triton PEPOPT_XLA_7X=0 \
     PEPOPT_PARTITION=<新分区> python optimize_peptide_infinite.py --targets HTR1A,BIN1,UNC13C
-  已入库序列只补算 UNC13C（HTR1A/BIN1 直接复用）, refresh_best 自动按全约束重排。
+  已入库序列只补算 UNC13C（HTR1A/BIN1 直接复用），refresh_best 自动按全约束重排。
 """
 
 import os
@@ -49,14 +49,15 @@ import random
 import argparse
 import numpy as np
 
-# 注意: 必须在 import optimize_peptide_local **之前**设定结果目录环境变量, 该模块在 import 时读取 PEPOPT_RESULTS_DIR（指向共享库的 af3_results/）。
+# 注意：必须在 import optimize_peptide_local **之前**设定结果目录环境变量，该模块在 import 时读取 PEPOPT_RESULTS_DIR（指向共享库的 af3_results/）。
 import peptide_db as db
 os.environ.setdefault("PEPOPT_RESULTS_DIR", db.results_dir())
 
 import optimize_peptide_local as loc          # 本地集群提交后端（复用打包/节流/OOM拦截）
 import optimize_peptide_BO as bo              # 特征化 + GP + cEI 采集函数（复用）
+import peptide_seq_sample as seq_sample        # 序贯采样×目标乘积×β拟合入库与数据库整理
 
-# 防御: 无论 loc 以何种顺序被导入, 都把其结果目录强制对齐到共享库, 保证推理任务的 input.json 与结果一定落在共享盘（而非家目录 af3_local_results）。
+# 防御：无论 loc 以何种顺序被导入，都把其结果目录强制对齐到共享库，保证推理任务的 input.json 与结果一定落在共享盘（而非家目录 af3_local_results）。
 loc.LOCAL_RESULTS_DIR = db.results_dir()
 
 from peptide_common import (SEQ_202, FIXED_A, ORIG_TAIL,HTR1A_SEQ, UNC13C_SEQ, BIN1_SEQ, ASIC1A_SEQ,generate_mutant, enumerate_space)
@@ -76,7 +77,7 @@ DEFAULT_TARGETS      = "HTR1A,BIN1"              # 旧阶段默认（V100 搁置
 OFF_THRESHOLD        = 0.8                       # 底线蛋白可行阈值
 MIN_GP_SAMPLES       = 12                        # 冷启动评估数（不足时纯随机探索）
 EXPLORE_FRAC         = 0.25                      # 每轮随机探索比例（攒数据库多样性）
-# 每轮 GP 挑选的序列数。**与 loc.BUNDLE_SIZE 解耦**: 包容量大是为了摊薄55min固定 MSA 开销(见 optimize_peptide_local), 但每轮 GP 只应挑少量高信息量候选——样本还不多(几十条)时一次挑几十个会让采集函数退化、重复采样低价值区域。差额由 submit_pending_bundle 的"攒批"机制补齐: 多轮各挑几个, 攒满一包才提交, 期间每轮先收割新结果 → GP 持续变强, 既不空转 GPU 也不牺牲引导质量。（复用 loc._env_int: 未设/空串取默认, 非法值告警后取默认, 切勿用 int(x or d) 写法）
+# 每轮 GP 挑选的序列数。**与 loc.BUNDLE_SIZE 解耦**：包容量大是为了摊薄55min固定 MSA 开销（见 optimize_peptide_local），但每轮 GP 只应挑少量高信息量候选——样本还不多（几十条）时一次挑几十个会让采集函数退化、重复采样低价值区域。差额由 submit_pending_bundle 的“攒批”机制补齐：多轮各挑几个，攒满一包才提交，期间每轮先收割新结果 → GP 持续变强，既不空转 GPU 也不牺牲引导质量。（复用 loc._env_int：未设/空串取默认，非法值告警后取默认，切勿用 int(x or d) 写法）
 DEFAULT_BATCH        = max(1, loc._env_int("PEPOPT_BATCH", 6))
 DEFAULT_POLL         = 300                       # 无进展时的轮询间隔（秒）
 BACKLOG_MULTIPLIER   = 2                         # 积压上限 = BUNDLE_SIZE × 该倍数（个任务）
@@ -94,7 +95,7 @@ def _handle_stop(signum, frame):
 # ===================== 候选池（按需无限扩展） =====================
 
 class CandidateStream:
-    """编辑距离 ≤2 变异序列的惰性无限流（去重, 固定种子可复现）。"""
+    """编辑距离 ≤2 变异序列的惰性无限流（去重，固定种子可复现）。"""
 
     def __init__(self, seed=42):
         self._seen = {SEQ_202}
@@ -115,7 +116,7 @@ class CandidateStream:
         return out
 
     def release(self, seqs):
-        """把未最终提交的候选放回流（GP 短名单只是临时抽样, 不释放会白白消耗候选空间）。"""
+        """把未最终提交的候选放回流（GP 短名单只是临时抽样，不释放会白白消耗候选空间）。"""
         for s in seqs:
             if s != SEQ_202:
                 self._seen.discard(s)
@@ -144,7 +145,7 @@ def db_evaluated_rows(active_targets):
 
 
 def in_flight_task_dirs(active_targets):
-    """共享结果目录中"已创建但未完成"的任务目录（排队/运行中）。"""
+    """共享结果目录中“已创建但未完成”的任务目录（排队/运行中）。"""
     rd = db.results_dir()
     if not os.path.isdir(rd):
         return []
@@ -174,7 +175,7 @@ def known_sequences():
 # ===================== 启发式挑选 =====================
 
 def heuristic_pick(stream, n, active_targets):
-    """按启发式先后顺序挑 n 个新候选：评估样本 < MIN_GP_SAMPLES → 全部随机探索；否则 ~EXPLORE_FRAC 随机探索 + 其余按 cEI(HTR1A 目标 × BIN1 可行概率)。"""
+    """按启发式先后顺序挑 n 个新候选：评估样本 < MIN_GP_SAMPLES → 全部随机探索；否则 ~EXPLORE_FRAC 随机探索 + 其余按 cEI（HTR1A 目标 × BIN1 可行概率）。"""
     rows = db_evaluated_rows(active_targets)
     exclude = known_sequences()
     active_off = [t for t in OFF_TARGETS if t in active_targets]
@@ -197,11 +198,12 @@ def heuristic_pick(stream, n, active_targets):
 
 
 def _gp_pick(rows, active_off, n, exclude, stream):
-    """cEI 挑选: 拟合 GP → 在"新随机候选 + 已有样本邻域"组成的临时候选集上取 TOP。"""
+    """cEI 挑选：拟合 GP → 在“新随机候选 + 已有样本邻域”组成的临时候选集上取 TOP。"""
+    rows, y_of = _gp_objective_rows(rows)        # 新阶段目标 = 三乘积，不足时回退旧目标
     X_obs = np.array([bo.featurize(r["peptide"]) for r in rows])
-    y_obs = np.array([r["score_htr1a"] for r in rows], dtype=float)
+    y_obs = np.array([y_of(r) for r in rows], dtype=float)
 
-    # 临时候选集: 随机撒 40×n 个新序列（无限流的天然探索）
+    # 临时候选集：随机撒 40×n 个新序列（无限流的天然探索）
     cand_seqs = stream.next_batch(max(40 * n, 200), exclude)
     if len(cand_seqs) < 2:
         return []
@@ -225,7 +227,7 @@ def _gp_pick(rows, active_off, n, exclude, stream):
         idx = bo.select_batch(acq, X_cand_s, list(range(len(cand_seqs))), n)
         picked = [cand_seqs[i] for i in idx]
     else:
-        # 采集值全零/异常 → 退化为按 GP 均值(预测分低者优先)排序
+        # 采集值全零/异常 → 退化为按 GP 均值（预测分低者优先）排序
         mu, _ = gp_t.predict(X_cand_s, return_std=True)
         order = np.argsort(mu)[:n]
         picked = [cand_seqs[i] for i in order]
@@ -233,27 +235,35 @@ def _gp_pick(rows, active_off, n, exclude, stream):
     return picked
 
 
-# ===================== 穷尽队列: 不重复 + 有限步全覆盖 =====================
+# ===================== 穷尽队列：不重复 + 有限步全覆盖 =====================
 
 SPACE_EDIT     = loc._env_int("PEPOPT_SPACE_EDIT", 2)
 SPACE_LEN_MIN  = loc._env_int("PEPOPT_SPACE_LEN_MIN", 6)
 SPACE_LEN_MAX  = loc._env_int("PEPOPT_SPACE_LEN_MAX", 10)
-# GP 打分池上限: 0 = **不限制, 对整个待办集打分**（默认）。实测（n_train=34）: 候选 5000 条 0.1s / 20000 条 0.4s / **全部 51091 条仅 1.0s**, 故候选池根本不是瓶颈；早期版本把它限在 20000 只是白费了 GP 的全局视野。保留旋钮仅为日后特征维度大幅上升时可重新收紧。
+# GP 打分池上限：0 = **不限制，对整个待办集打分**（默认）。实测（n_train=34）：候选 5000 条 0.1s / 20000 条 0.4s / **全部 51091 条仅 1.0s**，故候选池根本不是瓶颈；早期版本把它限在 20000 只是白费了 GP 的全局视野。保留旋钮仅为日后特征维度大幅上升时可重新收紧。
 SCORE_POOL_CAP = loc._env_int("PEPOPT_SCORE_POOL", 0)
-# GP **训练集**上限: 真正的瓶颈在这里。实测拟合+预测耗时随 n_train 近似立方增长:
+# GP **训练集**上限：真正的瓶颈在这里。实测拟合+预测耗时随 n_train 近似立方增长：
 #   n_train=34 → 0.5s | 1000 → 7.8s | 2000 → 10.7s | 4000 → 52s | 外推 51091 → ≈9.6h
-# 9.6h 已超过一个周期（n=24 时 7.7h）→ 若不封顶, 穷尽搜索到后期会直接超时。
-# 超限后按确定性分层子采样（见 _subsample_train）, 只影响"先跑谁"的次序, 对不重复/全覆盖三条不变量无影响（best_y 仍取**全量**最优, 不因子采样而失真）。
+# 9.6h 已超过一个周期（n=24 时 7.7h）→ 若不封顶，穷尽搜索到后期会直接超时。
+# 超限后按确定性分层子采样（见 _subsample_train），只影响“先跑谁”的次序，对不重复/全覆盖三条不变量无影响（best_y 仍取**全量**最优，不因子采样而失真）。
 TRAIN_CAP = loc._env_int("PEPOPT_TRAIN_CAP", 2000)
-# 总开关: 置 0 退回旧的随机采样启发式(CandidateStream + heuristic_pick)。
+# 总开关：置 0 退回旧的随机采样启发式（CandidateStream + heuristic_pick）。
 SWEEP_ENABLED = os.environ.get("PEPOPT_SWEEP", "1").strip().lower() not in \
                 ("0", "false", "no", "off")
 
 
-def _subsample_train(rows, cap=TRAIN_CAP):
-    """训练集超限时做**确定性分层子采样**: 一半取当前最优（保住高分区分辨率, cEI 排序最关心这里）, 另一半按 score 排序等距抽样（保住全分布的形状信息）。两条规则都不含随机数 → 同样的库状态必得同样的子集, 跨作业重启可复现。返回 (子集, 未截断的 best_y)； best_y 始终基于全量 rows, 不因截断而偏移。"""
-    srt = sorted(rows, key=lambda r: (r["score_htr1a"], r.get("tag", "")))
-    best_y = float(min(r["score_htr1a"] for r in rows))
+def _gp_objective_rows(rows):
+    """GP 训练目标选择：新阶段目标 = 三乘积 objective（越大越好）→ 取 y = 1-objective（越小越好，与采集函数的最小化约定一致）；乘积齐备的行不足 MIN_GP_SAMPLES 时回退旧目标 score_htr1a（冷启动兼容，避免 GP 无米下锅）。返回（可用行，y 取值函数）。"""
+    full = [r for r in rows if r.get("objective") is not None]
+    if len(full) >= MIN_GP_SAMPLES:
+        return full, lambda r: 1.0 - r["objective"]
+    return rows, lambda r: r["score_htr1a"]
+
+
+def _subsample_train(rows, y_of, cap=TRAIN_CAP):
+    """训练集超限时做**确定性分层子采样**：一半取当前最优（保住高分区分辨率，cEI 排序最关心这里），另一半按 y 排序等距抽样（保住全分布的形状信息）。两条规则都不含随机数 → 同样的库状态必得同样的子集，跨作业重启可复现。返回（子集，未截断的 best_y）；best_y 始终基于全量 rows，不因截断而偏移。"""
+    srt = sorted(rows, key=lambda r: (y_of(r), r.get("tag", "")))
+    best_y = float(min(y_of(r) for r in rows))
     if cap <= 0 or len(rows) <= cap:
         return rows, best_y
     k_best = max(1, cap // 2)
@@ -268,7 +278,7 @@ def _subsample_train(rows, cap=TRAIN_CAP):
 
 
 def attempted_vars():
-    """sequences.csv = **已派发台账**。prepare_cycle 在写任何输入之前先调用register_sequence, 故凡被队列取走过的可变区必然登记在此 —— "不重复"这条性质由台账保证, 不依赖任何内存状态, 因而天然跨作业重启持久。"""
+    """sequences.csv = **已派发台账**。prepare_cycle 在写任何输入之前先调用register_sequence，故凡被队列取走过的可变区必然登记在此 —— “不重复”这条性质由台账保证，不依赖任何内存状态，因而天然跨作业重启持久。"""
     out = set()
     for info in db.load_sequence_registry().values():
         v = info.get("var")
@@ -280,12 +290,12 @@ def attempted_vars():
 class ExhaustiveQueue:
     """确定性穷尽调度器 —— 同时保证【不重复】与【有限步内全覆盖】。
 
-    三条不变量（合起来构成覆盖证明）:
-      A. 全集 S = peptide_common.enumerate_space(): **精确构造**而非随机采样, 因此包含随机采样不可达的 665 条；|S| = 51091, 枚举顺序固定（字典序）, 与随机种子和调用次数无关。
-      B. 待办 P_k = S \\ A_k, 其中 A_k = sequences.csv 已登记台账。prepare_cycle先登记再写输入 → 凡被派发必入 A；于是每周期 |P| 至少减少本批大小, 且**同一序列不可能被二次派发**。
-      C. S 有限 → 至多 ceil(|S|/n) = ceil(51091/24) = 2129 个周期后 P = ∅, 即全覆盖。届时 next_batch 返回空列表, 调用方把它当**完成**而非失败（与旧的 EMPTY_CYCLE_LIMIT"采不到新样本"语义明确区分）。
+    三条不变量（合起来构成覆盖证明）：
+      A. 全集 S = peptide_common.enumerate_space()：**精确构造**而非随机采样，因此包含随机采样不可达的 665 条；|S| = 51091，枚举顺序固定（字典序），与随机种子和调用次数无关。
+      B. 待办 P_k = S \\ A_k，其中 A_k = sequences.csv 已登记台账。prepare_cycle先登记再写输入 → 凡被派发必入 A；于是每周期 |P| 至少减少本批大小，且**同一序列不可能被二次派发**。
+      C. S 有限 → 至多 ceil(|S|/n) = ceil(51091/24) = 2129 个周期后 P = ∅，即全覆盖。届时 next_batch 返回空列表，调用方把它当**完成**而非失败（与旧的 EMPTY_CYCLE_LIMIT“采不到新样本”语义明确区分）。
 
-    GP/贝叶斯在其中的角色: **只决定 P 里先跑谁**（把"预测 HTR1A 分高且BIN1可行"的排在前面, 让好结果尽早入库）, 对 A/B/C 三条不变量毫无贡献。即使 GP 完全失效（样本不足、数值异常、特征退化）, 次序也只是退化为字典序游标推进, 不重复与全覆盖依然成立。这就是"调整调度算法保证不重复并最终全覆盖"的准确含义: **覆盖由枚举 + 台账保证, 不由启发式保证**。
+    GP/贝叶斯在其中的角色：**只决定 P 里先跑谁**（把“预测 HTR1A 分高且BIN1可行”的排在前面，让好结果尽早入库），对 A/B/C 三条不变量毫无贡献。即使 GP 完全失效（样本不足、数值异常、特征退化），次序也只是退化为字典序游标推进，不重复与全覆盖依然成立。这就是“调整调度算法保证不重复并最终全覆盖”的准确含义：**覆盖由枚举 + 台账保证，不由启发式保证**。
     """
 
     CENTER = ORIG_TAIL
@@ -316,18 +326,18 @@ class ExhaustiveQueue:
 
     # ---- 取批 ----
     def next_batch(self, n, rows=None, active_off=None):
-        """取 n 条未派发序列（返回**全序列**形式, 与 prepare_cycle 约定一致）,保证批内互不重复且不与台账重复；剩余不足 n 时返回剩余全部（不伪造）。返回空列表 = 空间已穷尽。"""
+        """取 n 条未派发序列（返回**全序列**形式，与 prepare_cycle 约定一致），保证批内互不重复且不与台账重复；剩余不足 n 时返回剩余全部（不伪造）。返回空列表 = 空间已穷尽。"""
         P = self.pending()
         if n <= 0 or not P:
             return []
         if n >= len(P):
-            return [FIXED_A + v for v in P]         # 末批: 全取, 顺序即字典序
+            return [FIXED_A + v for v in P]         # 末批：全取，顺序即字典序
 
         rows = db_evaluated_rows(self.active) if rows is None else rows
         if active_off is None:
             active_off = [t for t in OFF_TARGETS if t in self.active]
 
-        # 冷启动（GP 不可拟合）时整批走探索；否则保留 EXPLORE_FRAC 配额。探索用**字典序旋转游标**而非随机采样: 游标 = 已派发数（由台账派生,跨作业重启自动接续）, 因此既有系统性覆盖推进, 又完全可复现。
+        # 冷启动（GP 不可拟合）时整批走探索；否则保留 EXPLORE_FRAC 配额。探索用**字典序旋转游标**而非随机采样：游标 = 已派发数（由台账派生，跨作业重启自动接续），因此既有系统性覆盖推进，又完全可复现。
         n_exp = n if len(rows) < MIN_GP_SAMPLES else max(1, int(round(n * EXPLORE_FRAC)))
         n_exp = max(0, min(n_exp, n))
         cur = (len(self.space) - len(P)) % len(P)
@@ -352,21 +362,22 @@ class ExhaustiveQueue:
         return [FIXED_A + v for v in picked[:n]]
 
     def _gp_order(self, P, exclude, rows, active_off, n_gp):
-        """按 cEI 降序产出可变区（稳定排序 → 同分按字典序, 可复现）。exclude 就地累积, 便于调用方复用同一集合去重。"""
+        """按 cEI 降序产出可变区（稳定排序 → 同分按字典序，可复现）。exclude 就地累积，便于调用方复用同一集合去重。"""
         if n_gp <= 0:
             return []
         if SCORE_POOL_CAP > 0 and len(P) > SCORE_POOL_CAP:
             stride = len(P) / float(SCORE_POOL_CAP)
             pool = [P[int(i * stride)] for i in range(SCORE_POOL_CAP)]
         else:
-            pool = list(P)                  # 默认: 对全部待办集打分（实测仅 ≈1s）
+            pool = list(P)                  # 默认：对全部待办集打分（实测仅 ≈1s）
         pool = [v for v in pool if v not in exclude]
         if len(pool) < 2:
             return []
 
-        train, best_y = _subsample_train(rows)      # best_y 基于全量, 不受截断影响
+        rows, y_of = _gp_objective_rows(rows)   # 新阶段目标 = 三乘积，不足时回退旧目标
+        train, best_y = _subsample_train(rows, y_of)   # best_y 基于全量，不受截断影响
         X_obs = self._feat([r["peptide"] for r in train])
-        y_obs = np.array([r["score_htr1a"] for r in train], dtype=float)
+        y_obs = np.array([y_of(r) for r in train], dtype=float)
         X_cand = self._feat([FIXED_A + v for v in pool])
         from sklearn.preprocessing import StandardScaler
         sc = StandardScaler().fit(np.vstack([X_obs, X_cand]))
@@ -383,7 +394,7 @@ class ExhaustiveQueue:
         acq = bo.constrained_acquisition(gp_t, gp_cons, X_cand_s, best_y)
         if bool(np.isfinite(acq).all()) and not np.all(np.isclose(acq, 0)):
             order = np.argsort(-np.asarray(acq, dtype=float), kind="stable")
-        else:                    # 采集退化 → 用 GP 均值(score=1-ipTM, 小者优先)
+        else:                    # 采集退化 → 用 GP 均值（score=1-ipTM，小者优先）
             mu, _ = gp_t.predict(X_cand_s, return_std=True)
             order = np.argsort(mu, kind="stable")
 
@@ -403,7 +414,7 @@ _SWEEP = None
 
 
 def get_sweep(active_targets=None):
-    """穷尽队列单例（枚举 51091 条只需约 0.1s, 但避免每周期重建）。"""
+    """穷尽队列单例（枚举 51091 条只需约 0.1s，但避免每周期重建）。"""
     global _SWEEP
     if _SWEEP is None or (active_targets and tuple(active_targets) != _SWEEP.active):
         _SWEEP = ExhaustiveQueue(tuple(active_targets) if active_targets else None)
@@ -411,12 +422,12 @@ def get_sweep(active_targets=None):
 
 
 def sweep_pick(active_targets, n):
-    """穷尽队列取批（替代随机采样的 heuristic_pick）。返回 [] 表示**空间已穷尽**（应视为正常完成, 而非采样失败）。"""
+    """穷尽队列取批（替代随机采样的 heuristic_pick）。返回 [] 表示**空间已穷尽**（应视为正常完成，而非采样失败）。"""
     return get_sweep(active_targets).next_batch(n)
 
 
 def coverage_report(active_targets, cycle_secs=None, per_cycle=24):
-    """覆盖进度 + ETA 文本。cycle_secs 给出时按每周期 per_cycle 条折算剩余天数。per_cycle由调用方显式传入（不 import optimize_peptide_node, 避免独立运行本模块时的循环导入）。"""
+    """覆盖进度 + ETA 文本。cycle_secs 给出时按每周期 per_cycle 条折算剩余天数。per_cycle由调用方显式传入（不 import optimize_peptide_node，避免独立运行本模块时的循环导入）。"""
     q = get_sweep(active_targets)
     c = q.coverage()
     txt = (f"穷尽覆盖 {c['dispatched']}/{c['total']} ({c['frac'] * 100:.2f}%) "
@@ -433,13 +444,13 @@ def coverage_report(active_targets, cycle_secs=None, per_cycle=24):
 def submit_candidates(seqs, active_targets):
     """注册 + 写输入 + 触发打包提交；若某靶标结果**已就绪**则就地入库。返回提交的序列数。
 
-    复用 optimize_peptide_local.local_predict_and_score: 它按<LOCAL_RESULTS_DIR>/<job_name>布局写 input.json, 并由submit_pending_bundle()统一打包提交（含 MAX_INFLIGHT 节流与失败重试）。job_name 用共享库的稳定规则 <tag>_<target>, 结果直接落共享盘；已就绪的（迁移过的旧结果/上轮完成的）返回 iptm, 即刻 upsert 入库（并写 .harvested, 与 harvest_results 幂等一致）。"""
+    复用 optimize_peptide_local.local_predict_and_score：它按<LOCAL_RESULTS_DIR>/<job_name>布局写 input.json，并由submit_pending_bundle()统一打包提交（含 MAX_INFLIGHT 节流与失败重试）。job_name 用共享库的稳定规则 <tag>_<target>，结果直接落共享盘；已就绪的（迁移过的旧结果/上轮完成的）返回 iptm，即刻 upsert 入库（并写 .harvested，与 harvest_results 幂等一致）。"""
     n = 0
     for seq in seqs:
         if _STOP:
             break
         var = seq[len(FIXED_A):]
-        tag = db.resolve_tag(var)      # 注册表优先: 沿用历史标签, 不孤儿化已有结果
+        tag = db.resolve_tag(var)      # 注册表优先：沿用历史标签，不孤儿化已有结果
         try:
             db.register_sequence(tag, var, seq)
         except RuntimeError as e:
@@ -466,9 +477,14 @@ def submit_candidates(seqs, active_targets):
     return n
 
 
-def harvest_and_report(active_targets):
-    """收割新完成结果入库, 刷新 BEST_TOP10, 打印统计。返回新增条数。"""
+def harvest_and_report(active_targets, new_sample_fn=None):
+    """收割新完成结果入库，序贯采样入库（β 统计量），刷新 BEST_TOP10，打印统计。返回收割新增条数。
+
+    new_sample_fn 透传给数据库整理做补采（真跑 AF3 新 seed）；留 None 时整理只消费池内免费样本。"""
     n_new, skipped = db.harvest_results()
+    n_fit = seq_sample.ingest_new_records(new_sample_fn)
+    if n_fit:
+        print(f"  🧮 序贯采样入库 {n_fit} 条（β 统计量已写入 obj_* 列）", flush=True)
     if n_new:
         print(f"  📥 收割入库 {n_new} 条新结果"
               + (f"（跳过 {len(skipped)}）" if skipped else ""), flush=True)
@@ -510,7 +526,7 @@ def run_infinite(active_targets, batch, poll, backlog_limit):
     os.makedirs(p["results"], exist_ok=True)
     stream = CandidateStream(seed=42)
 
-    # 初始序列永远排第一（基线锚点）: 任一激活靶标无结果即需提交（submit_candidates 幂等, 已完成的靶标会被直接提取评分不重算）
+    # 初始序列永远排第一（基线锚点）：任一激活靶标无结果即需提交（submit_candidates 幂等，已完成的靶标会被直接提取评分不重算）
     var0 = SEQ_202[len(FIXED_A):]
     tag0 = db.resolve_tag(var0)
     need_init = any(
@@ -529,18 +545,18 @@ def run_infinite(active_targets, batch, poll, backlog_limit):
         ts = time.strftime("%Y-%m-%d %H:%M:%S")
         print(f"== [{ts}] 轮次 {round_no} ==", flush=True)
 
-        # 1) 收割 + 最佳刷新 + 统计
+        # 1）收割 + 最佳刷新 + 统计
         harvest_and_report(active_targets)
         if _STOP:
             break
 
-        # 2) 初始序列优先
+        # 2）初始序列优先
         if need_init:
             print("  🧬 提交初始序列 SEQ_202（基线）", flush=True)
             submit_candidates([SEQ_202], active_targets)
             need_init = False
 
-        # 3) 计算积压, 决定是否提交新候选
+        # 3）计算积压，决定是否提交新候选
         inflight = in_flight_task_dirs(active_targets)
         print(f"  🚚 在途任务 {len(inflight)}/{backlog_limit} | "
               f"SLURM 队列深度 {loc.queue_depth()}", flush=True)
@@ -552,10 +568,10 @@ def run_infinite(active_targets, batch, poll, backlog_limit):
                 print(f"  🎯 挑选 {len(picks)} 个新候选提交: "
                       f"{[db.resolve_tag(s[len(FIXED_A):]) for s in picks]}", flush=True)
                 submit_candidates(picks, active_targets)
-        # 即便不提交新候选, 也触发一次打包提交（消化攒批/失败重试）
+        # 即便不提交新候选，也触发一次打包提交（消化攒批/失败重试）
         loc.submit_pending_bundle()
 
-        # 4) 等待一段再进入下一轮（让集群作业有时间产出结果；小步sleep保证 SIGTERM/SIGINT 信号响应及时）
+        # 4）等待一段再进入下一轮（让集群作业有时间产出结果；小步sleep保证 SIGTERM/SIGINT 信号响应及时）
         waited = 0
         while waited < poll and not _STOP:
             time.sleep(min(5, poll - waited))
@@ -625,7 +641,7 @@ def main():
               " 已入库结果自动复用, 仅补算搁置靶标并重排 BEST_TOP10）")
     print("=" * 62)
 
-    # 就绪保障: 预检查(数据库/权重/hmmer) + 解压作业跟随（与有限入口一致）
+    # 就绪保障：预检查（数据库/权重/hmmer）+ 解压作业跟随（与有限入口一致）
     ok, errors = loc.ensure_local_ready()
     if not ok:
         print("\n⚠️  预检查未通过仍将尝试运行: 旧结果可复用, 新提交会被跳过\n",

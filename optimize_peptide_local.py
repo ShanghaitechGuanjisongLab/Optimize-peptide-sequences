@@ -218,10 +218,11 @@ MAX_INFLIGHT    = max(1, QOS_LIMITS["submit"])
 #   V100 (CUDA 算力 7.x) -> 1,280 tokens   <- 当前 bme_gpupub 分区全是 V100 32GB
 #   A100 40GB            -> 4,352 tokens（还需改 model_config.py 的 pair_transition_shard_spec）
 #   A100/H100 80GB       -> 官方支持全尺寸（默认最大 bucket 5,120 tokens）
+# 官方 1,280 是"保证不溢出"的保守值而非硬上限: 实测 Asic1a 三聚体 1,597 tokens 在V100-32GB上真跑成功（unified memory 溢出到主机内存, ≈2735s/5样本, 计时注释见 optimize_peptide_node.py）,故闸门设 2048: 放行 Asic1a（1,597）, 仍拦截 UNC13C（≈2,233, 维持搁置）。
 # 若申请到 A100/H100-80G: 设环境变量 PEPOPT_GPU_MAX_TOKENS=5120 与
 # PEPOPT_FLASH_ATTN=triton（见下）, 并把 runner 的 AF3_NEED_XLA_7X_FLAG 置 0,
 # 即可补齐 UNC13C; 代码无需改动。
-GPU_MAX_TOKENS  = int(os.environ.get("PEPOPT_GPU_MAX_TOKENS", "") or 1280)
+GPU_MAX_TOKENS  = int(os.environ.get("PEPOPT_GPU_MAX_TOKENS", "") or 2048)
 
 # flash attention 实现（对应 run_alphafold.py 的 --flash_attention_implementation）:
 #   "xla"    : 不用 flash attention, 跨设备可用, 但注意力显存 O(N^2)。

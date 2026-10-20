@@ -30,7 +30,7 @@ DISABLED="$RUNS_DIR/loop.disabled"
 LOCK="$RUNS_DIR/loop_watchdog.lock"
 WLOG="$RUNS_DIR/loop_watchdog.log"
 JOB_NAME="pepopt-loop"
-TARGETS="${PEPOPT_TARGETS:-HTR1A,BIN1}"
+TARGETS="${PEPOPT_TARGETS:-HTR1A,BIN1,ASIC1A}"
 CYCLE_SEQS="${PEPOPT_CYCLE_SEQS:-24}"
 
 cd "$REPO" || exit 1

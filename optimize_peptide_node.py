@@ -102,6 +102,8 @@ import optimize_peptide_local as loc
 loc.LOCAL_RESULTS_DIR = db.results_dir()          # 防御: 强制对齐到共享库
 
 import optimize_peptide_infinite as inf          # 复用候选流/启发式挑选/收割报告
+import peptide_seq_sample as seq_sample        # 序贯采样×目标乘积×β拟合入库与数据库整理
+from peptide_common import create_af3_json     # 补采任务的 AF3 输入构造
 
 # ===================== 配置 =====================
 
@@ -149,15 +151,14 @@ def size_next_cycle(remaining_sec, max_seqs):
 
 # ===================== AF3 执行（委托给已验证的 bundle runner）=====================
 
-def build_runner_env(bundle_dir):
+def build_runner_env(bundle_dir, out_dir=None):
     """组装 scripts/af3_bundle_runner.sh 需要的全部 AF3_* 环境变量。
-    与 loc.build_bundle_sbatch_cmd() 的 --export 列表保持一致, 差别仅在于:
-    这里是**进程内 subprocess 继承**而非 sbatch --export。"""
+    与 loc.build_bundle_sbatch_cmd() 的 --export 列表保持一致, 差别仅在于:这里是**进程内 subprocess 继承**而非 sbatch --export。out_dir 覆盖输出根（补采任务写到 _resamples/ 下, 与主结果隔离, 收割路径自动忽略）。"""
     env = os.environ.copy()
     env.update({
         "AF3_CODE_DIR": loc.AF3_CODE_DIR,
         "AF3_BUNDLE_DIR": os.path.abspath(bundle_dir),
-        "AF3_OUT_DIR": os.path.abspath(db.results_dir()),
+        "AF3_OUT_DIR": os.path.abspath(out_dir or db.results_dir()),
         "AF3_MODEL_DIR": loc.LOCAL_MODEL_DIR,
         "AF3_DB_DIR": loc.LOCAL_DB_DIR,
         "AF3_WORK_DIR": _ROOT,
@@ -172,7 +173,7 @@ def build_runner_env(bundle_dir):
     return env
 
 
-def run_af3_cycle(bundle_dir):
+def run_af3_cycle(bundle_dir, out_dir=None):
     """在**本作业内**直接跑 AF3（不再 sbatch）; 返回 runner 退出码。
 
     runner 先复制成**快照**再执行: bash 按字节偏移边读边执行脚本, 而编辑器
@@ -196,7 +197,7 @@ def run_af3_cycle(bundle_dir):
         snap = src
     print("  🚀 启动 AF3 推理（作业内直接执行, 不再 sbatch）", flush=True)
     try:
-        p = subprocess.run(["bash", snap], env=build_runner_env(bundle_dir))
+        p = subprocess.run(["bash", snap], env=build_runner_env(bundle_dir, out_dir))
         return p.returncode
     except Exception as e:                       # noqa: BLE001 - 不能让作业裸崩
         print(f"  ❌ runner 执行异常: {e}", flush=True)
@@ -204,6 +205,78 @@ def run_af3_cycle(bundle_dir):
 
 
 # ===================== 组装一轮 =====================
+
+# 补采输出隔离根: 以下划线开头, harvest_results/in_flight/drain_backlog 都会跳过
+RESAMPLE_ROOT = "_resamples"
+
+
+def make_resample_fn(deadline):
+    """构造数据库整理的批量补采生成器（真跑 AF3 新 seed, 非抽随机数）。
+
+    契约 fn(tags) -> {tag: [新乘积样本…]}（无法生成的 tag 不出现在结果里）。
+    实现: 对每个 tag 的**变因子**靶标（有逐样本数据者, 固定因子是常数无需重跑）各跑一次新 seed 的 AF3 → 逐样本配对相乘得新乘积样本; 一次调用打包成一个 bundle 跑（chain-B MSA 每靶标只建一次, 逐条单跑太浪费）。
+    时间护栏: 距 deadline 不足 SAFETY_MARGIN×3 时不再开新补采（宁可少补, 不能把时限烧在补采上）。"""
+    def resample(tags):
+        if time.time() > deadline - 3 * SAFETY_MARGIN_SEC:
+            print("  ⏭️  接近作业时限, 跳过本轮补采", flush=True)
+            return {}
+        D = db.load_database()
+        plan = {}                      # tag -> [(target, samples旧列表)]（只为取靶标）
+        fixed = {}
+        for tag in tags:
+            row = D.get(tag) or {}
+            fac = seq_sample.collect_product_factors(tag, row)
+            if fac is None:
+                continue
+            target_samples, fixed_factors = fac
+            var_t = [t for t in seq_sample.PRODUCT_TARGETS if t in target_samples]
+            if not var_t:
+                continue               # 全固定因子: 无可采样随机性
+            plan[tag] = var_t
+            fixed[tag] = fixed_factors
+        if not plan:
+            return {}
+        seed = int(time.time()) % 100000 + 2   # 新 seed（初跑 seed=1）; 时间戳保证不与历史重复
+        res_root = os.path.join(db.results_dir(), RESAMPLE_ROOT)
+        bundle = os.path.join(res_root, f"bundle_{seed}")
+        out_root = os.path.join(bundle, "out")
+        os.makedirs(bundle, exist_ok=True)
+        jobs = []                       # (tag, target, job_name)
+        for tag in list(plan):
+            pep = (D.get(tag) or {}).get("peptide")
+            if not pep:
+                plan.pop(tag, None)
+                continue
+            for t in plan[tag]:
+                job = f"{tag}_{t.lower()}_s{seed}"
+                job_json = create_af3_json(
+                    pep, inf.TARGET_SEQS[t], job, model_seeds=[seed],
+                    target_copies=inf.TARGET_COPIES.get(t, 1))
+                with open(os.path.join(bundle, f"{job}.json"), "w") as f:
+                    json.dump(job_json, f, indent=2)
+                jobs.append((tag, t, job))
+        if not jobs:
+            return {}
+        print(f"  🔁 整理补采: {len(plan)} 条记录 × 新 seed={seed} → {len(jobs)} 个 AF3 任务",
+              flush=True)
+        run_af3_cycle(bundle, out_dir=out_root)
+        # 逐任务提取新样本, 按靶标配对相乘（固定因子为常数）;
+        # 变因子缺任何一个都放弃该记录——乘积缺因子会得到错误的样本值
+        per_tag = {}
+        for tag, t, job in jobs:
+            samples = db.extract_sample_iptms(os.path.join(out_root, job), t)
+            if samples:
+                per_tag.setdefault(tag, {})[t] = samples
+        out = {}
+        for tag, t2s in per_tag.items():
+            if len(t2s) != len(plan[tag]):
+                continue
+            try:
+                out[tag] = seq_sample.build_product_samples(t2s, fixed.get(tag) or {})
+            except ValueError:
+                continue
+        return out
+    return resample
 
 def prepare_cycle(seqs, active_targets, cycle_dir):
     """为本轮挑中的序列写 AF3 输入 JSON（同时落地两处）:
@@ -405,7 +478,9 @@ def run_loop(active_targets, cycle_seqs, max_hours):
               f"(≈{(cycle_seconds(n_seq)) / 3600:.1f}h)", flush=True)
 
         # 1) 先收割上一个周期的成果（首轮则收割历史遗留/其它入口的完成结果）
-        n_new = inf.harvest_and_report(active_targets)
+        #    收割内部做序贯采样入库（β 统计量）, 并在入库数过 2^k 时触发数据库整理（P̃·N>M 决定每条记录重复搜索多少次, 补采真跑 AF3 新 seed）
+        n_new = inf.harvest_and_report(active_targets,
+                                       new_sample_fn=make_resample_fn(deadline))
 
         # 2) 本轮工作目录（补跑遗留与新候选共用）
         cycle_dir = os.path.join(p["root"], "cycles",
@@ -471,7 +546,8 @@ def run_loop(active_targets, cycle_seqs, max_hours):
               f"({(time.time() - start) / 3600:.1f}h)", flush=True)
 
         # 6) 立刻收割本周期的结果, 使下一轮的 GP 能用上最新数据
-        got = inf.harvest_and_report(active_targets)
+        got = inf.harvest_and_report(active_targets,
+                                     new_sample_fn=make_resample_fn(deadline))
         if got == 0 and n_new == 0:
             empty_cycles += 1
         else:
@@ -481,7 +557,7 @@ def run_loop(active_targets, cycle_seqs, max_hours):
         time.sleep(5)
 
     print(f"\n👋 作业内无限循环结束（共 {cycle_no} 个周期）", flush=True)
-    inf.harvest_and_report(active_targets)
+    inf.harvest_and_report(active_targets, new_sample_fn=make_resample_fn(deadline))
     print(f"   数据库: {p['root']}", flush=True)
     print("   本作业退出后, 登录节点的 cron 看门狗会在 ≤5min 内续交下一个作业。",
           flush=True)

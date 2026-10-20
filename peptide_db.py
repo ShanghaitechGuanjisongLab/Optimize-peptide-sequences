@@ -117,7 +117,8 @@ def make_tag(seq_var):
 
 
 _TASK_RE = re.compile(r"^([a-z0-9]+)_([a-z0-9]+)$")
-_TARGET_ALIASES = {"htr1a": "HTR1A", "bin1": "BIN1", "unc13c": "UNC13C"}
+# 必须含 asic1a: 漏掉它会让 <tag>_asic1a 的结果目录解析不出靶标 → ASIC1A 结果永远收割不进库（静默死链路）
+_TARGET_ALIASES = {"htr1a": "HTR1A", "bin1": "BIN1", "unc13c": "UNC13C", "asic1a": "ASIC1A"}
 
 # AF3 的 run_alphafold.py 向**已存在且非空**的输出目录写结果时, 会另建
 # <名>_YYYYMMDD_HHMMSS/ 兄弟目录以免覆盖。驱动为打包提交预先在
@@ -711,10 +712,9 @@ def import_archived(archive_csv, source="archived", dry_run=False):
 # ---------------------------------------------------------------------
 
 def refresh_best(off_threshold=0.8, top_n=10, targets=("HTR1A", "BIN1")):
-    """按 (底线蛋白可行优先, iptm_htr1a 降序) 维护 BEST_TOP10/。
+    """按 (底线蛋白可行优先, 目标乘积降序, 缺乘积回退 iptm_htr1a 降序) 维护 BEST_TOP10/。
 
-    只用启用靶标做可行性判定：UNC13C 未评估(None)时不参与, 待将来补齐
-    后以 targets 含 UNC13C 重跑本函数即可用全约束重新排序、重选 top-N。"""
+    只用启用靶标做可行性判定：UNC13C 未评估(None)时不参与, 待将来补齐后以 targets 含 UNC13C 重跑本函数即可用全约束重新排序、重选 top-N。ASIC1A 不参与可行性判定：它是新阶段目标乘积的正因子（越高越好）, 不是底线蛋白。"""
     by_tag = load_database()
     p = paths(ensure=True)
     rows = []
@@ -724,12 +724,14 @@ def refresh_best(off_threshold=0.8, top_n=10, targets=("HTR1A", "BIN1")):
             continue
         feas = True
         for t in targets:
-            if t == "HTR1A":
+            if t == "HTR1A" or t == "ASIC1A":
                 continue
             v = r.get(f"iptm_{t.lower()}")
             if v is not None and v >= off_threshold:
                 feas = False
-        rows.append((0 if feas else 1, -h, tag, r, feas))
+        obj = r.get("objective_product")        # 新阶段排序主键: 三乘积越大越好
+        rank = obj if obj is not None else h     # 乘积未齐（缺因子）回退 iptm_htr1a
+        rows.append((0 if feas else 1, -rank, tag, r, feas))
     rows.sort(key=lambda x: (x[0], x[1]))
     best = rows[:top_n]
 
@@ -742,20 +744,24 @@ def refresh_best(off_threshold=0.8, top_n=10, targets=("HTR1A", "BIN1")):
             shutil.rmtree(old, ignore_errors=True)
 
     index = []
-    for rank, (_, neg_h, tag, r, feas) in enumerate(best, 1):
+    for rank, (_, neg_rank, tag, r, feas) in enumerate(best, 1):
         src = ensure_best_structure(tag)
         dest = os.path.join(best_dir, f"rank{rank:02d}_{tag}_HTR1A.zip")
         if src:
             shutil.copy(src, dest)
         index.append({"rank": rank, "tag": tag, "peptide": r.get("peptide", ""),
-                      "iptm_htr1a": -neg_h, "iptm_bin1": r.get("iptm_bin1"),
+                      "objective_product": r.get("objective_product"),
+                      "iptm_asic1a": r.get("iptm_asic1a"),
+                      "iptm_htr1a": r.get("iptm_htr1a"),
+                      "iptm_bin1": r.get("iptm_bin1"),
                       "iptm_unc13c": r.get("iptm_unc13c"),
                       "feasible": feas, "has_structure": bool(src)})
     with open(os.path.join(best_dir, "BEST_TOP10.csv"), "w", newline="",
               encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=["rank", "tag", "peptide", "iptm_htr1a",
-                                          "iptm_bin1", "iptm_unc13c", "feasible",
-                                          "has_structure"])
+        w = csv.DictWriter(f, fieldnames=["rank", "tag", "peptide",
+                                          "objective_product", "iptm_asic1a",
+                                          "iptm_htr1a", "iptm_bin1", "iptm_unc13c",
+                                          "feasible", "has_structure"])
         w.writeheader()
         for it in index:
             w.writerow(it)
