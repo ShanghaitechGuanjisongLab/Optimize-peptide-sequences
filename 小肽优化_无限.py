@@ -5,14 +5,14 @@
   - bme_gpupub 分区全是 V100-32GB（官方上限 ~1280 tokens）：肽×HTR1A ≈ 441、肽×BIN1 ≈ 612 可算；肽×UNC13C ≈ 2233 超限，暂时搁置。
   - 因此现阶段搜索目标调整为：**HTR1A ipTM 尽量大，BIN1 ipTM < 0.8**（UNC13C 约束去掉；由此得到的“最佳”未来可能部分因 UNC13C 越线被筛除，所以策略是**多算多存**——结果持续追加进共享数据库，等 A100/H100 到位后直接从数据库里补算 UNC13C 并筛选，已完成结果不重算）。
 
-与 optimize_peptide_BO.py（有限预算）的关系：
+与 小肽优化_BO.py（有限预算）的关系：
   本入口是 BO 的“无限 + 数据库化”变体：复用其序列特征化/高斯过程/约束期望改进采集函数，但
-    1）单一真源改为共享数据库（peptide_db.py，存于共享目录，计算节点可见）；
+    1）单一真源改为共享数据库（小肽数据库.py，存于共享目录，计算节点可见）；
     2）无预算上限：候选来自 **精确穷尽枚举**（`enumerate_space()`，51091 条）；
     3）每轮：收割新完成结果入库 → 刷新 BEST_TOP10 → 按启发式挑选新候选提交→无进展则轮询等待；直到手动终止（SIGINT/SIGTERM 优雅退出）。
 
 候选调度（2026-10-04 第二次定案：穷尽队列取代随机采样）：
-  现在的主调度器是 `ExhaustiveQueue` —— 全集为 `peptide_common.enumerate_space()`精确构造的 51091 条（编辑距离 ≤2、长 6~10、20 种标准氨基酸），每轮从「全集 − 已派发台账（sequences.csv）」中取 n 条。由此得到三条可证明的性质：
+  现在的主调度器是 `ExhaustiveQueue` —— 全集为 `小肽公共库.enumerate_space()`精确构造的 51091 条（编辑距离 ≤2、长 6~10、20 种标准氨基酸），每轮从「全集 − 已派发台账（sequences.csv）」中取 n 条。由此得到三条可证明的性质：
   **不重复**、待办集合每轮精确定量递减、至多 ⌈51091/24⌉=2129 轮 ≈680 天必然全覆盖（取空后 next_batch 返回 [] = 明确的完成信号）。GP只决定“先跑谁”（cEI 把预测 HTR1A 分高、BIN1 可行的排前面），对上述性质零贡献；GP 失效则退化为字典序游标推进，覆盖与不重复依然成立。
   取代随机采样的理由（均实测）：旧 `CandidateStream` 每周期只撒 ~720 个随机点供 GP 排序（argmax 在子集上取，不在整个空间上），且 `generate_mutant` 有**665 条序列永远采不到**（模式B 的 delta=±1 只做单次插入或删除）。退回旧行为：`PEPOPT_SWEEP=0`。
 
@@ -22,14 +22,14 @@
   3）之后每轮 batch 中 ~EXPLORE_FRAC（默认 25%）配额仍按字典序游标推进（游标 = 已派发数，跨作业重启自动接续），其余按约束期望改进cEI = EI(score=1-ipTM_HTR1A) × P(ipTM_BIN1 < 0.8) 挑选；
   4）GP 训练集超 TRAIN_CAP（默认 2000）时做确定性分层子采样 —— 因为拟合是O(n³)（实测 4000 条已 52s，外推 5 万条 ≈9.6h > 周期预算），而全空间打分实测仅 ≈1s，故瓶颈在训练侧不在候选侧。
 
-用法（登录节点，建议经 run.sh infinite 后台运行）：
-    python optimize_peptide_infinite.py                  # 默认 --targets HTR1A,BIN1
-    python optimize_peptide_infinite.py --migrate       # 先把家目录旧结果迁入共享库再开跑
-    python optimize_peptide_infinite.py --batch 6 --poll 300
-    python optimize_peptide_infinite.py --status         # 只打印数据库统计与最佳结果，不开跑
+用法（登录节点，建议经 运行.sh infinite 后台运行）：
+    python 小肽优化_无限.py                  # 默认 --targets HTR1A,BIN1
+    python 小肽优化_无限.py --migrate       # 先把家目录旧结果迁入共享库再开跑
+    python 小肽优化_无限.py --batch 6 --poll 300
+    python 小肽优化_无限.py --status         # 只打印数据库统计与最佳结果，不开跑
 终止：kill <PID>（或 Ctrl+C）；已提交的 SLURM 作业不受影响，重跑即续作。
 
-共享数据库（peptide_db，默认 /public_bme2/Share200T/管吉松/peptide_opt_db）：
+共享数据库（小肽数据库，默认 /public_bme2/Share200T/管吉松/peptide_opt_db）：
     peptide_database.csv  每序列一行：iptm_htr1a / iptm_bin1 / iptm_unc13c（现为空）
     sequences.csv         tag → 序列注册表
     af3_results/<tag>_<target>/   全部 AF3 结果（输入/输出/评分）
@@ -37,7 +37,7 @@
 
 将来 UNC13C 解锁（申请到 A100/H100-80G）：
     PEPOPT_GPU_MAX_TOKENS=5120 PEPOPT_FLASH_ATTN=triton PEPOPT_XLA_7X=0 \
-    PEPOPT_PARTITION=<新分区> python optimize_peptide_infinite.py --targets HTR1A,BIN1,UNC13C 已入库序列只补算 UNC13C（HTR1A/BIN1 直接复用），refresh_best 自动按全约束重排。
+    PEPOPT_PARTITION=<新分区> python 小肽优化_无限.py --targets HTR1A,BIN1,UNC13C 已入库序列只补算 UNC13C（HTR1A/BIN1 直接复用），refresh_best 自动按全约束重排。
 """
 
 import os
@@ -48,18 +48,18 @@ import random
 import argparse
 import numpy as np
 
-# 注意：必须在 import optimize_peptide_local **之前**设定结果目录环境变量，该模块在 import 时读取 PEPOPT_RESULTS_DIR（指向共享库的 af3_results/）。
-import peptide_db as db
+# 注意：必须在 import 小肽优化_本地集群 **之前**设定结果目录环境变量，该模块在 import 时读取 PEPOPT_RESULTS_DIR（指向共享库的 af3_results/）。
+import 小肽数据库 as db
 os.environ.setdefault("PEPOPT_RESULTS_DIR", db.results_dir())
 
-import optimize_peptide_local as loc          # 本地集群提交后端（复用打包/节流/OOM拦截）
-import optimize_peptide_BO as bo              # 特征化 + GP + cEI 采集函数（复用）
-import peptide_seq_sample as seq_sample        # 序贯采样×目标乘积×β拟合入库与数据库整理
+import 小肽优化_本地集群 as loc          # 本地集群提交后端（复用打包/节流/OOM拦截）
+import 小肽优化_BO as bo              # 特征化 + GP + cEI 采集函数（复用）
+import 小肽序贯采样 as seq_sample        # 序贯采样×目标乘积×β拟合入库与数据库整理
 
 # 防御：无论 loc 以何种顺序被导入，都把其结果目录强制对齐到共享库，保证推理任务的 input.json 与结果一定落在共享盘（而非家目录 af3_local_results）。
 loc.LOCAL_RESULTS_DIR = db.results_dir()
 
-from peptide_common import (SEQ_202, FIXED_A, ORIG_TAIL,HTR1A_SEQ, UNC13C_SEQ, BIN1_SEQ, ASIC1A_SEQ,generate_mutant, enumerate_space)
+from 小肽公共库 import (SEQ_202, FIXED_A, ORIG_TAIL,HTR1A_SEQ, UNC13C_SEQ, BIN1_SEQ, ASIC1A_SEQ,generate_mutant, enumerate_space)
 
 # ===================== 配置 =====================
 
@@ -70,14 +70,14 @@ OFF_TARGETS   = ["UNC13C", "BIN1"]               # 旧阶段底线蛋白（越�
 OFF_COL       = {"UNC13C": "iptm_unc13c", "BIN1": "iptm_bin1"}
 # 同源多聚体靶标的拷贝数（AF3 输入挂几个链 ID）；新阶段目标乘积的三因子
 TARGET_COPIES = {"ASIC1A": 3}
-# 目标乘积因子：真源在 peptide_db.PRODUCT_TARGETS（**总开关**；2026-10-20 停算ASIC1A，目标 = ipTM(HTR1A)×ipTM(BIN1)），此处只转发不重复定义。
+# 目标乘积因子：真源在 小肽数据库.PRODUCT_TARGETS（**总开关**；2026-10-20 停算ASIC1A，目标 = ipTM(HTR1A)×ipTM(BIN1)），此处只转发不重复定义。
 PRODUCT_TARGETS = list(db.PRODUCT_TARGETS)
 
 DEFAULT_TARGETS      = "HTR1A,BIN1"              # 旧阶段默认（V100 搁置 UNC13C）
 OFF_THRESHOLD        = 0.8                       # 底线蛋白可行阈值
 MIN_GP_SAMPLES       = 12                        # 冷启动评估数（不足时纯随机探索）
 EXPLORE_FRAC         = 0.25                      # 每轮随机探索比例（攒数据库多样性）
-# 每轮 GP 挑选的序列数。**与 loc.BUNDLE_SIZE 解耦**：包容量大是为了摊薄55min固定 MSA 开销（见 optimize_peptide_local），但每轮 GP 只应挑少量高信息量候选——样本还不多（几十条）时一次挑几十个会让采集函数退化、重复采样低价值区域。差额由 submit_pending_bundle 的“攒批”机制补齐：多轮各挑几个，攒满一包才提交，期间每轮先收割新结果 → GP 持续变强，既不空转 GPU 也不牺牲引导质量。（复用 loc._env_int：未设/空串取默认，非法值告警后取默认，切勿用 int(x or d) 写法）
+# 每轮 GP 挑选的序列数。**与 loc.BUNDLE_SIZE 解耦**：包容量大是为了摊薄55min固定 MSA 开销（见 小肽优化_本地集群），但每轮 GP 只应挑少量高信息量候选——样本还不多（几十条）时一次挑几十个会让采集函数退化、重复采样低价值区域。差额由 submit_pending_bundle 的“攒批”机制补齐：多轮各挑几个，攒满一包才提交，期间每轮先收割新结果 → GP 持续变强，既不空转 GPU 也不牺牲引导质量。（复用 loc._env_int：未设/空串取默认，非法值告警后取默认，切勿用 int(x or d) 写法）
 DEFAULT_BATCH        = max(1, loc._env_int("PEPOPT_BATCH", 6))
 DEFAULT_POLL         = 300                       # 无进展时的轮询间隔（秒）
 BACKLOG_MULTIPLIER   = 2                         # 积压上限 = BUNDLE_SIZE × 该倍数（个任务）
@@ -291,7 +291,7 @@ class ExhaustiveQueue:
     """确定性穷尽调度器 —— 同时保证【不重复】与【有限步内全覆盖】。
 
     三条不变量（合起来构成覆盖证明）：
-      A. 全集 S = peptide_common.enumerate_space()：**精确构造**而非随机采样，因此包含随机采样不可达的 665 条；|S| = 51091，枚举顺序固定（字典序），与随机种子和调用次数无关。
+      A. 全集 S = 小肽公共库.enumerate_space()：**精确构造**而非随机采样，因此包含随机采样不可达的 665 条；|S| = 51091，枚举顺序固定（字典序），与随机种子和调用次数无关。
       B. 待办 P_k = S \\ A_k，其中 A_k = sequences.csv 已登记台账。prepare_cycle先登记再写输入 → 凡被派发必入 A；于是每周期 |P| 至少减少本批大小，且**同一序列不可能被二次派发**。
       C. S 有限 → 至多 ceil(|S|/n) = ceil(51091/24) = 2129 个周期后 P = ∅，即全覆盖。届时 next_batch 返回空列表，调用方把它当**完成**而非失败（与旧的 EMPTY_CYCLE_LIMIT“采不到新样本”语义明确区分）。
 
@@ -427,7 +427,7 @@ def sweep_pick(active_targets, n):
 
 
 def coverage_report(active_targets, cycle_secs=None, per_cycle=24):
-    """覆盖进度 + ETA 文本。cycle_secs 给出时按每周期 per_cycle 条折算剩余天数。per_cycle由调用方显式传入（不 import optimize_peptide_node，避免独立运行本模块时的循环导入）。"""
+    """覆盖进度 + ETA 文本。cycle_secs 给出时按每周期 per_cycle 条折算剩余天数。per_cycle由调用方显式传入（不 import 小肽优化_节点内，避免独立运行本模块时的循环导入）。"""
     q = get_sweep(active_targets)
     c = q.coverage()
     txt = (f"穷尽覆盖 {c['dispatched']}/{c['total']} ({c['frac'] * 100:.2f}%) "
@@ -444,7 +444,7 @@ def coverage_report(active_targets, cycle_secs=None, per_cycle=24):
 def submit_candidates(seqs, active_targets):
     """注册 + 写输入 + 触发打包提交；若某靶标结果**已就绪**则就地入库。返回提交的序列数。
 
-    复用 optimize_peptide_local.local_predict_and_score：它按<LOCAL_RESULTS_DIR>/<job_name>布局写 input.json，并由submit_pending_bundle()统一打包提交（含 MAX_INFLIGHT 节流与失败重试）。job_name 用共享库的稳定规则 <tag>_<target>，结果直接落共享盘；已就绪的（迁移过的旧结果/上轮完成的）返回 iptm，即刻 upsert 入库（并写 .harvested，与 harvest_results 幂等一致）。"""
+    复用 小肽优化_本地集群.local_predict_and_score：它按<LOCAL_RESULTS_DIR>/<job_name>布局写 input.json，并由submit_pending_bundle()统一打包提交（含 MAX_INFLIGHT 节流与失败重试）。job_name 用共享库的稳定规则 <tag>_<target>，结果直接落共享盘；已就绪的（迁移过的旧结果/上轮完成的）返回 iptm，即刻 upsert 入库（并写 .harvested，与 harvest_results 幂等一致）。"""
     n = 0
     for seq in seqs:
         if _STOP:

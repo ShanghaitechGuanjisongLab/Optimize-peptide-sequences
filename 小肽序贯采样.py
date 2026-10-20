@@ -17,8 +17,8 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import peptide_db as db
-from peptide_stats import BetaFit, consolidation_pass, trigger_power_of_two
+import 小肽数据库 as db
+from 小肽统计 import BetaFit, consolidation_pass, trigger_power_of_two
 
 
 def build_product_samples(target_samples, fixed_factors):
@@ -77,7 +77,7 @@ def ingest_record(tag, target_samples, fixed_factors, peptide=None, var=None):
 
 # ==================== 逐样本入库与整理补采（集成入口）====================
 
-# 目标乘积因子：真源在 peptide_db.PRODUCT_TARGETS（总开关；2026-10-20 停算 ASIC1A）。此处转发以免反向依赖入口模块。
+# 目标乘积因子：真源在 小肽数据库.PRODUCT_TARGETS（总开关；2026-10-20 停算 ASIC1A）。此处转发以免反向依赖入口模块。
 PRODUCT_TARGETS = db.PRODUCT_TARGETS
 
 

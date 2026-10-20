@@ -1,7 +1,7 @@
 """
 小肽序列优化 — AlphaFold Server 云端预测后端库。
 
-仅当使用官方 AlphaFold Server 作为预测后端时导入本模块（入口：optimize_peptide_AF3.py；BO 入口加 --server）。
+仅当使用官方 AlphaFold Server 作为预测后端时导入本模块（入口：小肽优化_云端.py；BO 入口加 --server）。
 
 云端专属内容：
   - 任务 JSON 生成与批量分批逻辑（af3_jobs/）
@@ -9,7 +9,7 @@
   - 可选的 af3_automator 浏览器自动化（缺失时静默降级为手动模式）
   - 云端版蒙特卡洛编排（自动化可用性检查、待处理任务处理）
 
-通用逻辑（序列、突变规则、评分提取、MC 主循环）在 peptide_common.py。
+通用逻辑（序列、突变规则、评分提取、MC 主循环）在 小肽公共库.py。
 """
 
 import os
@@ -20,7 +20,7 @@ import random
 
 import numpy as np
 
-from peptide_common import (SEQ_202, FIXED_A, ORIG_TAIL, ROOT_DIR,
+from 小肽公共库 import (SEQ_202, FIXED_A, ORIG_TAIL, ROOT_DIR,
                             MC_STEPS, TEMPERATURE,
                             HTR1A_SEQ, UNC13C_SEQ, BIN1_SEQ,
                             generate_mutant, create_af3_json,

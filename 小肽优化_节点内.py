@@ -21,20 +21,20 @@
   旧形态用 `CandidateStream` 随机采样 + “重试并排除已评估”取候选。它有两个结构性缺陷，都在实测中被量化过：
     1）**候选池是抽样的，不是全集**：每周期只撒 ~720 个随机点做 GP 排序，argmax是在这个子集上取的，不是在整个搜索空间上取的；
     2）**随机采样有 665 条序列永远采不到**（`generate_mutant` 的模式B 只做单次插入或删除，故“净长度不变的插入+删除”两步编辑生成不出来）。
-  现改为 `ExhaustiveQueue`：候选全集 = `peptide_common.enumerate_space()`精确枚举的 51091 条（编辑距离 ≤2、长 6~10、20 种标准氨基酸），每周期从「全集 − 已派发台账」里按 GP 的 cEI 次序取 24 条。由此得到三条**可证明**的性质（详见该类文档）：不重复、每周期待办精确定量递减、至多 2129 个周期≈680 天必然全覆盖。GP 只决定“先跑谁”，对覆盖保证零贡献 —— 即便 GP 完全失效，次序退化为字典序游标，上述性质依然成立。
+  现改为 `ExhaustiveQueue`：候选全集 = `小肽公共库.enumerate_space()`精确枚举的 51091 条（编辑距离 ≤2、长 6~10、20 种标准氨基酸），每周期从「全集 − 已派发台账」里按 GP 的 cEI 次序取 24 条。由此得到三条**可证明**的性质（详见该类文档）：不重复、每周期待办精确定量递减、至多 2129 个周期≈680 天必然全覆盖。GP 只决定“先跑谁”，对覆盖保证零贡献 —— 即便 GP 完全失效，次序退化为字典序游标，上述性质依然成立。
   代价护栏：全空间打分实测仅 ≈1s（故 SCORE_POOL_CAP 默认 0 = 不限制）；真正的瓶颈是 GP 拟合的 O(n_train^3)（4000 条已 52s，外推 5 万条 ≈9.6h > 周期预算），故 TRAIN_CAP=2000 做确定性分层子采样，best_y 仍取全量最优。
 
 优雅重启（换代码用）：
-  正在运行的作业已把 .py 载入内存，**改源文件对它无效**。要把新代码投出去，在 `<db_root>/runs/` 下放一个名为 `restart.requested` 的空文件（`run.sh restart-loop`）即可：作业会在**下一个周期起点**正常退出，由 cron看门狗 ≤5min 内续交新作业。已完成周期的结果早已收割入库，因此不丢数据，唯一代价是新作业首轮重建 chain-B MSA（实测 ≈55min）。标志会被自动消费，不会让续交的作业又立刻退出。
+  正在运行的作业已把 .py 载入内存，**改源文件对它无效**。要把新代码投出去，在 `<db_root>/runs/` 下放一个名为 `restart.requested` 的空文件（`运行.sh restart-loop`）即可：作业会在**下一个周期起点**正常退出，由 cron看门狗 ≤5min 内续交新作业。已完成周期的结果早已收割入库，因此不丢数据，唯一代价是新作业首轮重建 chain-B MSA（实测 ≈55min）。标志会被自动消费，不会让续交的作业又立刻退出。
 
-运行方式（都由 run.sh 封装，手动亦可）：
-    sbatch <resource flags> --export=ALL,PEPOPT_MAX_HOURS=118……\\ scripts/af3_loop_job.sh
+运行方式（都由 运行.sh 封装，手动亦可）：
+    sbatch <resource flags> --export=ALL,PEPOPT_MAX_HOURS=118……\\ 作业脚本/AF3循环作业.sh
     # 登录节点直接调试（会占用 QoS 运行槽，仅在队列空时用）：
-    PEPOPT_MAX_HOURS=0.05 python optimize_peptide_node.py --targets HTR1A,BIN1
+    PEPOPT_MAX_HOURS=0.05 python 小肽优化_节点内.py --targets HTR1A,BIN1
 
 依赖的环境分工（实测）：
     conda base：sklearn / pandas / matplotlib（编排、GP、入库）
-    conda af3_old：jax 0.4.34 / alphafold3 / jackhmmer（AF3 推理）—— **无**sklearn、pandas，故两套环境必须并存；本脚本在 base 下运行，并把 AF3 那一步整体委托给scripts/af3_bundle_runner.sh（它自己 conda activate af3_old）。这样两环境互不污染，也复用了 runner 里已验证过的两阶段容错与输出折叠逻辑。
+    conda af3_old：jax 0.4.34 / alphafold3 / jackhmmer（AF3 推理）—— **无**sklearn、pandas，故两套环境必须并存；本脚本在 base 下运行，并把 AF3 那一步整体委托给作业脚本/AF3打包推理.sh（它自己 conda activate af3_old）。这样两环境互不污染，也复用了 runner 里已验证过的两阶段容错与输出折叠逻辑。
 """
 
 import os
@@ -52,21 +52,21 @@ _ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _ROOT)
 
 # ---- 必须先设结果目录再 import loc（该模块 import 时读取此环境变量）----
-import peptide_db as db
+import 小肽数据库 as db
 os.environ.setdefault("PEPOPT_RESULTS_DIR", db.results_dir())
 
-import optimize_peptide_local as loc
+import 小肽优化_本地集群 as loc
 loc.LOCAL_RESULTS_DIR = db.results_dir()          # 防御：强制对齐到共享库
 
-import optimize_peptide_infinite as inf          # 复用候选流/启发式挑选/收割报告
-import peptide_seq_sample as seq_sample        # 序贯采样×目标乘积×β拟合入库与数据库整理
-from peptide_common import create_af3_json     # 补采任务的 AF3 输入构造
+import 小肽优化_无限 as inf          # 复用候选流/启发式挑选/收割报告
+import 小肽序贯采样 as seq_sample        # 序贯采样×目标乘积×β拟合入库与数据库整理
+from 小肽公共库 import create_af3_json     # 补采任务的 AF3 输入构造
 
 # ===================== 配置 =====================
 
-# 靶标真源在 optimize_peptide_infinite（已含 ASIC1A 同源三聚体），此处不重复定义
+# 靶标真源在 小肽优化_无限（已含 ASIC1A 同源三聚体），此处不重复定义
 TARGET_ORDER      = inf.TARGET_ORDER
-# 评估靶标开关：2026-10-20 停算 ASIC1A（目标 = HTR1A×BIN1 两乘积；数据/路径保留，恢复时改回 "HTR1A,BIN1,ASIC1A" 并同步 peptide_db.PRODUCT_TARGETS）
+# 评估靶标开关：2026-10-20 停算 ASIC1A（目标 = HTR1A×BIN1 两乘积；数据/路径保留，恢复时改回 "HTR1A,BIN1,ASIC1A" 并同步 小肽数据库.PRODUCT_TARGETS）
 DEFAULT_TARGETS   = "HTR1A,BIN1"
 CYCLE_SEQS        = 8                  # 每轮序列数（×靶标数 = 每轮任务数）
 CYCLE_FIXED_SEC   = 4703.0             # 每轮固定开销：三个 chain B 的 MSA（实测 2026-10-13）ASIC1a 526aa=1410s + HTR1A 422aa=1738s + BIN1 593aa=1555s ≈ 78min（同源多聚体的拷贝链 MSA 被 functools.cache 缓存：chain C/D 实测仅 0.02s）
@@ -110,7 +110,7 @@ def size_next_cycle(remaining_sec, max_seqs):
 # ===================== AF3 执行（委托给已验证的 bundle runner）=====================
 
 def build_runner_env(bundle_dir, out_dir=None):
-    """组装 scripts/af3_bundle_runner.sh 需要的全部 AF3_* 环境变量。
+    """组装 作业脚本/AF3打包推理.sh 需要的全部 AF3_* 环境变量。
     与 loc.build_bundle_sbatch_cmd() 的 --export 列表保持一致，差别仅在于：这里是**进程内 subprocess 继承**而非 sbatch --export。out_dir 覆盖输出根（补采任务写到 _resamples/ 下，与主结果隔离，收割路径自动忽略）。"""
     env = os.environ.copy()
     env.update({
@@ -182,9 +182,9 @@ def run_af3_cycle(bundle_dir, out_dir=None):
 
     双路径：
       * HQ 路径（默认，PEPOPT_HQ_MODE=1）：每个 JSON 一个独立任务提交到任务中间层，可随时添加/取消单个预测，MSA 走磁盘缓存免重复搜索。
-      * 直跑路径（PEPOPT_HQ_MODE=0 或 HQ 路径异常时自动回退）：整包跑af3_bundle_runner.sh（MSA 进程内摊销 + 两阶段容错）。
+      * 直跑路径（PEPOPT_HQ_MODE=0 或 HQ 路径异常时自动回退）：整包跑AF3打包推理.sh（MSA 进程内摊销 + 两阶段容错）。
 
-    直跑路径的 runner 先复制成**快照**再执行：bash 按字节偏移边读边执行脚本，而编辑器写 scripts/*.sh 是**原地截断重写**（inode 不变）→ 若本长驻作业执行期间有人修改了仓库里的 runner，bash 回读到下一条命令时就会错位（语法崩或行为失控；2026-10-04 实测踩到，靠临时回滚才救回在跑的5天作业）。快照使长驻作业与仓库后续改动彻底解耦。
+    直跑路径的 runner 先复制成**快照**再执行：bash 按字节偏移边读边执行脚本，而编辑器写 作业脚本/*.sh 是**原地截断重写**（inode 不变）→ 若本长驻作业执行期间有人修改了仓库里的 runner，bash 回读到下一条命令时就会错位（语法崩或行为失控；2026-10-04 实测踩到，靠临时回滚才救回在跑的5天作业）。快照使长驻作业与仓库后续改动彻底解耦。
 
     两条路径都只需容忍非零退出码：已完成任务的结果都在盘上，交给收割阶段入库。"""
     if os.environ.get("PEPOPT_HQ_MODE", "1") != "0":
@@ -192,7 +192,7 @@ def run_af3_cycle(bundle_dir, out_dir=None):
             return run_af3_cycle_hq(bundle_dir, out_dir)
         except Exception as e:                   # noqa：BLE001 - 不让作业裸崩
             print(f"  ⚠️ HQ 路径失败（{e}）, 回退整包直跑", flush=True)
-    src = os.path.join(_ROOT, "scripts", "af3_bundle_runner.sh")
+    src = os.path.join(_ROOT, "作业脚本", "AF3打包推理.sh")
     if not os.path.isfile(src):
         print(f"  ❌ 缺 runner: {src}", flush=True)
         return 2
@@ -288,7 +288,7 @@ def make_resample_fn(deadline):
 
 def prepare_cycle(seqs, active_targets, cycle_dir):
     """为本轮挑中的序列写 AF3 输入 JSON（同时落地两处）：
-      1）规范结果目录 <af3_results>/<tag>_<target>/input.json —— 收割/折叠/BEST 打包都以它为唯一位置（见 peptide_db.consolidate_task）；
+      1）规范结果目录 <af3_results>/<tag>_<target>/input.json —— 收割/折叠/BEST 打包都以它为唯一位置（见 小肽数据库.consolidate_task）；
       2）本轮工作目录 <cycle_dir>/<job_name>.json —— runner 以 --input_dir 读它。
     返回（已排入的任务数，跳过的原因列表）。token 超限的任务在提交前拦截。"""
     os.makedirs(cycle_dir, exist_ok=True)

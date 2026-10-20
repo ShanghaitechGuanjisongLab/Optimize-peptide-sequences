@@ -16,13 +16,13 @@
         cEI(x) = EI(x) × P(ipTM_unc < 0.8 | x) × P(ipTM_bin < 0.8 | x) 即“改进潜力 × 对每个底线蛋白的可行概率”，比原版硬阈值（双 ≥0.8 即丢弃）更平滑，避免阈值附近的浪费。
      c）按 cEI 贪心选出 batch 个候选（带特征空间多样性约束），提交评估；完成后写入 CSV，进入下一轮。
 
-复用的部分（从 optimize_peptide_AF3 导入）：
+复用的部分（从 小肽优化_云端 导入）：
   - 序列常量、generate_mutant() 突变规则、create_af3_json()、extract_scores_from_zip() 评分提取；
   - predict_and_score()（服务器版：JSON 生成/缓存评分）。
 
 运行方式：
-    python optimize_peptide_BO.py             # 默认：本地集群推理（无每日配额限制）
-    python optimize_peptide_BO.py --server    # 改用 AlphaFold Server 云端预测（手动/自动模式同主脚本）
+    python 小肽优化_BO.py             # 默认：本地集群推理（无每日配额限制）
+    python 小肽优化_BO.py --server    # 改用 AlphaFold Server 云端预测（手动/自动模式同主脚本）
   与其他入口一样支持断点续跑：已评估候选记录在 output_bo/bo_evaluations.csv，已完成的 AF3 结果缓存直接复用。
 
 输出：
@@ -60,13 +60,13 @@ from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import Matern, WhiteKernel
 from sklearn.preprocessing import StandardScaler
 
-from peptide_common import (SEQ_202, FIXED_A, ORIG_TAIL,
+from 小肽公共库 import (SEQ_202, FIXED_A, ORIG_TAIL,
                             HTR1A_SEQ, UNC13C_SEQ, BIN1_SEQ,
                             generate_mutant)
 
 # ===================== 靶标配置 =====================
 
-# 三个靶标各自独立预测。UNC13C 复合物约 2233 tokens，超过 bme_gpupub 分区 V100 的官方上限 1280 tokens （见 optimize_peptide_local.GPU_MAX_TOKENS），在 V100 上必然显存溢出，因此支持 --targets HTR1A,BIN1 只跑 V100 放得下的两个靶标（结果独立存放）；待申请到 A100/H100 再以全靶标运行补齐 UNC13C 约束。
+# 三个靶标各自独立预测。UNC13C 复合物约 2233 tokens，超过 bme_gpupub 分区 V100 的官方上限 1280 tokens （见 小肽优化_本地集群.GPU_MAX_TOKENS），在 V100 上必然显存溢出，因此支持 --targets HTR1A,BIN1 只跑 V100 放得下的两个靶标（结果独立存放）；待申请到 A100/H100 再以全靶标运行补齐 UNC13C 约束。
 TARGET_SEQS    = {"HTR1A": HTR1A_SEQ, "UNC13C": UNC13C_SEQ, "BIN1": BIN1_SEQ}
 TARGET_ORDER   = ["HTR1A", "UNC13C", "BIN1"]   # 固定评估顺序
 OFF_TARGETS    = ["UNC13C", "BIN1"]            # 底线蛋白（结合越低越好）
@@ -472,12 +472,12 @@ if __name__ == "__main__":
     print("=" * 60)
 
     if args.server:
-        import peptide_server as server
+        import 小肽云端后端 as server
         server.AUTO_MODE = False
         predict_fn = server.predict_and_score
         print("运行模式: AlphaFold Server（--server，与主脚本相同的手动/自动流程，受每日配额限制）")
     else:
-        import optimize_peptide_local as loc
+        import 小肽优化_本地集群 as loc
         # 预检查 + 解压作业实时进度跟随（运行中则等待，不继续后续步骤）
         loc.ensure_local_ready()
         predict_fn = loc.local_predict_and_score

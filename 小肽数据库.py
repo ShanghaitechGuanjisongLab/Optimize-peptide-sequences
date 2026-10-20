@@ -51,7 +51,7 @@ MASTER_FIELDS = ["tag", "peptide", "var_region",
                  "objective_product", "source", "created_at", "updated_at",
                  # --- 序贯采样的 β 分布统计量（供数据库整理阶段查阅）---
                  # 充分统计量 (obj_n,obj_sum,obj_sum2) → 方法矩拟合，
-                 # 追加拟合 == 全数据批式拟合，无需存全数据（见 peptide_stats.py）
+                 # 追加拟合 == 全数据批式拟合，无需存全数据（见 小肽统计.py）
                  "obj_n", "obj_sum", "obj_sum2",
                  "obj_max", "obj_alpha", "obj_beta", "obj_extra", "obj_pool"]
 
@@ -149,7 +149,7 @@ def resolve_tag(seq_var):
 
 def make_job_name(peptide, target):
     """（全序列，靶标）→ AF3 结果目录名（小写，与 sanitised_name 一致）。"""
-    from peptide_common import FIXED_A
+    from 小肽公共库 import FIXED_A
     var = peptide[len(FIXED_A):] if peptide.startswith(FIXED_A) else peptide
     return f"{resolve_tag(var)}_{target.lower()}"
 
@@ -327,7 +327,7 @@ def load_database():
     return by_tag
 
 
-# 目标乘积因子（**总开关**）：2026-10-20 停算 ASIC1A，目标 = ipTM(HTR1A)×ipTM(BIN1)。恢复三乘积只需改成本元组（如 ("ASIC1A", "HTR1A", "BIN1")）并把评估靶标（optimize_peptide_node.DEFAULT_TARGETS 等）加回 ASIC1A —— iptm_asic1a 列、TARGET_COPIES、同源三聚体等数据与代码路径全程保留。
+# 目标乘积因子（**总开关**）：2026-10-20 停算 ASIC1A，目标 = ipTM(HTR1A)×ipTM(BIN1)。恢复三乘积只需改成本元组（如 ("ASIC1A", "HTR1A", "BIN1")）并把评估靶标（小肽优化_节点内.DEFAULT_TARGETS 等）加回 ASIC1A —— iptm_asic1a 列、TARGET_COPIES、同源三聚体等数据与代码路径全程保留。
 PRODUCT_TARGETS = ("HTR1A", "BIN1")
 
 
@@ -496,7 +496,7 @@ def load_obj_fit(tag):
     r = next((x for x in rows if x["tag"] == tag), None)
     if r is None or not r.get("obj_n"):
         return None
-    from peptide_stats import BetaFit
+    from 小肽统计 import BetaFit
     return BetaFit.from_stats(r)
 
 
@@ -797,7 +797,7 @@ def migrate_legacy(legacy_results_dir=None, dry_run=False):
     legacy_results_dir = legacy_results_dir or "af3_local_results"
     if not os.path.isdir(legacy_results_dir):
         return 0, {"(missing)": legacy_results_dir}
-    from peptide_common import FIXED_A
+    from 小肽公共库 import FIXED_A
     p = paths(ensure=True)
 
     # 归组：(seqstem, target) → [（目录，时间戳，是否有 summary）]；

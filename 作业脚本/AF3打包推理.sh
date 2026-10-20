@@ -2,8 +2,8 @@
 # =============================================================================
 # AlphaFold3 打包推理作业脚本（独立文件）
 #
-# 由 optimize_peptide_local.py 的 submit_pending_bundle() 提交：
-#     sbatch <SLURM 选项> --export=ALL,AF3_CODE_DIR=…………\         scripts/af3_bundle_runner.sh
+# 由 小肽优化_本地集群.py 的 submit_pending_bundle() 提交：
+#     sbatch <SLURM 选项> --export=ALL,AF3_CODE_DIR=…………\         作业脚本/AF3打包推理.sh
 # SLURM 资源指令走命令行参数，作业配置走环境变量，本脚本只负责作业逻辑，因此没有任何 shell 代码内嵌在 Python 字符串里。
 #
 # 【两阶段容错设计】

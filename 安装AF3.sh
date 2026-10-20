@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =====================================================================
-# install_af3.sh — 全自动安装 AlphaFold3 到本地 conda 环境（无任何手动步骤）
+# 安装AF3.sh — 全自动安装 AlphaFold3 到本地 conda 环境（无任何手动步骤）
 #
 # 设计原则：所有版本号均在运行时动态探测，不硬编码：
 #   - C++ 标准       ← 解析 AF3 源码 CMakeLists.txt 的 CMAKE_CXX_STANDARD
@@ -11,8 +11,8 @@
 #   - gcc 版本       ← `conda search` 全部候选，降序逐个安装并自检（按探测到的 C++ 标准编译+链接+运行），失败自动降级重试
 #
 # 用法：
-#   bash install_af3.sh          # 前台运行
-#   nohup bash install_af3.sh > install_af3.log 2>&1 &   # 后台运行
+#   bash 安装AF3.sh          # 前台运行
+#   nohup bash 安装AF3.sh > 安装AF3.log 2>&1 &   # 后台运行
 # =====================================================================
 set -euo pipefail
 

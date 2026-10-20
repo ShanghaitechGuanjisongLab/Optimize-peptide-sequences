@@ -15,7 +15,7 @@
 #   本脚本的“重计算”（结构预测）在 AlphaFold Server 云端   完成，本地仅做 JSON 生成 / 评分提取 / 蒙特卡洛优化，
 #   计算量极小，用 1 核 4G 内存即可。
 #
-# 提交：sbatch run_peptide.sbatch 查看：squeue -u $USER
+# 提交：sbatch 云端蒙特卡洛.sbatch 查看：squeue -u $USER
 # =====================================================
 
 echo "作业开始: $(date) | 节点: $(hostname)"
@@ -28,6 +28,6 @@ conda activate base
 cd "$SLURM_SUBMIT_DIR" || exit 1
 
 # -u 关闭缓冲，使日志可实时跟踪 (tail -f pepopt_%j.out)
-python -u optimize_peptide_AF3.py
+python -u 小肽优化_云端.py
 
 echo "作业结束: $(date)"

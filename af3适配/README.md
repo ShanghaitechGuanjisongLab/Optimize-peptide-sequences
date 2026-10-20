@@ -24,7 +24,7 @@ af3适配/
 
 # 任务流（af3任务.py）
 
-`optimize_peptide_node.run_af3_cycle` 默认走此路径（`PEPOPT_HQ_MODE=0` 可强制回退整包直跑）：每个 AF3 JSON 一个独立任务（一任务一 job → `任务控制.sh cancel <id>` 精确取消单个预测），生成的启动器在任务开始时内嵌缓存 MSA、结束时收割本任务的 MSA 入缓存（同序列后续任务自动免搜索）。
+`小肽优化_节点内.run_af3_cycle` 默认走此路径（`PEPOPT_HQ_MODE=0` 可强制回退整包直跑）：每个 AF3 JSON 一个独立任务（一任务一 job → `任务控制.sh cancel <id>` 精确取消单个预测），生成的启动器在任务开始时内嵌缓存 MSA、结束时收割本任务的 MSA 入缓存（同序列后续任务自动免搜索）。
 
 手动补算/试算：`任务中间层/任务控制.sh add --name seqX_htr1a --gpus 1
 --priority 10 -- bash……`（priority 越大越先跑）。

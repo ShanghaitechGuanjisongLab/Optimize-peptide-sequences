@@ -11,12 +11,12 @@
 # =====================================================
 # 小肽序列贝叶斯优化（服务器版后端）— SLURM 委托脚本
 # -----------------------------------------------------
-# 注意：optimize_peptide_BO.py 的默认后端是本地集群推理，
+# 注意：小肽优化_BO.py 的默认后端是本地集群推理，
 # 请直接在登录节点运行：
-#   python optimize_peptide_BO.py 它会自动为每个候选提交独立的 GPU 作业（无每日配额限制），支持断点续跑；无需本委托脚本。
+#   python 小肽优化_BO.py 它会自动为每个候选提交独立的 GPU 作业（无每日配额限制），支持断点续跑；无需本委托脚本。
 #
 # 仅当确需改用 AlphaFold Server 云端预测（手动上传/下载，受每日配额限制）时，才用本脚本把轻量编排提交到计算节点：
-#   sbatch run_peptide_bo.sbatch
+#   sbatch 云端贝叶斯.sbatch
 # =====================================================
 
 echo "作业开始: $(date) | 节点: $(hostname)"
@@ -27,8 +27,8 @@ conda activate base    # 依赖已齐，计算节点无外网，不能联网 pip
 cd "$SLURM_SUBMIT_DIR" || exit 1
 
 # 贝叶斯优化入口（服务器版后端）；预算/批量/候选库可调，例如：
-#   python optimize_peptide_BO.py --server --budget 120 --batch 8 --pool 1500
+#   python 小肽优化_BO.py --server --budget 120 --batch 8 --pool 1500
 # -u 关闭缓冲，使日志可实时跟踪 (tail -f pepopt_bo_%j.out)
-python -u optimize_peptide_BO.py --server
+python -u 小肽优化_BO.py --server
 
 echo "作业结束: $(date)"

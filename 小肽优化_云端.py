@@ -3,10 +3,10 @@
 =============================================================
 本文件只是流程入口，逻辑拆分在两个库中：
 
-  - peptide_common.py  公共逻辑（序列常量、突变规则、AF3 JSON 格式、评分提取、蒙特卡洛主循环）。导入零副作用。
-  - peptide_server.py  云端后端库（JSON 生成/批量分批、结果缓存、可选的 af3_automator 浏览器自动化、云端编排）。
+  - 小肽公共库.py  公共逻辑（序列常量、突变规则、AF3 JSON 格式、评分提取、蒙特卡洛主循环）。导入零副作用。
+  - 小肽云端后端.py  云端后端库（JSON 生成/批量分批、结果缓存、可选的 af3_automator 浏览器自动化、云端编排）。
 
-只有走云端后端时才需要运行本脚本；本地集群推理请用 optimize_peptide_local.py，贝叶斯优化请用 optimize_peptide_BO.py。
+只有走云端后端时才需要运行本脚本；本地集群推理请用 小肽优化_本地集群.py，贝叶斯优化请用 小肽优化_BO.py。
 
 使用方式：
   - 全自动模式：先运行 setup_auth.py 完成 Google 登录，再运行本脚本（需自备 af3_automator 模块与 Playwright）
@@ -17,7 +17,7 @@ import random
 
 import numpy as np
 
-from peptide_server import (HAS_AUTOMATOR, AUTO_MODE,
+from 小肽云端后端 import (HAS_AUTOMATOR, AUTO_MODE,
                             check_playwright_installed, check_auth_exists,
                             batch_generate_all_json, check_results_status,
                             optimize_with_server)

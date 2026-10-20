@@ -2,19 +2,19 @@
 # =============================================================================
 # 无限循环作业 —— SLURM 侧包装脚本（单作业形态，计算节点上运行）
 #
-# 由 optimize_peptide_local.submit_loop_job() 提交（资源指令走命令行参数，作业配置走 --export 环境变量，与仓库既有约定一致）。
+# 由 小肽优化_本地集群.submit_loop_job() 提交（资源指令走命令行参数，作业配置走 --export 环境变量，与仓库既有约定一致）。
 #
 # ⭐ 为什么需要这个形态（2026-10-04 定案）：
 #   旧形态 = 登录节点常驻 Python 驱动 + 反复 sbatch 小包作业。它脆弱在：
 #   登录节点把所有交互进程塞进同一个 cgroup /system.slice/sshd.service，setsid 逃不出去 → 会话被清理时驱动无声消失 → GPU 空转、结果滞留未入库（已发生两次，其中一次空转 8h22m）。
-#   新形态 = **一个长驻作业内部自带无限循环**（见 optimize_peptide_node.py）：
+#   新形态 = **一个长驻作业内部自带无限循环**（见 小肽优化_节点内.py）：
 #   作业跑满分区时限 MaxTime（5 天）才退出，期间反复 {挑候选→跑AF3→收割入库}。
 #   于是既不需要登录节点常驻进程，也不需要“计算节点里 sbatch 下一包”（那会与 QoS MaxJobsPerUser=1 的运行槽互斥）。
 #   登录节点只留 cron 看门狗，职责退化为“队列里没这个作业了就再交一个”。
 #
 # 环境分工（实测：af3_old **不含** sklearn/pandas，故两套环境必须并存）：
-#   conda base   → 本脚本与 optimize_peptide_node.py（编排 / GP / 入库）
-#   conda af3_old→ AF3 推理那一步（由 scripts/af3_bundle_runner.sh 自行激活）
+#   conda base   → 本脚本与 小肽优化_节点内.py（编排 / GP / 入库）
+#   conda af3_old→ AF3 推理那一步（由 作业脚本/AF3打包推理.sh 自行激活）
 #
 # 可选环境变量：
 #   PEPOPT_TARGETS=HTR1A+BIN1   待评估靶标（V100 放不下 UNC13C）
@@ -77,7 +77,7 @@ TASKD_PID=""
 if [ -f "$TASKD" ]; then
     bash "$TASKD" --gpus "${CUDA_VISIBLE_DEVICES:-none}" \
         --cpus "${SLURM_CPUS_PER_TASK:-${SLURM_CPUS_ON_NODE:-$(nproc)}}" \
-        >>"${TASKCTL_STATE:-$REPO_DIR/../任务中间层/state}/logs/taskd.out" 2>&1 &
+        >>"${TASKCTL_STATE:-$REPO_DIR/../任务中间层/运行状态}/logs/taskd.out" 2>&1 &
     TASKD_PID=$!
     echo "🧭 任务守护已启动 (pid=$TASKD_PID); 客户端: 任务中间层/任务控制.sh"
 else
@@ -86,7 +86,7 @@ else
 fi
 
 # -u：关闭输出缓冲，使 SLURM 日志可实时 tail
-python -u optimize_peptide_node.py \
+python -u 小肽优化_节点内.py \
     --targets "${PEPOPT_TARGETS:-HTR1A+BIN1}" \
     --cycle-seqs "${PEPOPT_CYCLE_SEQS:-24}" \
     --max-hours "${PEPOPT_MAX_HOURS:-118}"

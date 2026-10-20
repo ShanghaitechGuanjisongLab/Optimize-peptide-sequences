@@ -11,15 +11,15 @@
 #   crond 运行在自己的 service cgroup，不受 sshd 会话清理影响，故由它定期拉起驱动是唯一可靠的自愈手段（无需 root）。
 #
 # 行为：
-#   - 每 5 分钟被 cron 调用一次（见 ./run.sh watchdog 安装）；
-#   - 用户显式 ./run.sh stop 后**不会**擅自复活（靠 infinite.disabled 标记）；
+#   - 每 5 分钟被 cron 调用一次（见 ./运行.sh watchdog 安装）；
+#   - 用户显式 ./运行.sh stop 后**不会**擅自复活（靠 infinite.disabled 标记）；
 #   - flock 防并发：上一次拉起还没完成就直接退出；
 #   - 存活判定看 cmdline（防 PID 复用误判）；
 #   - 所有动作追加进 runs/watchdog.log 便于事后审计。
 #
 # cron 环境要点（安装时已处理，改动此脚本需注意）：
 #   cron 的 PATH 极简，不含 SLURM 与 conda → 驱动会调不到 sbatch/squeue。
-#   故 ./run.sh watchdog 会把登录时的完整 PATH 写进 crontab 的 PATH= 行。
+#   故 ./运行.sh watchdog 会把登录时的完整 PATH 写进 crontab 的 PATH= 行。
 # =============================================================================
 set -u
 
@@ -43,7 +43,7 @@ driver_alive() {
   p="$(cat "$PID_FILE" 2>/dev/null)"
   [[ -n "$p" ]] || return 1
   kill -0 "$p" 2>/dev/null || return 1
-  ps -p "$p" -o args= 2>/dev/null | grep -q "optimize_peptide_infinite.py"
+  ps -p "$p" -o args= 2>/dev/null | grep -q "小肽优化_无限.py"
 }
 
 # ---- 并发保护：已有看门狗在跑就立刻退出 ----
@@ -78,7 +78,7 @@ CONDA_SH="${CONDA_SH:-$HOME/miniconda3/etc/profile.d/conda.sh}"
 ts="$(date +%Y%m%d_%H%M%S)"
 DLOG="$RUNS_DIR/infinite_${ts}.log"
 
-setsid nohup python -u optimize_peptide_infinite.py --migrate \
+setsid nohup python -u 小肽优化_无限.py --migrate \
       </dev/null >"$DLOG" 2>&1 &
 PID=$!
 echo "$PID" > "$PID_FILE"

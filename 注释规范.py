@@ -3,7 +3,7 @@
 """注释规范修复：把注释/文档字符串/文档正文里的英文标点换成中文标点，并把被硬换行打断的句子接回一行。
 
 只动注释与文档字符串，不碰代码；数学公式、代码引用、CLI 参数值（如 --targets HTR1A,BIN1）等本来就该用英文标点的部分原样保留，不含中文的行不处理。
-用法：python3 _punct_fix.py [--apply] [--no-unwrap] [--diff]；不加 --apply 为干跑。
+用法：python3 注释规范.py [--apply] [--no-unwrap] [--diff]；不加 --apply 为干跑。
 """
 import re, sys, os, io, ast, tokenize
 

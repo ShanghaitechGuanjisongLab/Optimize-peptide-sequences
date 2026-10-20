@@ -1,12 +1,12 @@
 """
 蒙特卡洛优化小肽序列 — AlphaFold3 本地推理入口
 =============================================================
-与 optimize_peptide_AF3.py（官方服务器版）的区别：
+与 小肽优化_云端.py（官方服务器版）的区别：
   - 结构预测在本集群 GPU 计算节点上运行（自动用 sbatch 提交作业）
   - 复用本机已下载的 AlphaFold3 代码、模型权重与数据库（见下方路径）
   - 无每日配额限制，无需 Google 账号，任务全部并行排队在集群上
 
-复用的部分（来自公共库 peptide_common）：
+复用的部分（来自公共库 小肽公共库）：
   - 序列常量（SEQ_202 / HTR1A_SEQ / UNC13C_SEQ / BIN1_SEQ）
   - generate_mutant() 突变规则、run_monte_carlo() 蒙特卡洛主循环（后端无关）
   本文件提供本地集群推理的预测实现：生成 .sbatch → sbatch 提交 → 计算节点推理。
@@ -25,7 +25,7 @@
         pip install pandas matplotlib openpyxl c）数据库：共享目录中是压缩的 .zst 文件；首次运行会自动提交一个解压作业到计算节点异步执行，无需保持 SSH 连接，解压完成后重跑本脚本即可继续。
   2. 运行：
         conda activate base      # 或任意装好驱动依赖的环境
-        python optimize_peptide_local.py 首次运行会为初始序列×3 个靶标提交推理作业；作业完成后重跑本脚本即可自动评分并继续推进（支持断点续跑）。
+        python 小肽优化_本地集群.py 首次运行会为初始序列×3 个靶标提交推理作业；作业完成后重跑本脚本即可自动评分并继续推进（支持断点续跑）。
 
 检查策略：入口的预检查只做提示、不会退出——即使资源尚未就绪也会照常运行流程：已完成的旧结果仍可被评分复用，新的提交失败会打印原因，补齐条件后重跑即可。
 
@@ -63,7 +63,7 @@ if _missing:
     sys.exit(f"驱动环境缺少依赖: {_missing}，请先执行: pip install {' '.join(_missing)}")
 
 # 导入公共库（导入零副作用，不含任何预测后端逻辑）
-from peptide_common import create_af3_json, run_monte_carlo, ROOT_DIR
+from 小肽公共库 import create_af3_json, run_monte_carlo, ROOT_DIR
 
 # ===================== 本地模式配置区域 =====================
 
@@ -94,7 +94,7 @@ LOCAL_RESULTS_DIR = os.environ.get("PEPOPT_RESULTS_DIR", "").strip() \
     or os.path.join(os.path.dirname(os.path.abspath(__file__)), "af3_local_results")
 
 # 外置作业脚本目录：SLURM 实际执行的 .sh 脚本存放处，不再把 shell 内嵌进 Python 字符串
-SCRIPTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts")
+SCRIPTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "作业脚本")
 
 # SLURM 资源配置（每个“序列×靶标”为一个推理任务，多任务打包进单个作业）
 # PEPOPT_PARTITION 可覆盖（将来申请到 A100/H100 分区时切换）
@@ -212,7 +212,7 @@ MAX_INFLIGHT    = max(1, QOS_LIMITS["submit"])
 #   V100 （CUDA 算力 7.x）-> 1，280 tokens   <- 当前 bme_gpupub 分区全是 V100 32GB
 #   A100 40GB            -> 4，352 tokens（还需改 model_config.py 的 pair_transition_shard_spec）
 #   A100/H100 80GB       -> 官方支持全尺寸（默认最大 bucket 5，120 tokens）
-# 官方 1，280 是“保证不溢出”的保守值而非硬上限：实测 Asic1a 三聚体 1，597 tokens 在V100-32GB上真跑成功（unified memory 溢出到主机内存，≈2735s/5样本，计时注释见 optimize_peptide_node.py），故闸门设 2048：放行 Asic1a（1，597），仍拦截 UNC13C（≈2，233，维持搁置）。
+# 官方 1，280 是“保证不溢出”的保守值而非硬上限：实测 Asic1a 三聚体 1，597 tokens 在V100-32GB上真跑成功（unified memory 溢出到主机内存，≈2735s/5样本，计时注释见 小肽优化_节点内.py），故闸门设 2048：放行 Asic1a（1，597），仍拦截 UNC13C（≈2，233，维持搁置）。
 # 若申请到 A100/H100-80G：设环境变量 PEPOPT_GPU_MAX_TOKENS=5120 与
 # PEPOPT_FLASH_ATTN=triton（见下），并把 runner 的 AF3_NEED_XLA_7X_FLAG 置 0，
 # 即可补齐 UNC13C；代码无需改动。
@@ -483,14 +483,14 @@ def submit_db_prep_job():
         print(f"📦 上次解压作业已结束 ({state}, jobid={jobid})，清理陈旧标记后重新提交。")
         os.remove(marker)
 
-    # 作业脚本外置于 scripts/db_prep_runner.sh；SLURM 资源走参数，配置走 --export，
+    # 作业脚本外置于 作业脚本/数据库解压作业.sh；SLURM 资源走参数，配置走 --export，
     # Python 侧不再内嵌 shell，也不生成临时 .sbatch 文件。
     repo_dir = os.path.dirname(os.path.abspath(__file__))
-    runner = os.path.join(SCRIPTS_DIR, "db_prep_runner.sh")
+    runner = os.path.join(SCRIPTS_DIR, "数据库解压作业.sh")
     env_pairs = [
         f"PEPOPT_WORK_DIR={repo_dir}",
         "PEPOPT_CONDA_ENV=base",
-        "PEPOPT_ENTRY=optimize_peptide_local.py",
+        "PEPOPT_ENTRY=小肽优化_本地集群.py",
     ]
     cmd = [
         "sbatch",
@@ -693,12 +693,12 @@ def queue_depth():
 def build_bundle_sbatch_cmd(bundle_id, bundle_dir):
     """构建提交打包推理作业的 sbatch 命令（返回 argv 列表）。
 
-    作业脚本外置于 scripts/af3_bundle_runner.sh（两阶段容错逻辑见该文件头注释）；
+    作业脚本外置于 作业脚本/AF3打包推理.sh（两阶段容错逻辑见该文件头注释）；
     SLURM 资源指令走命令行参数，作业配置走 --export 环境变量，Python 侧不内嵌任何 shell 脚本字符串。
 
-    **提交的是 runner 的快照副本**（复制进 bundle 目录，命名下划线开头以免被收割/打包逻辑当作任务）。原因：bash 边读边执行、按字节偏移回读脚本，而编辑器写文件是**原地截断重写**（inode 不变）——若在作业运行期间修改 scripts/ 下的 runner，正在执行的作业会在下一条命令处读到错位内容而语法崩溃或行为失控。快照副本让作业与本仓库后续改动完全解耦（2026-10-04 实测踩到，当时靠临时回滚救回运行中的作业）。"""
+    **提交的是 runner 的快照副本**（复制进 bundle 目录，命名下划线开头以免被收割/打包逻辑当作任务）。原因：bash 边读边执行、按字节偏移回读脚本，而编辑器写文件是**原地截断重写**（inode 不变）——若在作业运行期间修改 作业脚本/ 下的 runner，正在执行的作业会在下一条命令处读到错位内容而语法崩溃或行为失控。快照副本让作业与本仓库后续改动完全解耦（2026-10-04 实测踩到，当时靠临时回滚救回运行中的作业）。"""
     work_dir = os.path.dirname(os.path.abspath(__file__))
-    src_runner = os.path.join(SCRIPTS_DIR, "af3_bundle_runner.sh")
+    src_runner = os.path.join(SCRIPTS_DIR, "AF3打包推理.sh")
     runner = os.path.join(os.path.abspath(bundle_dir), "_runner_snapshot.sh")
     shutil.copyfile(src_runner, runner)          # 快照：与仓库后续修改解耦
     os.chmod(runner, 0o755)
@@ -739,7 +739,7 @@ def build_bundle_sbatch_cmd(bundle_id, bundle_dir):
 
 
 # =====================================================================
-# 单作业无限循环形态（推荐；见 scripts/af3_loop_job.sh 文件头的取舍理由）
+# 单作业无限循环形态（推荐；见 作业脚本/AF3循环作业.sh 文件头的取舍理由）
 # ---------------------------------------------------------------------
 # 旧形态是“登录节点常驻驱动 + 反复 sbatch 小包”。它的结构性缺陷：
 #   ① 登录节点进程脆弱 —— 本机把所有交互进程塞进同一 cgroup
@@ -747,7 +747,7 @@ def build_bundle_sbatch_cmd(bundle_id, bundle_dir):
 #      （已发生两次，其中一次 GPU 空转 8h22m、29 个结果滞留未入库）；
 #   ② QoS MaxJobsPerUser=1 是**运行并发**上限 → 编排作业与计算作业互斥，
 #      故也不能把编排做成一个独立的计算节点作业。
-# 解法 = 把整个搜索放进**一个长驻作业内部循环**（optimize_peptide_node.py）：
+# 解法 = 把整个搜索放进**一个长驻作业内部循环**（小肽优化_节点内.py）：
 #   分区 MaxTime=5 天、PreemptMode=OFF（不被抢占），且 --test-only 实测
 #   48h/2天/3天/5天 的预计启动时间**完全相同** → 长时限不受精调度惩罚。
 #   登录节点从此不留常驻进程，只有一个 cron 看门狗负责"5 天到期/意外死亡
@@ -807,7 +807,7 @@ def build_loop_job_cmd(targets, cycle_seqs, max_hours=None):
     """构建“单个长驻循环作业”的 sbatch 命令（返回 argv 列表）。
 
     资源与 bundle 作业一致（受 QoS 的 gpu=1 / cpu=8 钳制），但时限取分区 MaxTime（默认 5 天），并把 MaxTime-余量 作为 Python 侧时间预算下发，使作业能自适应地把最后一轮排满、到期前优雅退出（而非被 SLURM 掐断）。"""
-    import peptide_db as db                       # 延迟导入：保持本模块可独立使用
+    import 小肽数据库 as db                       # 延迟导入：保持本模块可独立使用
     p = db.paths(ensure=True)
     runs = os.path.join(p["root"], "runs")
     os.makedirs(runs, exist_ok=True)
@@ -850,7 +850,7 @@ def build_loop_job_cmd(targets, cycle_seqs, max_hours=None):
         f"--gres=gpu:{n_gpu}",
         f"--time={time_str}",
         "--export=ALL," + ",".join(env_pairs),
-        os.path.join(SCRIPTS_DIR, "af3_loop_job.sh"),
+        os.path.join(SCRIPTS_DIR, "AF3循环作业.sh"),
     ], budget_h
 
 
@@ -984,7 +984,7 @@ def write_input_json(peptide_seq, target_seq, job_name, result_dir,
                     target_copies=1):
     """写入单任务的 AF3 输入 JSON（提交由打包机制统一处理）。
 
-    target_copies：靶标链数（同源多聚体）；3 = Asic1a 同源三聚体（详见peptide_common.create_af3_json）。"""
+    target_copies：靶标链数（同源多聚体）；3 = Asic1a 同源三聚体（详见小肽公共库.create_af3_json）。"""
     input_json = os.path.join(result_dir, "input.json")
     job = create_af3_json(peptide_seq, target_seq, job_name,
                           target_copies=target_copies)

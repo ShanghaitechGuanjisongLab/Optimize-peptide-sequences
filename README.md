@@ -6,16 +6,16 @@
 
 | 入口文件 | 搜索策略 | 预测后端 |
 | --- | --- | --- |
-| `optimize_peptide_node.py` | **无限搜索（当前主推）：单个长驻计算节点作业内部循环** | 本地集群 GPU 推理（作业内直接执行，不再 sbatch）|
-| `optimize_peptide_BO.py` | 贝叶斯优化（有限预算，便于短周期实验）| 默认本地集群 GPU 推理；`--server` 切换为 AlphaFold Server |
-| `optimize_peptide_infinite.py` | ⚠️ legacy 无限搜索（登录节点常驻驱动）；其候选流/GP 挑选/收割报告被 node 入口复用 | 本地集群 GPU 推理 + 反复 sbatch 小包作业 |
-| `optimize_peptide_local.py` | 蒙特卡洛 | 本地集群 GPU 推理（自动提交 SLURM 作业，重跑续作）|
-| `optimize_peptide_AF3.py` | 蒙特卡洛（原版）| AlphaFold Server（手动上传/下载）|
-| `peptide_db.py` | —（共享结果库）| 稳定标签/主表 CSV/收割入库/BEST_TOP10/旧结果迁移；导入零副作用 |
-| `peptide_common.py` | —（公共库）| 序列常量、突变规则、AF3 JSON 格式、评分提取、后端无关的蒙特卡洛主循环；导入零副作用 |
-| `peptide_server.py` | —（云端后端库）| 云端 JSON 批量/缓存/可选浏览器自动化编排，仅云端入口导入 |
+| `小肽优化_节点内.py` | **无限搜索（当前主推）：单个长驻计算节点作业内部循环** | 本地集群 GPU 推理（作业内直接执行，不再 sbatch）|
+| `小肽优化_BO.py` | 贝叶斯优化（有限预算，便于短周期实验）| 默认本地集群 GPU 推理；`--server` 切换为 AlphaFold Server |
+| `小肽优化_无限.py` | ⚠️ legacy 无限搜索（登录节点常驻驱动）；其候选流/GP 挑选/收割报告被 node 入口复用 | 本地集群 GPU 推理 + 反复 sbatch 小包作业 |
+| `小肽优化_本地集群.py` | 蒙特卡洛 | 本地集群 GPU 推理（自动提交 SLURM 作业，重跑续作）|
+| `小肽优化_云端.py` | 蒙特卡洛（原版）| AlphaFold Server（手动上传/下载）|
+| `小肽数据库.py` | —（共享结果库）| 稳定标签/主表 CSV/收割入库/BEST_TOP10/旧结果迁移；导入零副作用 |
+| `小肽公共库.py` | —（公共库）| 序列常量、突变规则、AF3 JSON 格式、评分提取、后端无关的蒙特卡洛主循环；导入零副作用 |
+| `小肽云端后端.py` | —（云端后端库）| 云端 JSON 批量/缓存/可选浏览器自动化编排，仅云端入口导入 |
 
-> ⭐ **当前阶段的实际运行形态**（V100 只有 1 张卡的配额，UNC13C 超限搁置）：`./run.sh` 提交**一个** 5 天长驻作业，在计算节点上循环“挑候选 → 跑 AF3 → 收割入库”，登录节点不留常驻进程。背景与取舍见下文「无限搜索入口」一节。
+> ⭐ **当前阶段的实际运行形态**（V100 只有 1 张卡的配额，UNC13C 超限搁置）：`./运行.sh` 提交**一个** 5 天长驻作业，在计算节点上循环“挑候选 → 跑 AF3 → 收割入库”，登录节点不留常驻进程。背景与取舍见下文「无限搜索入口」一节。
 
 # 研究背景
 
@@ -92,7 +92,7 @@ conda install -n af3_old -c bioconda hmmer
 # 使用方法
 
 ```bash
-python optimize_peptide_AF3.py
+python 小肽优化_云端.py
 ```
 
 脚本执行流程：
@@ -111,7 +111,7 @@ python optimize_peptide_AF3.py
 
 # 贝叶斯优化入口（推荐）
 
-蒙特卡洛版每步随机抽候选，在“每天只能评估约 10 个候选”的昂贵评估场景下样本效率低。`optimize_peptide_BO.py` 改用**贝叶斯优化**：
+蒙特卡洛版每步随机抽候选，在“每天只能评估约 10 个候选”的昂贵评估场景下样本效率低。`小肽优化_BO.py` 改用**贝叶斯优化**：
 
 1. **候选库**：按相同突变规则预生成约 1500 个编辑距离 ≤ 2 的候选（固定种子，可复现）；
 2. **冷启动**：评估初始序列 + 8 个随机候选；
@@ -123,10 +123,10 @@ python optimize_peptide_AF3.py
 > **按显存选靶标（`--targets`）**：三个靶标各自独立预测，而 `bme_gpupub` 分区全是 **V100-32GB**，官方仅支持 **≤1280 tokens** 的复合物。按序列长度估算：肽–HTR1A ≈ **441** tokens、肽–BIN1 ≈ **612** tokens 均在限内；肽–UNC13C ≈ **2233** tokens **远超上限**，在 V100 上必然显存溢出。因此当前阶段可用 `--targets HTR1A,BIN1` 只跑 V100 放得下的两个靶标、尽量多存结果，UNC13C 约束**暂时搁置**；等申请到 A100/H100-80G 再以全靶标运行补齐（已完成的 HTR1A/BIN1 结果按 `af3_local_results/<任务名>` 缓存，会被直接复用，不重复计算）。靶标子集运行时的评估记录写入独立目录 `output_bo_htr1a-bin1/`，不与全量的 `output_bo/` 混淆。
 
 ```bash
-python optimize_peptide_BO.py                          # 默认全靶标（HTR1A+UNC13C+BIN1；UNC13C 需 A100/H100）
-python optimize_peptide_BO.py --targets HTR1A,BIN1      # 【当前 V100】只跑 HTR1A+BIN1，搁置 UNC13C
-python optimize_peptide_BO.py --server                  # 切换为 AlphaFold Server 云端后端（手动上传/下载，受配额限制）
-python optimize_peptide_BO.py --targets HTR1A,BIN1 --budget 200 --batch 8 --pool 1500   # 多存结果：自定义预算/批量/候选库
+python 小肽优化_BO.py                          # 默认全靶标（HTR1A+UNC13C+BIN1；UNC13C 需 A100/H100）
+python 小肽优化_BO.py --targets HTR1A,BIN1      # 【当前 V100】只跑 HTR1A+BIN1，搁置 UNC13C
+python 小肽优化_BO.py --server                  # 切换为 AlphaFold Server 云端后端（手动上传/下载，受配额限制）
+python 小肽优化_BO.py --targets HTR1A,BIN1 --budget 200 --batch 8 --pool 1500   # 多存结果：自定义预算/批量/候选库
 ```
 
 输出位于 `output_bo/`（靶标子集运行时为 `output_bo_htr1a-bin1/`）：`bo_evaluations.csv`（全部评估记录）、`bo_curve.png`（最优分改进曲线）、`BEST_STRUCTURE/`（最佳序列结构包）、`result_bo.xlsx`（最终结果表）。
@@ -139,8 +139,8 @@ python optimize_peptide_BO.py --targets HTR1A,BIN1 --budget 200 --batch 8 --pool
 
 | 文件 | 形态 | 状态 |
 | --- | --- | --- |
-| `optimize_peptide_node.py` | **单个长驻计算节点作业**：sbatch 一个时限=分区 `MaxTime`（5 天）的作业，整个搜索循环跑在**作业内部** | ✅ 当前主推 |
-| `optimize_peptide_infinite.py` | 登录节点常驻 Python 驱动 + 反复 sbatch 小包作业 | ⚠️ legacy（其候选流/启发式挑选/收割报告被 node 入口复用）|
+| `小肽优化_节点内.py` | **单个长驻计算节点作业**：sbatch 一个时限=分区 `MaxTime`（5 天）的作业，整个搜索循环跑在**作业内部** | ✅ 当前主推 |
+| `小肽优化_无限.py` | 登录节点常驻 Python 驱动 + 反复 sbatch 小包作业 | ⚠️ legacy（其候选流/启发式挑选/收割报告被 node 入口复用）|
 
 为何改为“单作业”形态（2026-10-04 实测定案，详见文件头）：
 
@@ -150,7 +150,7 @@ python optimize_peptide_BO.py --targets HTR1A,BIN1 --budget 200 --batch 8 --pool
 
 与有限预算 BO 入口的区别：
 
-1. **单一真源是共享数据库**（`peptide_db.py`，存于共享目录，计算节点可见）：
+1. **单一真源是共享数据库**（`小肽数据库.py`，存于共享目录，计算节点可见）：
 `/public_bme2/Share200T/管吉松/peptide_opt_db/`（可用环境变量 `PEPOPT_DB_ROOT` 覆盖）
    - `peptide_database.csv`：每序列一行（`iptm_htr1a` / `iptm_bin1` / `iptm_unc13c`，现阶段 unc13c 列留空）；
    - `sequences.csv`：任务标签 `tag` → 序列注册表；
@@ -162,9 +162,9 @@ python optimize_peptide_BO.py --targets HTR1A,BIN1 --budget 200 --batch 8 --pool
    >
    > 因此写入路径一律用 **`db.resolve_tag(var)`**（注册表优先）而非 `make_tag()`：已登记过的序列沿用当初的旧 5 位十进制标签（如 `s05770`），否则扩位后同一序列会拿到新标签 → 磁盘上已有的 34 条结果全部孤儿化并被重算。切换前已核对：主库 34 行全在注册表且可变区一致、84 个结果目录无损沿用、零覆盖空洞。
 
-3. **候选来自精确穷尽枚举，而非随机采样**（2026-10-04 定案，`ExhaustiveQueue`）：全集 = `peptide_common.enumerate_space()` 精确构造的 **51091 条**（编辑距离 ≤2、长 6~10、20 种标准氨基酸，枚举仅 97ms、字典序确定）。每周期从「全集 − 已派发台账」中取 24 条。
+3. **候选来自精确穷尽枚举，而非随机采样**（2026-10-04 定案，`ExhaustiveQueue`）：全集 = `小肽公共库.enumerate_space()` 精确构造的 **51091 条**（编辑距离 ≤2、长 6~10、20 种标准氨基酸，枚举仅 97ms、字典序确定）。每周期从「全集 − 已派发台账」中取 24 条。
 
-由此得到三条**可证明**的性质：① **不重复**（凡被派发必先登记进 `sequences.csv`）；② 待办集合每周期精确定量递减；③ 至多 ⌈51091/24⌉ = **2129 个周期 ≈ 680 天必然全覆盖**（`./run.sh status` 实时显示进度与 ETA）。
+由此得到三条**可证明**的性质：① **不重复**（凡被派发必先登记进 `sequences.csv`）；② 待办集合每周期精确定量递减；③ 至多 ⌈51091/24⌉ = **2129 个周期 ≈ 680 天必然全覆盖**（`./运行.sh status` 实时显示进度与 ETA）。
 
 取代随机采样的两个实测理由：旧 `CandidateStream` 每周期只撒 ~720 个随机点做 GP 排序（argmax 是在子集上取的，不是在整个空间上），且 `generate_mutant` 有 **665 条序列永远采不到**（模式B 的 `delta=±1` 只做单次插入或删除，故“净长度不变的插入+删除”两步编辑生成不出来）。精确枚举含这 665 条。
 
@@ -174,14 +174,14 @@ python optimize_peptide_BO.py --targets HTR1A,BIN1 --budget 200 --batch 8 --pool
 
 4. **每个周期（cycle）的顺序**：收割上轮结果入库 → 刷新 BEST_TOP10 → **先补跑历史遗留的未完成任务**（`drain_backlog`，防止“已注册却永远算不完”的孤儿）→ 剩余配额由穷尽队列按 cEI 次序给出新候选（评估样本 <12 时整批走字典序游标；之后 ~25% 探索配额 + 其余按约束期望改进 cEI = EI(1-ipTM_HTR1A) × P(ipTM_BIN1 < 0.8)）→ **在作业内部**直接跑 AF3（不再 sbatch）。每周期默认 24 序列（`PEPOPT_CYCLE_SEQS`）。空间取空时作业**明确报告“已全覆盖”并正常收尾**，与“连续空轮失败”（`EMPTY_CYCLE_LIMIT`）语义区分开。
 5. **时间预算自适应**：临近 5 天时限的最后一周期按剩余时间反推序列数（`size_next_cycle`），把 GPU 用满而不是提前空停；到期后优雅退出，由 cron 看门狗在 ≤5min 内续交下一个 5 天作业。即使被 SLURM 掐断也只损失“当前正在算的 1 个任务”—— 已完成结果早就逐个落在共享盘上，下个作业首轮收割即入库。
-6. **优雅终止与重启**：`./run.sh stop` = `scancel` 循环作业 + 写 `runs/loop.disabled`（阻止看门狗续交）；作业内 SIGTERM/SIGINT 也会完成当前周期再退。
+6. **优雅终止与重启**：`./运行.sh stop` = `scancel` 循环作业 + 写 `runs/loop.disabled`（阻止看门狗续交）；作业内 SIGTERM/SIGINT 也会完成当前周期再退。
 
-改完代码要让新代码生效，**不要 `scancel`**：正在跑的作业已把 `.py` 载入内存，编辑源文件对它无效；但直接取消会丢掉当前周期尚未算完的任务，更糟的是 `bme_gpupub` 的 GPU 常被其他用户占满（`squeue` 对我隐藏他人作业，需看 `scontrol show node` 的 `AllocTRES=gres/gpu`）——**释放的卡会被立刻抢走**，新作业转 `PENDING(Resources)` 不知何时启动（2026-10-04 实测踩过）。正确做法是 `./run.sh restart-loop`：在 `runs/restart.requested` 放一个标志，作业在**下一个周期起点**正常退出（已完成周期的结果早已收割入库，不丢数据），看门狗 ≤5min 续交加载了新代码的作业；唯一代价是新作业首轮重建 chain-B MSA（实测 ≈55min）。标志会被自动消费，不会让续交的作业又立刻退出。
+改完代码要让新代码生效，**不要 `scancel`**：正在跑的作业已把 `.py` 载入内存，编辑源文件对它无效；但直接取消会丢掉当前周期尚未算完的任务，更糟的是 `bme_gpupub` 的 GPU 常被其他用户占满（`squeue` 对我隐藏他人作业，需看 `scontrol show node` 的 `AllocTRES=gres/gpu`）——**释放的卡会被立刻抢走**，新作业转 `PENDING(Resources)` 不知何时启动（2026-10-04 实测踩过）。正确做法是 `./运行.sh restart-loop`：在 `runs/restart.requested` 放一个标志，作业在**下一个周期起点**正常退出（已完成周期的结果早已收割入库，不丢数据），看门狗 ≤5min 续交加载了新代码的作业；唯一代价是新作业首轮重建 chain-B MSA（实测 ≈55min）。标志会被自动消费，不会让续交的作业又立刻退出。
 7. **GPU 资源利用与硬限（2026-10 实测）**：
    - `bme_gpupub` 共 16×V100-32GB（`bme_gpu01/02` 各 4 张 V100S-PCIE、`bme_gpu09` 8 张 V100-SXM2），但它是**全用户共享**的分区；A100（`bme_gpu`/`bme_a10080g`/`bme_gpu11/16/17`）与 4090（`spst_yangbo1`）均无权访问（`--test-only` 返回 *Invalid account or account/partition combination*）。
    - 真正的上限来自**分区级 QoS** `partition_bme_gpupub`（非用户 QoS，`sacctmgr show qos name=partition_bme_gpupub`）：`MaxTRESPU=cpu=8,gres/gpu=1`、`MaxJobsPerUser=1`、`MaxSubmitJobsPerUser=2` —— 即**每用户峰值只有 1 张 GPU / 8 个 CPU**，同时 1 个作业在跑 + 1 个排队。注意超限作业**不会报错**，而是永远 PENDING（`QOSMaxTRESPULimit`）。
    - 因此代码在 import 时**自动探测分区 QoS 并钳制资源**（`_probe_qos_limits()`）：`--gres=gpu:N` 与 `--cpus-per-task` 按 `MaxTRESPU÷MaxJobsPerUser` 取值，提交窗口 = `MaxSubmitJobsPerUser`。当前解析为 `gpu:1 / cpus 8 / mem 64G`，并保留 1 运行 + 1 排队使上个作业一结束下个立即接续（**零空隙**）。`PEPOPT_GPUS_PER_JOB` 可手动指定，但仍被 QoS 上限钳制并告警。
-   - `scripts/af3_bundle_runner.sh` 的多卡阶段（`stage1_parallel`：同靶标归同一 GPU 流以复用 MSA 缓存，单一靶标时轮转均分）已实现但**在 1 卡限额下不启用**；管理员一旦放开 `MaxTRESPU`，本代码无需修改即自动改为每作业多卡并行。
+   - `作业脚本/AF3打包推理.sh` 的多卡阶段（`stage1_parallel`：同靶标归同一 GPU 流以复用 MSA 缓存，单一靶标时轮转均分）已实现但**在 1 卡限额下不启用**；管理员一旦放开 `MaxTRESPU`，本代码无需修改即自动改为每作业多卡并行。
    - **实测耗时结构**（V100-SXM2，6 任务包共 2h）：MSA 占 100 min、推理仅 17 min（HTR1A 93s / BIN1 230s，约 14%）。其中 **chain B（靶标）MSA 每进程只建一次**（HTR1A 1738s + BIN1 1555s ≈ 55 min 固定开销，包内后续同靶标任务只需 0.02–0.07s），而 **chain A（肽）MSA 每个不同肽都要重算 ~670s**——这是不可摊销的主成本。
    - 因此 1 卡限额下两个有效杆杆：① **MSA 线程用满 QoS 给的 8 核**（`PEPOPT_MSA_CPUS`，默认 = 全部可用 CPU；MSA 是临界路径且数据管线阶段主线程阻塞等待，并不额外抢 CPU）；② **加大单作业任务数摊薄那 55 min 固定开销**（`PEPOPT_BUNDLE_SIZE`，默认 **48** = 24 序列 × 2 靶标，约 7.6h/包）。按实测建模的**单序列**成本 `3293/N + 1010s`：`N=3→2108s | 6→1559s | 12→1284s | 24→1147s | 48→1079s | 渐近 1010s`；取 N=24 比上一档 +12%，再大只多 6% 却要 14h+/包，不划算。
    - **周期容量与 GP 引导的平衡**：周期尺寸取 24 序列（= 48 任务），因为再大则 GP 反馈太慢（一轮要跑 14h+）、再小则那 55 min 固定开销摊不薄；每周期结束后立刻收割并把新数据交给下一轮的 GP，引导不会滞后超过一轮。
@@ -190,26 +190,26 @@ python optimize_peptide_BO.py --targets HTR1A,BIN1 --budget 200 --batch 8 --pool
    - 想用满 16 张卡只能走管理员：调高 `partition_bme_gpupub` 的 `MaxTRESPU`/`MaxJobsPerUser`（**放开后代码自动改为每作业多卡并行，无需改动**），或开通 A100 分区权限（后者还能一并解锁 UNC13C）。
 
 ```bash
-./run.sh                 # 默认: 提交单个长驻循环作业 + 装 cron 看门狗
-./run.sh status          # 作业/看门狗状态 + 穷尽覆盖进度与 ETA + 数据库统计与 BEST_TOP10
-./run.sh stop            # scancel 循环作业并阻止看门狗续交
-./run.sh restart-loop    # 改完代码后在**周期边界**优雅重启（新代码生效, 不废已完成周期）
-./run.sh watchdog        # 单独安装/修复 cron 看门狗（每 5min 检查作业是否在队列）
-./run.sh no-watchdog     # 卸载看门狗
+./运行.sh                 # 默认: 提交单个长驻循环作业 + 装 cron 看门狗
+./运行.sh status          # 作业/看门狗状态 + 穷尽覆盖进度与 ETA + 数据库统计与 BEST_TOP10
+./运行.sh stop            # scancel 循环作业并阻止看门狗续交
+./运行.sh restart-loop    # 改完代码后在**周期边界**优雅重启（新代码生效, 不废已完成周期）
+./运行.sh watchdog        # 单独安装/修复 cron 看门狗（每 5min 检查作业是否在队列）
+./运行.sh no-watchdog     # 卸载看门狗
 # 自定义靶标/周期尺寸（传给作业）：
-PEPOPT_CYCLE_SEQS=30 PEPOPT_TARGETS=HTR1A,BIN1 ./run.sh loop
+PEPOPT_CYCLE_SEQS=30 PEPOPT_TARGETS=HTR1A,BIN1 ./运行.sh loop
 # legacy 形态（登录节点常驻驱动, 脆弱, 仅保留兼容）：
-./run.sh infinite ; ./run.sh legacy-stop ; ./run.sh legacy-status
+./运行.sh infinite ; ./运行.sh legacy-stop ; ./运行.sh legacy-status
 # 库维护/统计：
-python optimize_peptide_infinite.py --status
+python 小肽优化_无限.py --status
 ```
 
 **将来 UNC13C 解锁**（申请到 A100/H100-80G）时，无需改代码，只需用环境变量换后端再提交一次：
 
 ```bash
-./run.sh stop    # 先停掉 V100 的循环作业
+./运行.sh stop    # 先停掉 V100 的循环作业
 PEPOPT_PARTITION=<新分区> PEPOPT_GPU_MAX_TOKENS=5120 PEPOPT_FLASH_ATTN=triton \
-PEPOPT_XLA_7X=0 PEPOPT_TARGETS=HTR1A,BIN1,UNC13C ./run.sh loop
+PEPOPT_XLA_7X=0 PEPOPT_TARGETS=HTR1A,BIN1,UNC13C ./运行.sh loop
 ```
 
 （`sbatch` 用 `--export=ALL`，故这些变量会从登录 shell 透传到计算节点）
@@ -219,26 +219,26 @@ PEPOPT_XLA_7X=0 PEPOPT_TARGETS=HTR1A,BIN1,UNC13C ./run.sh loop
 > 靶标退化为单靶标 → 跑几天才发现 BIN1 约束全丢（2026-10-04 实际踩到）。因此 `submit_loop_job()`
 > 一律用 **`+`** 作分隔符下发（`PEPOPT_TARGETS=HTR1A+BIN1`），Python 侧 `parse_targets()` 两种都接受，
 > 且 `_check_export_pairs()` 会在提交前拦截任何含逗号的值、`main()` 对“只有 HTR1A”直接拒绝启动、
-> `af3_loop_job.sh` 首屏回显靶标并校验必须含 BIN1 —— 四道防线确保同类退化不会再白烧机时。
-> 经 `./run.sh` / 看门狗调用时这些都自动处理，人手 `sbatch` 时务必用 `+`。
+> `AF3循环作业.sh` 首屏回显靶标并校验必须含 BIN1 —— 四道防线确保同类退化不会再白烧机时。
+> 经 `./运行.sh` / 看门狗调用时这些都自动处理，人手 `sbatch` 时务必用 `+`。
 
 已入库序列只补算 UNC13C（HTR1A/BIN1 结果直接复用，因为 `prepare_cycle` 先用 `consolidate_task` 判重），`refresh_best` 自动改按全约束（BIN1+UNC13C 双 <0.8）重排 BEST_TOP10。注：A100 上 flash attention 可改 `triton` 且 token 上限抬到 5120，届时 MSA 与显存开销大幅下降，可同步调大 `PEPOPT_CYCLE_SEQS`。
 
-# 共享数据库公共库（peptide_db.py）
+# 共享数据库公共库（小肽数据库.py）
 
-`peptide_db.py` 是跨入口的共享结果库（导入零副作用），无限搜索入口自动使用。也可单独调用做一次性维护：
+`小肽数据库.py` 是跨入口的共享结果库（导入零副作用），无限搜索入口自动使用。也可单独调用做一次性维护：
 
 ```bash
-python -c "import peptide_db as db; print(db.stats())"                    # 数据库统计
-python -c "import peptide_db as db; print(db.migrate_legacy(dry_run=True))"  # 演练旧结果迁移（不写盘）
-python -c "import peptide_db as db; print(db.refresh_best())"              # 重算 BEST_TOP10（如补完 UNC13C 后改 targets=('HTR1A','BIN1','UNC13C')）
+python -c "import 小肽数据库 as db; print(db.stats())"                    # 数据库统计
+python -c "import 小肽数据库 as db; print(db.migrate_legacy(dry_run=True))"  # 演练旧结果迁移（不写盘）
+python -c "import 小肽数据库 as db; print(db.refresh_best())"              # 重算 BEST_TOP10（如补完 UNC13C 后改 targets=('HTR1A','BIN1','UNC13C')）
 ```
 
 `migrate_legacy()` 把家目录旧 `af3_local_results/`（旧下标命名 `seq_XXXX_*`，完成结果常被移进带时间戳的兄弟目录、input.json 可能缺失）的已完成结果按 input.json / model.cif 双兜底还原 A 链序列，转为稳定标签名复制进共享库并入库（幂等，可反复执行；UNC13C/未完成目录自动跳过）。
 
 # 本地集群推理入口（蒙特卡洛）
 
-`optimize_peptide_local.py` 是与主脚本相同逻辑的蒙特卡洛版本，但预测后端换为**本地 GPU 推理**：对每个候选自动写入输入 JSON 并打包提交 `.sbatch` 作业（`bme_gpupub` 分区、`v-jiamh` 账户；**GPU/CPU 数按分区 QoS 自动探测并钳制**，当前为每作业 1 GPU / 8 CPU，见上文“GPU 资源利用与硬限”），提交到集群计算节点运行，完成后重跑脚本即可提取评分、继续优化（支持续跑）。前置条件（详见文件头说明）：
+`小肽优化_本地集群.py` 是与主脚本相同逻辑的蒙特卡洛版本，但预测后端换为**本地 GPU 推理**：对每个候选自动写入输入 JSON 并打包提交 `.sbatch` 作业（`bme_gpupub` 分区、`v-jiamh` 账户；**GPU/CPU 数按分区 QoS 自动探测并钳制**，当前为每作业 1 GPU / 8 CPU，见上文“GPU 资源利用与硬限”），提交到集群计算节点运行，完成后重跑脚本即可提取评分、继续优化（支持续跑）。前置条件（详见文件头说明）：
 
 - 本地 AlphaFold3 代码与权重：仓库外已具备（`/public_bme2/Share200T/管吉松/AlphaFold3` + `/public_bme2/Share200T/管吉松/weights/af3.bin`）；
 - 序列数据库：脚本会**自动检测磁盘空间并把解压作为 SLURM 作业提交到计算节点**（目标 `LOCAL_DB_DIR = /public_bme2/Share200T/管吉松/databases/alphafold3`，家目录有 ~500G 配额放不下）；检测到解压作业运行中会**转入实时进度跟踪**，完成后自动继续；
@@ -249,34 +249,34 @@ python -c "import peptide_db as db; print(db.refresh_best())"              # 重
 在 HPC 登录节点（如 `bme_login1`）上，**当前阶段（V100）推荐单个长驻循环作业**：搜索循环跑在计算节点作业内部，登录节点**不留任何常驻进程**（只一个 cron 看门狗负责到期续交），无需每日配额：
 
 ```bash
-./run.sh                                      # 【当前 V100 推荐】提交 5 天长驻循环作业 + 装 cron 看门狗
-./run.sh stop                                 # scancel 循环作业并阻止续交（已算结果全在共享盘）
-./run.sh status                               # 作业/看门狗状态 + 数据库统计 + BEST_TOP10
-python optimize_peptide_BO.py --targets HTR1A,BIN1   # 有限预算 BO（同样可只用 V100 靶标）
-python optimize_peptide_BO.py                        # 有限预算 BO 全靶标（UNC13C 需 A100/H100-80G）
-python optimize_peptide_local.py                     # 蒙特卡洛 + 本地集群推理
+./运行.sh                                      # 【当前 V100 推荐】提交 5 天长驻循环作业 + 装 cron 看门狗
+./运行.sh stop                                 # scancel 循环作业并阻止续交（已算结果全在共享盘）
+./运行.sh status                               # 作业/看门狗状态 + 数据库统计 + BEST_TOP10
+python 小肽优化_BO.py --targets HTR1A,BIN1   # 有限预算 BO（同样可只用 V100 靶标）
+python 小肽优化_BO.py                        # 有限预算 BO 全靶标（UNC13C 需 A100/H100-80G）
+python 小肽优化_本地集群.py                     # 蒙特卡洛 + 本地集群推理
 squeue -u $USER                     # 查看作业状态（循环作业名：pepopt-loop）
 ```
 
 仅当确需改用 **AlphaFold Server 云端后端**（受每日约 30 任务的配额限制，且当前为手动上传/下载模式）时，才需要显式切换：
 
 ```bash
-python optimize_peptide_BO.py --server    # 贝叶斯优化 + 云端后端
-python optimize_peptide_AF3.py            # 蒙特卡洛 + 云端后端（原版）
+python 小肽优化_BO.py --server    # 贝叶斯优化 + 云端后端
+python 小肽优化_云端.py            # 蒙特卡洛 + 云端后端（原版）
 ```
 
 云端后端的编排工作极轻，若不想在登录节点长时间运行，可用仓库自带的委托脚本把它提交到计算节点。最省事的方式是一键脚本（自动提交 + 实时滚动进度 + 结束报告，不暴露作业号细节）：
 
 ```bash
-./run.sh               # 一键提交：贝叶斯优化（本地后端）并实时跟踪进度
-./run.sh v100          # 【当前 V100】只跑 HTR1A+BIN1，搁置 UNC13C（超 V100 显存上限）
-./run.sh mc            # 蒙特卡洛版本
+./运行.sh               # 一键提交：贝叶斯优化（本地后端）并实时跟踪进度
+./运行.sh v100          # 【当前 V100】只跑 HTR1A+BIN1，搁置 UNC13C（超 V100 显存上限）
+./运行.sh mc            # 蒙特卡洛版本
 ```
 
 或手动等价操作：
 
 ```bash
-sbatch run_peptide_bo.sbatch   # BO + 云端后端
+sbatch 云端贝叶斯.sbatch   # BO + 云端后端
 tail -f pepopt_bo_<作业号>.out # 实时查看进度（作业号由提交信息给出）
 ```
 
@@ -304,21 +304,21 @@ tail -f pepopt_bo_<作业号>.out # 实时查看进度（作业号由提交信�
 # 目录与输出
 
 ```
-├── peptide_common.py            # 公共库: 序列/突变/JSON/评分/蒙特卡洛主循环（导入零副作用）
-├── peptide_db.py                # 共享结果库: 稳定标签/主表CSV/收割入库/BEST/旧结果迁移
-├── peptide_server.py            # 云端后端库: 批量JSON/结果缓存/可选浏览器自动化（仅云端入口导入）
-├── optimize_peptide_AF3.py      # 入口: 蒙特卡洛 + AlphaFold Server 云端后端（瘦壳）
-├── optimize_peptide_BO.py       # 入口: 贝叶斯优化（有限预算）
-├── optimize_peptide_node.py     # 入口【当前主推】: 计算节点内的无限循环作业
-├── optimize_peptide_infinite.py # 入口【legacy】: 登录节点常驻驱动（其库函数被 node 复用）
-├── optimize_peptide_local.py    # 入口: 蒙特卡洛 + 本地集群推理；并提供 SLURM 提交/打包/QoS 探测
-├── run_peptide.sbatch           # SLURM 委托脚本（服务器版蒙特卡洛）
-├── run_peptide_bo.sbatch        # SLURM 委托脚本（服务器版贝叶斯优化）
-├── run.sh                       # 一键运行（默认提交长驻循环作业; 亦含 stop/status/watchdog）
-├── scripts/af3_loop_job.sh      # 循环作业的 SLURM 包装（激活 base, 拉起 node 入口）
-├── scripts/af3_bundle_runner.sh # 作业内实际跑 AF3 的脚本（两阶段容错 + 时间戳输出折叠）
-├── scripts/loop_watchdog.sh     # cron 看门狗: 队列里没循环作业了就续交一个
-├── scripts/driver_watchdog.sh   # 【legacy】cron 看门狗: 拉起登录节点常驻驱动
+├── 小肽公共库.py            # 公共库: 序列/突变/JSON/评分/蒙特卡洛主循环（导入零副作用）
+├── 小肽数据库.py                # 共享结果库: 稳定标签/主表CSV/收割入库/BEST/旧结果迁移
+├── 小肽云端后端.py            # 云端后端库: 批量JSON/结果缓存/可选浏览器自动化（仅云端入口导入）
+├── 小肽优化_云端.py      # 入口: 蒙特卡洛 + AlphaFold Server 云端后端（瘦壳）
+├── 小肽优化_BO.py       # 入口: 贝叶斯优化（有限预算）
+├── 小肽优化_节点内.py     # 入口【当前主推】: 计算节点内的无限循环作业
+├── 小肽优化_无限.py # 入口【legacy】: 登录节点常驻驱动（其库函数被 node 复用）
+├── 小肽优化_本地集群.py    # 入口: 蒙特卡洛 + 本地集群推理；并提供 SLURM 提交/打包/QoS 探测
+├── 云端蒙特卡洛.sbatch           # SLURM 委托脚本（服务器版蒙特卡洛）
+├── 云端贝叶斯.sbatch        # SLURM 委托脚本（服务器版贝叶斯优化）
+├── 运行.sh                       # 一键运行（默认提交长驻循环作业; 亦含 stop/status/watchdog）
+├── 作业脚本/AF3循环作业.sh      # 循环作业的 SLURM 包装（激活 base, 拉起 node 入口）
+├── 作业脚本/AF3打包推理.sh # 作业内实际跑 AF3 的脚本（两阶段容错 + 时间戳输出折叠）
+├── 作业脚本/循环看门狗.sh     # cron 看门狗: 队列里没循环作业了就续交一个
+├── 作业脚本/驱动看门狗.sh   # 【legacy】cron 看门狗: 拉起登录节点常驻驱动
 ├── af3_jobs/                    # 生成的 AF3 JSON 任务、批次与序列索引（运行后产生）
 ├── af3_results/                 # AlphaFold Server 结果 zip（按 <任务名>.zip 命名）
 ├── af3_local_results/           # 本地推理任务目录与结果（运行后产生）
@@ -342,27 +342,27 @@ tail -f pepopt_bo_<作业号>.out # 实时查看进度（作业号由提交信�
 ├── af3_results/<tag>_<target>/  # 每个 序列×靶标 的 input.json + AF3 输出
 │   └── _bundles/ · cycles/       # 历史作业包目录（快照 runner + 任务 json + slurm 日志）
 ├── BEST_TOP10/                  # top10 的 HTR1A 结构包 + BEST_TOP10.csv
-└── runs/                        # loop_<jobid>.out/.err、loop_watchdog.log、loop.disabled
+└── runs/                        # loop_<jobid>.out/.err、循环看门狗.log、loop.disabled
 ```
 
 # 常用函数速查
 
 | 函数 | 所属模块 | 作用 |
 | --- | --- | --- |
-| `generate_mutant(orig_tail)` | `peptide_common` | 生成编辑距离 ≤ 2 的可变区突变（随机采样；球内有 665 条采不到）|
-| `enumerate_space(center, max_edit, min_len, max_len)` | `peptide_common` | **精确穷尽**枚举搜索空间（默认 51091 条、字典序、确定性）|
-| `ExhaustiveQueue(...).next_batch(n)` | `optimize_peptide_infinite` | 穷尽调度器取批：不重复 + 有限步全覆盖（GP 仅定次序）|
-| `ExhaustiveQueue(...).coverage()` | `optimize_peptide_infinite` | 覆盖进度 `{total, dispatched, pending, frac}` |
-| `attempted_vars()` | `optimize_peptide_infinite` | 从 `sequences.csv` 读出已派发台账（不重复的依据）|
-| `resolve_tag(var_region)` | `peptide_db` | 可变区 → 标签，**注册表优先**（写入路径必须用它，不用 `make_tag`）|
-| `restart_requested(p)` / `consume_restart_flag(p)` | `optimize_peptide_node` | 周期边界优雅重启标志的检查与消费 |
-| `create_af3_json(peptide_seq, target_seq, job_name)` | `peptide_common` | 生成单条 AlphaFold3 JSON 任务 |
-| `extract_scores_from_zip(zip_path)` | `peptide_common` | 从结果 zip 中提取 `iptm` / `ptm` / `ranking_score` 等评分 |
-| `run_monte_carlo(predict_fn, opt_root, ...)` | `peptide_common` | 后端无关的蒙特卡洛主循环（预测函数由入口注入）|
-| `batch_generate_all_json()` | `peptide_server` | 批量生成全部序列 × 全部靶标的 JSON 并分批 |
-| `check_results_status()` | `peptide_server` | 检查云端已完成 / 待处理任务 |
-| `optimize_with_server()` | `peptide_server` | 云端版蒙特卡洛编排（自动化检查 + 待处理任务处理）|
-| `optimize_peptide_BO.run_bo(predict_fn, pool_size, batch_size, budget)` | `optimize_peptide_BO` | 贝叶斯优化主循环（冷启动 → 拟合 3 个 GP → 约束期望改进采集 → 批量评估）|
+| `generate_mutant(orig_tail)` | `小肽公共库` | 生成编辑距离 ≤ 2 的可变区突变（随机采样；球内有 665 条采不到）|
+| `enumerate_space(center, max_edit, min_len, max_len)` | `小肽公共库` | **精确穷尽**枚举搜索空间（默认 51091 条、字典序、确定性）|
+| `ExhaustiveQueue(...).next_batch(n)` | `小肽优化_无限` | 穷尽调度器取批：不重复 + 有限步全覆盖（GP 仅定次序）|
+| `ExhaustiveQueue(...).coverage()` | `小肽优化_无限` | 覆盖进度 `{total, dispatched, pending, frac}` |
+| `attempted_vars()` | `小肽优化_无限` | 从 `sequences.csv` 读出已派发台账（不重复的依据）|
+| `resolve_tag(var_region)` | `小肽数据库` | 可变区 → 标签，**注册表优先**（写入路径必须用它，不用 `make_tag`）|
+| `restart_requested(p)` / `consume_restart_flag(p)` | `小肽优化_节点内` | 周期边界优雅重启标志的检查与消费 |
+| `create_af3_json(peptide_seq, target_seq, job_name)` | `小肽公共库` | 生成单条 AlphaFold3 JSON 任务 |
+| `extract_scores_from_zip(zip_path)` | `小肽公共库` | 从结果 zip 中提取 `iptm` / `ptm` / `ranking_score` 等评分 |
+| `run_monte_carlo(predict_fn, opt_root, ...)` | `小肽公共库` | 后端无关的蒙特卡洛主循环（预测函数由入口注入）|
+| `batch_generate_all_json()` | `小肽云端后端` | 批量生成全部序列 × 全部靶标的 JSON 并分批 |
+| `check_results_status()` | `小肽云端后端` | 检查云端已完成 / 待处理任务 |
+| `optimize_with_server()` | `小肽云端后端` | 云端版蒙特卡洛编排（自动化检查 + 待处理任务处理）|
+| `小肽优化_BO.run_bo(predict_fn, pool_size, batch_size, budget)` | `小肽优化_BO` | 贝叶斯优化主循环（冷启动 → 拟合 3 个 GP → 约束期望改进采集 → 批量评估）|
 
 # 常见问题
 

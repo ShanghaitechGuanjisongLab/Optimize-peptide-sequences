@@ -3,7 +3,7 @@
 af3任务.py — 把 AF3 预测任务接入任务中间层（HyperQueue）
 =========================================================
 职责：把「一个 AF3 输入 JSON」变成「一个可随时添加/取消的 HQ 任务」：
-  1. 任务目录：JSON 副本 + **冻结的** af3_bundle_runner.sh 快照 + _run.sh 启动器（快照使长驻作业与仓库后续改动彻底解耦，与 optimize_peptide_node 既有设计一致：bash 边读边执行，编辑器原地截断重写会让执行错位）。
+  1. 任务目录：JSON 副本 + **冻结的** AF3打包推理.sh 快照 + `_启动器.sh`（快照使长驻作业与仓库后续改动彻底解耦，与 小肽优化_节点内 既有设计一致：bash 边读边执行，编辑器原地截断重写会让执行错位）。
   2. 启动器在任务**开始时**内嵌 MSA（查 msa缓存，命中即免搜索，特征逐字节等价于现场搜索），**结束时**把本任务产出的 _data.json 收割回缓存——于是同批后续任务自动复用前序任务算出的肽链 MSA（自愈）。
   3. 经 任务控制.sh 提交（gpus=1，优先级可调），返回 HQ job id。
 
@@ -38,7 +38,7 @@ def _sh_quote(s: str) -> str:
 def gen_task(json_path: str, env: dict, task_root: str) -> str:
     """为单个 AF3 JSON 生成自包含任务目录；返回任务目录路径。
 
-    env：AF3_* 环境变量字典（即 optimize_peptide_node.build_runner_env() 的产物）；其中 AF3_BUNDLE_DIR 会被任务目录覆盖，其余原样烧进启动器。
+    env：AF3_* 环境变量字典（即 小肽优化_节点内.build_runner_env() 的产物）；其中 AF3_BUNDLE_DIR 会被任务目录覆盖，其余原样烧进启动器。
     """
     name = os.path.splitext(os.path.basename(json_path))[0]
     tdir = os.path.join(task_root, name)
@@ -47,10 +47,11 @@ def gen_task(json_path: str, env: dict, task_root: str) -> str:
     dst_json = os.path.join(tdir, name + ".json")
     shutil.copyfile(json_path, dst_json)
 
-    # 冻结 runner 快照（见模块文档：防止仓库脚本被原地重写时执行错位）
-    runner_src = os.path.join(env.get("AF3_WORK_DIR", ""), "scripts",
-                              "af3_bundle_runner.sh")
-    runner_snap = os.path.join(tdir, "_af3_bundle_runner.sh")
+    # 冻结 runner 快照（见模块文档：防止仓库脚本被原地重写时执行错位）。
+    # 生成物一律以 `_` 开头：收割与打包逻辑靠该前缀跳过它们，不会当作任务。
+    runner_src = os.path.join(env.get("AF3_WORK_DIR", ""), "作业脚本",
+                              "AF3打包推理.sh")
+    runner_snap = os.path.join(tdir, "_AF3打包推理快照.sh")
     shutil.copyfile(runner_src, runner_snap)
     os.chmod(runner_snap, 0o755)
 
@@ -76,7 +77,7 @@ def gen_task(json_path: str, env: dict, task_root: str) -> str:
         f"-exec python3 {_sh_quote(MSA_CACHE)} harvest {{}} + 2>/dev/null || true",
         "exit $rc",
     ]
-    launcher = os.path.join(tdir, "_run.sh")
+    launcher = os.path.join(tdir, "_启动器.sh")
     with open(launcher, "w") as f:
         f.write("\n".join(lines) + "\n")
     os.chmod(launcher, 0o755)
@@ -92,7 +93,7 @@ def submit(json_path: str, env: dict, task_root: str, priority: int = 0,
         ["bash", TASKCTL, "add",
          "--name", name, "--gpus", str(gpus), "--cpus", str(cpus),
          "--priority", str(priority),
-         "--", "bash", os.path.join(tdir, "_run.sh")],
+         "--", "bash", os.path.join(tdir, "_启动器.sh")],
         capture_output=True, text=True)
     m = re.search(r"ID=(\d+)", r.stdout)
     if not m:

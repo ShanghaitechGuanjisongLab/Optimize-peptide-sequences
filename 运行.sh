@@ -3,22 +3,22 @@
 # 一键运行优化任务并实时输出进度（隐藏作业号等中间细节）
 #
 # 用法：
-#   ./run.sh            # 默认：提交**单个长驻循环作业**（当前形态，推荐）
-#   ./run.sh loop       # 同上（显式写法）；计算节点作业内部无限循环搜索
-#   ./run.sh stop       # 停止（scancel 循环作业 + 阻止看门狗续交）
-#   ./run.sh status     # 作业/看门狗状态 + 穷尽覆盖进度 + 数据库统计与 BEST_TOP10
-#   ./run.sh restart-loop # 改完代码后**在周期边界**优雅重启（新代码生效，不废已完成周期）
-#   ./run.sh watchdog   # 单独安装 cron 看门狗（loop 会自动装）
-#   ./run.sh no-watchdog# 卸载看门狗
-#   ./run.sh infinite   # 【legacy】登录节点常驻驱动形态（脆弱，仅保留兼容）
-#   ./run.sh bo         # 有限预算贝叶斯优化（前台，output_bo*/）
-#   ./run.sh v100       # 同上，但只跑 V100 放得下的 HTR1A+BIN1
-#   ./run.sh mc         # 蒙特卡洛 + 本地集群推理后端
-#   ./run.sh bo-server  # 贝叶斯优化 + AlphaFold Server 云端后端
-#   ./run.sh mc-server  # 蒙特卡洛 + AlphaFold Server 云端后端
+#   ./运行.sh            # 默认：提交**单个长驻循环作业**（当前形态，推荐）
+#   ./运行.sh loop       # 同上（显式写法）；计算节点作业内部无限循环搜索
+#   ./运行.sh stop       # 停止（scancel 循环作业 + 阻止看门狗续交）
+#   ./运行.sh status     # 作业/看门狗状态 + 穷尽覆盖进度 + 数据库统计与 BEST_TOP10
+#   ./运行.sh restart-loop # 改完代码后**在周期边界**优雅重启（新代码生效，不废已完成周期）
+#   ./运行.sh watchdog   # 单独安装 cron 看门狗（loop 会自动装）
+#   ./运行.sh no-watchdog# 卸载看门狗
+#   ./运行.sh infinite   # 【legacy】登录节点常驻驱动形态（脆弱，仅保留兼容）
+#   ./运行.sh bo         # 有限预算贝叶斯优化（前台，output_bo*/）
+#   ./运行.sh v100       # 同上，但只跑 V100 放得下的 HTR1A+BIN1
+#   ./运行.sh mc         # 蒙特卡洛 + 本地集群推理后端
+#   ./运行.sh bo-server  # 贝叶斯优化 + AlphaFold Server 云端后端
+#   ./运行.sh mc-server  # 蒙特卡洛 + AlphaFold Server 云端后端
 #
-# 两种形态的取舍（2026-10-04 定案，详见 optimize_peptide_node.py 文件头）：
-#   - **loop（当前形态）**：sbatch 一个时限=分区 MaxTime（5 天）的作业，搜索循环整个跑在**计算节点内部**（optimize_peptide_node.py）：挑候选 → 跑 AF3→收割入库 → 下一轮。登录节点**不留任何常驻进程**，只有一个 cron 看门狗负责“队列里没这个作业了就再交一个”（正常每 5 天才动作一次）。
+# 两种形态的取舍（2026-10-04 定案，详见 小肽优化_节点内.py 文件头）：
+#   - **loop（当前形态）**：sbatch 一个时限=分区 MaxTime（5 天）的作业，搜索循环整个跑在**计算节点内部**（小肽优化_节点内.py）：挑候选 → 跑 AF3→收割入库 → 下一轮。登录节点**不留任何常驻进程**，只有一个 cron 看门狗负责“队列里没这个作业了就再交一个”（正常每 5 天才动作一次）。
 #     可行性实测依据：PreemptMode=OFF 不被抢占；分区无 MaxWall；--test-only 下48h/2天/3天/5天的预计启动时间**完全相同** → 长时限不受精调度惩罚。
 #   - infinite（legacy）：登录节点常驻 Python 驱动 + 反复 sbatch 小包。它脆弱：
 #     本机把所有交互进程塞进同一 cgroup `/system.slice/sshd.service` 且loginctl查不到会话 → setsid 只换会话/进程组而**逃不出 cgroup** → 会话被清理时驱动无声消失（已发生两次，一次 GPU 空转 8h22m、29 个结果滞盘未入库）。
@@ -43,8 +43,8 @@ LOOP_JOB_NAME="pepopt-loop"
 LOOP_TARGETS="${PEPOPT_TARGETS:-HTR1A,BIN1}"   # 开关：2026-10-20 停算 ASIC1A
 LOOP_CYCLE_SEQS="${PEPOPT_CYCLE_SEQS:-24}"
 LOOP_DISABLED="$RUNS_DIR/loop.disabled"       # stop 写入 → 看门狗不再续交
-LOOP_WLOG="$RUNS_DIR/loop_watchdog.log"
-LOOP_WATCHDOG="$REPO_DIR/scripts/loop_watchdog.sh"
+LOOP_WLOG="$RUNS_DIR/循环看门狗.log"
+LOOP_WATCHDOG="$REPO_DIR/作业脚本/循环看门狗.sh"
 
 # ---- 【legacy】登录节点常驻驱动 ----
 PID_FILE="$RUNS_DIR/infinite.pid"
@@ -57,7 +57,7 @@ driver_alive() {
   [[ -f "$PID_FILE" ]] || return 1
   local p; p="$(cat "$PID_FILE" 2>/dev/null)"
   [[ -n "$p" ]] && kill -0 "$p" 2>/dev/null || return 1
-  ps -p "$p" -o args= 2>/dev/null | grep -q "optimize_peptide_infinite.py"
+  ps -p "$p" -o args= 2>/dev/null | grep -q "小肽优化_无限.py"
 }
 
 install_watchdog() {
@@ -76,7 +76,9 @@ install_watchdog() {
     echo "PATH=$PATH"
     # 战役参数必须烙进 crontab 行：cron 无登录环境，缺省会读到默认 DB/靶标→续交的作业会打回旧库或跑错靶标（多战役并存时串库）。
     echo "PEPOPT_DB_ROOT=${PEPOPT_DB_ROOT:-/public_bme2/Share200T/管吉松/peptide_opt_db}"
-    echo "PEPOPT_TARGETS=${PEPOPT_TARGETS:-HTR1A,BIN1,ASIC1A}"
+    # 靶标必须引单一真源 $LOOP_TARGETS，不得在此重复写默认值：
+    # 旧版写死 :-HTR1A,BIN1,ASIC1A，导致停算 ASIC1A 后看门狗续交的作业又打回三靶标。
+    echo "PEPOPT_TARGETS=$LOOP_TARGETS"
     echo "PEPOPT_CYCLE_SEQS=${PEPOPT_CYCLE_SEQS:-24}"
     echo "*/$WATCHDOG_INTERVAL * * * * $WATCHDOG >/dev/null 2>&1"
     echo "$BLOCK_END"
@@ -85,8 +87,8 @@ install_watchdog() {
     [[ "$wd" == "$LOOP_WATCHDOG" ]] \
       && echo "🩺 cron 看门狗已装: 每 ${WATCHDOG_INTERVAL} 分钟检查（循环作业不在队列就续交）" \
       || echo "🩺 cron 看门狗已装(legacy 驱动形态): 每 ${WATCHDOG_INTERVAL} 分钟自愈一次"
-    echo "   📌 烙入的战役参数: DB_ROOT=${PEPOPT_DB_ROOT:-默认} | TARGETS=${PEPOPT_TARGETS:-HTR1A,BIN1,ASIC1A}"
-    echo "   卸载: ./run.sh no-watchdog"
+    echo "   📌 烙入的战役参数: DB_ROOT=${PEPOPT_DB_ROOT:-默认} | TARGETS=$LOOP_TARGETS | CYCLE_SEQS=$LOOP_CYCLE_SEQS"
+    echo "   卸载: ./运行.sh no-watchdog"
   else
     echo "⚠️  crontab 安装失败"
   fi
@@ -135,7 +137,7 @@ submit_loop() {
 import re
 import sys
 sys.path.insert(0, "$REPO_DIR")
-import optimize_peptide_local as loc
+import 小肽优化_本地集群 as loc
 loc.ensure_local_ready()
 # 分隔符兼容 ',' 与 '+'：submit_loop_job 内部改用 '+' 下发给 SLURM（逗号会被截断）
 targets = [t for t in re.split(r"[,+]", "$LOOP_TARGETS") if t]
@@ -171,7 +173,7 @@ start_loop() {
     lg="$(loop_log)"
     [[ -n "$lg" ]] && echo "   📄 最近日志: tail -f $lg"
   fi
-  echo "   🛑 停止: ./run.sh stop   |   📊 状态: ./run.sh status"
+  echo "   🛑 停止: ./运行.sh stop   |   📊 状态: ./运行.sh status"
   if [[ -z "${j// /}" ]]; then
     echo "   ⏳ 本次未能提交（多为 QoS 提交窗口被旧作业占满）; 看门狗会在"
     echo "      窗口空出后自动补交（≤${WATCHDOG_INTERVAL}min）, 无需人工重跑。"
@@ -191,8 +193,8 @@ stop_loop() {
     echo "循环作业不在队列。"
   fi
   kill_legacy_driver || true
-  echo "   已写停用标记 → 看门狗不再续交; 彻底移除: ./run.sh no-watchdog"
-  echo "   重新开跑: ./run.sh loop"
+  echo "   已写停用标记 → 看门狗不再续交; 彻底移除: ./运行.sh no-watchdog"
+  echo "   重新开跑: ./运行.sh loop"
 }
 
 # 穷尽覆盖进度（候选全集 51091 的已派发/待评估 + 全覆盖 ETA）
@@ -202,8 +204,8 @@ coverage_line() {
   python -u - <<PY 2>/dev/null
 import re, sys
 sys.path.insert(0, "$REPO_DIR")
-import optimize_peptide_infinite as inf
-import optimize_peptide_node as N        # cycle_seconds 在节点入口里定义
+import 小肽优化_无限 as inf
+import 小肽优化_节点内 as N        # cycle_seconds 在节点入口里定义
 targets = tuple(t for t in re.split(r"[,+]", "$LOOP_TARGETS") if t)
 n = max(1, $LOOP_CYCLE_SEQS)
 if not inf.SWEEP_ENABLED:
@@ -215,16 +217,16 @@ PY
 }
 
 # 在**周期边界**优雅重启循环作业 → 让新代码生效，不浪费已完成周期的计算。
-# 必要性：正在跑的作业已把 .py 载入内存，改源文件对它无效；直接 scancel 则会丢掉当前周期尚未算完的任务。标志由 optimize_peptide_node.run_loop 在每轮开头消费（取走后 break），cron 看门狗 ≤5min 内续交加载了新代码的作业。
+# 必要性：正在跑的作业已把 .py 载入内存，改源文件对它无效；直接 scancel 则会丢掉当前周期尚未算完的任务。标志由 小肽优化_节点内.run_loop 在每轮开头消费（取走后 break），cron 看门狗 ≤5min 内续交加载了新代码的作业。
 restart_loop() {
   local j; j="$(loop_jobs)"
   if [[ -z "${j// /}" ]]; then
-    echo "循环作业不在队列 → 无需重启; 直接 ./run.sh loop 即以新代码提交。"
+    echo "循环作业不在队列 → 无需重启; 直接 ./运行.sh loop 即以新代码提交。"
     return 0
   fi
   if [[ -f "$LOOP_DISABLED" ]]; then
     echo "⚠️  存在停用标记 $LOOP_DISABLED → 重启后看门狗不会续交。"
-    echo "   先执行: ./run.sh loop"
+    echo "   先执行: ./运行.sh loop"
     return 1
   fi
   mkdir -p "$RUNS_DIR"; date '+%F %T' > "$RUNS_DIR/restart.requested"
@@ -249,12 +251,12 @@ status_loop() {
   fi
   coverage_line   # 穷尽覆盖进度（只在 PEPOPT_SWEEP 开启时有意义）
   driver_alive && {
-    echo "⚠️  legacy 登录节点驱动仍在运行 (PID $(cat "$PID_FILE")) → ./run.sh loop 会自动接管"; }
+    echo "⚠️  legacy 登录节点驱动仍在运行 (PID $(cat "$PID_FILE")) → ./运行.sh loop 会自动接管"; }
   if crontab -l 2>/dev/null | grep -q "$BLOCK_BEGIN"; then
     echo "🩺 看门狗: 已装 (每 ${WATCHDOG_INTERVAL}min)"
     [[ -s "$LOOP_WLOG" ]] && { echo "   最近动作:"; tail -4 "$LOOP_WLOG" | sed 's/^/     /'; }
   else
-    echo "🩺 看门狗: 未装 → ./run.sh watchdog"
+    echo "🩺 看门狗: 未装 → ./运行.sh watchdog"
   fi
   local lg jid
   jid="$(loop_jobs)"; jid="${jid%% *}"; jid="${jid// /}"
@@ -267,17 +269,17 @@ status_loop() {
   squeue -u "$USER" -o "%.8i %.14j %.2t %.10M %.20R" 2>/dev/null | head -8
   echo
   source ~/miniconda3/etc/profile.d/conda.sh; conda activate base
-  python -u optimize_peptide_infinite.py --status
+  python -u 小肽优化_无限.py --status
 }
 
 # ============= 【legacy】登录节点常驻驱动 =============
 
 start_infinite() {
   echo "⚠️  这是【legacy】登录节点常驻驱动形态, 已知脆弱（会话被清理即无声消失,"
-  echo "    曾导致 GPU 空转 8h22m）。除非确有必要, 请用默认形态: ./run.sh loop"
+  echo "    曾导致 GPU 空转 8h22m）。除非确有必要, 请用默认形态: ./运行.sh loop"
   if driver_alive; then
     echo "♾️  无限搜索已在运行 (PID $(cat "$PID_FILE"))。"
-    echo "   日志: tail -f \"$RUNS_DIR\"/infinite_*.log | ./run.sh stop 停止"
+    echo "   日志: tail -f \"$RUNS_DIR\"/infinite_*.log | ./运行.sh stop 停止"
     exit 0
   fi
   rm -f "$PID_FILE" "$DISABLED_FILE" 2>/dev/null   # 清理陈旧状态，重新允许自愈
@@ -288,18 +290,18 @@ start_infinite() {
   conda activate base
   # --migrate：把家目录旧结果迁入共享库（幂等，已迁过会自动跳过）
   # 后台日志由共享库的 runs/ 目录持久化，计算节点与登录节点都可见。
-  # 注：setsid 只能脱离会话/进程组，逃不出 sshd.service 的 cgroup（实测），故仍需 cron 看门狗兵托（见 scripts/driver_watchdog.sh 文件头）。
+  # 注：setsid 只能脱离会话/进程组，逃不出 sshd.service 的 cgroup（实测），故仍需 cron 看门狗兵托（见 作业脚本/驱动看门狗.sh 文件头）。
   #   setsid→nohup→python 为 exec 链，不换 PID，故 $！即真实 python PID。
-  setsid nohup python -u optimize_peptide_infinite.py --migrate "$@" \
+  setsid nohup python -u 小肽优化_无限.py --migrate "$@" \
         </dev/null >"$log" 2>&1 &
   local pid=$!
   echo "$pid" > "$PID_FILE"
   echo "♾️  无限搜索已后台启动 (PID $pid)，结果持续追加进共享数据库："
   echo "   🗄️  $DB_ROOT"
   echo "   📄 日志: tail -f $log"
-  echo "   🛑 停止: ./run.sh stop   （已提交的 GPU 作业不受影响）"
-  echo "   📊 状态: ./run.sh legacy-status"
-  install_watchdog "$REPO_DIR/scripts/driver_watchdog.sh"
+  echo "   🛑 停止: ./运行.sh stop   （已提交的 GPU 作业不受影响）"
+  echo "   📊 状态: ./运行.sh legacy-status"
+  install_watchdog "$REPO_DIR/作业脚本/驱动看门狗.sh"
   sleep 3
   echo "------------------------------------------------------ 启动日志前 20 行："
   head -20 "$log" 2>/dev/null
@@ -311,7 +313,7 @@ stop_infinite() {
   if ! driver_alive; then
     echo "无限搜索未在运行。"
     rm -f "$PID_FILE" 2>/dev/null
-    echo "已写入停用标记（看门狗不会复活）; 重新开跑: ./run.sh infinite"
+    echo "已写入停用标记（看门狗不会复活）; 重新开跑: ./运行.sh infinite"
     exit 0
   fi
   local pid; pid=$(cat "$PID_FILE")
@@ -321,7 +323,7 @@ stop_infinite() {
   kill -0 "$pid" 2>/dev/null && { echo "   未在 12s 内退出, 强制 kill"; kill -9 "$pid"; }
   rm -f "$PID_FILE"
   echo "✅ 已停止。共享数据库保留在 $DB_ROOT; squeue -u $USER 可查看仍在跑的 GPU 作业。"
-  echo "   看门狗仍装于 crontab（遇停用标记会跳过）; 彻底移除: ./run.sh no-watchdog"
+  echo "   看门狗仍装于 crontab（遇停用标记会跳过）; 彻底移除: ./运行.sh no-watchdog"
 }
 
 status_infinite() {
@@ -336,7 +338,7 @@ status_infinite() {
     echo "🩺 看门狗: 已装 (每 ${WATCHDOG_INTERVAL}min)"
     [[ -s "$WLOG" ]] && { echo "   最近自愈记录:"; tail -4 "$WLOG" | sed 's/^/     /'; }
   else
-    echo "🩺 看门狗: 未装 → ./run.sh watchdog"
+    echo "🩺 看门狗: 未装 → ./运行.sh watchdog"
   fi
   local last; last=$(ls -t "$RUNS_DIR"/infinite_*.log 2>/dev/null | head -1)
   [[ -n "$last" ]] && { echo "📄 最近日志尾部: $last"; tail -15 "$last"; }
@@ -344,7 +346,7 @@ status_infinite() {
   squeue -u "$USER" -o "%.8i %.14j %.2t %.10M %.20R" 2>/dev/null | head -8
   echo
   source ~/miniconda3/etc/profile.d/conda.sh; conda activate base
-  python -u optimize_peptide_infinite.py --status
+  python -u 小肽优化_无限.py --status
 }
 
 # ---- 本地集群推理后端（有限入口）：编排跑在登录节点，进度实时输出 ----
@@ -372,11 +374,11 @@ case "$mode" in
   infinite) shift; start_infinite "$@"; exit $? ;;
   legacy-stop)   stop_infinite; exit $? ;;
   legacy-status) status_infinite; exit $? ;;
-  bo)   run_local optimize_peptide_BO.py ;;
-  v100) run_local optimize_peptide_BO.py --targets HTR1A,BIN1 ;;
-  mc)   run_local optimize_peptide_local.py ;;
-  bo-server) SBATCH=run_peptide_bo.sbatch; NAME="贝叶斯优化（云端后端）" ;;
-  mc-server) SBATCH=run_peptide.sbatch;    NAME="蒙特卡洛（云端后端）" ;;
+  bo)   run_local 小肽优化_BO.py ;;
+  v100) run_local 小肽优化_BO.py --targets HTR1A,BIN1 ;;
+  mc)   run_local 小肽优化_本地集群.py ;;
+  bo-server) SBATCH=云端贝叶斯.sbatch; NAME="贝叶斯优化（云端后端）" ;;
+  mc-server) SBATCH=云端蒙特卡洛.sbatch;    NAME="蒙特卡洛（云端后端）" ;;
   *) echo "未知模式 '$mode'，可选: 默认(长驻循环作业) | loop | stop | status | watchdog | no-watchdog | infinite(legacy) | bo | v100 | mc | bo-server | mc-server"; exit 1 ;;
 esac
 
