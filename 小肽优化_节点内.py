@@ -112,7 +112,7 @@ def size_next_cycle(remaining_sec, max_seqs):
 def build_runner_env(bundle_dir, out_dir=None):
     """组装 作业脚本/AF3打包推理.sh 需要的全部 AF3_* 环境变量。
     与 loc.build_bundle_sbatch_cmd() 的 --export 列表保持一致，差别仅在于：这里是**进程内 subprocess 继承**而非 sbatch --export。out_dir 覆盖输出根（补采任务写到 _resamples/ 下，与主结果隔离，收割路径自动忽略）。"""
-    env = os.environ.copy()
+    env = {k: v for k, v in os.environ.items() if not k.startswith("BASH_FUNC_")}
     env.update({
         "AF3_CODE_DIR": loc.AF3_CODE_DIR,
         "AF3_BUNDLE_DIR": os.path.abspath(bundle_dir),
@@ -221,10 +221,13 @@ RESAMPLE_ROOT = "_resamples"
 def make_resample_fn(deadline):
     """构造数据库整理的批量补采生成器（真跑 AF3 新 seed，非抽随机数）。
 
-    契约 fn(tags) -> {tag：[新乘积样本…]}（无法生成的 tag 不出现在结果里）。
+    契约 fn(tag, n=1) -> {tag：[新乘积样本…]} 或 fn(tags) -> {...}（爬山单条 or 整理批量）。
     实现：对每个 tag 的**变因子**靶标（有逐样本数据者，固定因子是常数无需重跑）各跑一次新 seed 的 AF3 → 逐样本配对相乘得新乘积样本；一次调用打包成一个 bundle 跑（chain-B MSA 每靶标只建一次，逐条单跑太浪费）。
     时间护栏：距 deadline 不足 SAFETY_MARGIN×3 时不再开新补采（宁可少补，不能把时限烧在补采上）。"""
-    def resample(tags):
+    def resample(tags, n=1):
+        # 兼容单条调用（爬山）与批量调用（整理）
+        if isinstance(tags, str):
+            tags = [tags]
         if time.time() > deadline - 3 * SAFETY_MARGIN_SEC:
             print("  ⏭️  接近作业时限, 跳过本轮补采", flush=True)
             return {}
@@ -483,8 +486,11 @@ def run_loop(active_targets, cycle_seqs, max_hours):
 
         # 1）先收割上一个周期的成果（首轮则收割历史遗留/其它入口的完成结果）
         #    收割内部做序贯采样入库（β 统计量），并在入库数过 2^k 时触发数据库整理（P̃·N>M 决定每条记录重复搜索多少次，补采真跑 AF3 新 seed）
-        n_new = inf.harvest_and_report(active_targets,
-                                       new_sample_fn=make_resample_fn(deadline))
+        n_new, new_tags = inf.harvest_and_report(active_targets,
+                                                 new_sample_fn=make_resample_fn(deadline))
+        if new_tags:
+            inf.climb_new_records(new_tags, active_targets,
+                                  make_resample_fn(deadline))
 
         # 2）本轮工作目录（补跑遗留与新候选共用）
         cycle_dir = os.path.join(p["root"], "cycles",
@@ -550,8 +556,11 @@ def run_loop(active_targets, cycle_seqs, max_hours):
               f"({(time.time() - start) / 3600:.1f}h)", flush=True)
 
         # 6）立刻收割本周期的结果，使下一轮的 GP 能用上最新数据
-        got = inf.harvest_and_report(active_targets,
-                                     new_sample_fn=make_resample_fn(deadline))
+        got, got_tags = inf.harvest_and_report(active_targets,
+                                               new_sample_fn=make_resample_fn(deadline))
+        if got_tags:
+            inf.climb_new_records(got_tags, active_targets,
+                                  make_resample_fn(deadline))
         if got == 0 and n_new == 0:
             empty_cycles += 1
         else:
@@ -561,10 +570,12 @@ def run_loop(active_targets, cycle_seqs, max_hours):
         time.sleep(5)
 
     print(f"\n👋 作业内无限循环结束（共 {cycle_no} 个周期）", flush=True)
-    inf.harvest_and_report(active_targets, new_sample_fn=make_resample_fn(deadline))
+    final_n, final_tags = inf.harvest_and_report(active_targets,
+                                                  new_sample_fn=make_resample_fn(deadline))
+    if final_tags:
+        inf.climb_new_records(final_tags, active_targets,
+                              make_resample_fn(deadline))
     print(f"   数据库: {p['root']}", flush=True)
-    print("   本作业退出后, 登录节点的 cron 看门狗会在 ≤5min 内续交下一个作业。",
-          flush=True)
 
 
 # ===================== 入口 =====================

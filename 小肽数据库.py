@@ -575,10 +575,10 @@ def pack_result_zip(result_dir, job_name):
 def harvest_results(results_root=None):
     """扫描结果目录，把**新完成**的 AF3 结果提取评分并入库（幂等，可反复调用）。
 
-    以（序列×靶标）为一组处理：AF3 可能把输出写到规范目录 <tag>_<target>/ 或追加时间戳的兄弟目录 <tag>_<target>_<ts>/，本函数先用 consolidate_task() 折叠到规范目录再取分，故两种布局都能收割；折叠后该任务不再被误判为“未完成”而重跑。入库成功后在规范目录写 .harvested，下次跳过。返回（新增数，{名：跳过原因}）。"""
+    以（序列×靶标）为一组处理：AF3 可能把输出写到规范目录 <tag>_<target>/ 或追加时间戳的兄弟目录 <tag>_<target>_<ts>/，本函数先用 consolidate_task() 折叠到规范目录再取分，故两种布局都能收割；折叠后该任务不再被误判为“未完成”而重跑。入库成功后在规范目录写 .harvested，下次跳过。返回（新增数，{名：跳过原因}，新增 tags 集合）。"""
     results_root = results_root or results_dir()
     if not os.path.isdir(results_root):
-        return 0, {}
+        return 0, {}, set()
     reg = load_sequence_registry()
     # 按 (tag, target) 归组（时间戳兄弟目录归入同一组）
     groups = {}
@@ -589,7 +589,7 @@ def harvest_results(results_root=None):
         parsed = split_job_name(name)
         if parsed is not None:
             groups.setdefault(parsed, True)
-    n_new, skipped = 0, {}
+    n_new, skipped, new_tags = 0, {}, set()
     for (tag, target) in sorted(groups):
         key = f"{tag}_{target.lower()}"
         canon = canonical_dir(tag, target, results_root)
@@ -609,13 +609,14 @@ def harvest_results(results_root=None):
                       peptide=info.get("peptide"), var=info.get("var"),
                       source="local", iptm_mean=scores.get("iptm_mean"))
         n_new += 1
+        new_tags.add(tag)
         try:
             os.makedirs(canon, exist_ok=True)
             with open(os.path.join(canon, ".harvested"), "w") as f:
                 f.write(_now() + "\n")
         except OSError:
             pass
-    return n_new, skipped
+    return n_new, skipped, new_tags
 
 
 # ---------------------------------------------------------------------
@@ -693,9 +694,9 @@ def import_archived(archive_csv, source="archived", dry_run=False):
 # ---------------------------------------------------------------------
 
 def refresh_best(off_threshold=0.8, top_n=10, targets=("HTR1A", "BIN1")):
-    """按（底线蛋白可行优先，目标乘积降序，缺乘积回退 iptm_htr1a 降序）维护 BEST_TOP10/。
+    """按目标乘积降序（缺乘积回退 iptm_htr1a 降序）维护 BEST_TOP10/。
 
-    只用启用靶标做可行性判定：UNC13C 未评估(None)时不参与，待将来补齐后以 targets 含 UNC13C 重跑本函数即可用全约束重新排序、重选 top-N。ASIC1A 不参与可行性判定：它是目标乘积的正因子（越高越好），不是底线蛋白。"""
+    约束已全部取消：优化目标是 HTR1A 和 BIN1 都尽可能大，不再限制底线蛋白上限。"""
     by_tag = load_database()
     p = paths(ensure=True)
     rows = []
@@ -703,18 +704,10 @@ def refresh_best(off_threshold=0.8, top_n=10, targets=("HTR1A", "BIN1")):
         h = r.get("iptm_htr1a")
         if h is None:
             continue
-        feas = True
-        for t in targets:
-            if t == "HTR1A" or t == "ASIC1A":
-                continue
-            v = r.get(f"iptm_{t.lower()}")
-            if v is not None and v >= off_threshold:
-                feas = False
-        # 现算而非读列：历史行的 objective_product 列是旧目标留下的，与当前PRODUCT_TARGETS开关可能不一致；现算保证排序始终跟目标一致。
-        obj = objective_product(r)        # 排序主键：目标乘积越大越好
-        rank = obj if obj is not None else h     # 乘积未齐（缺因子）回退 iptm_htr1a
-        rows.append((0 if feas else 1, -rank, tag, r, feas))
-    rows.sort(key=lambda x: (x[0], x[1]))
+        obj = objective_product(r)
+        rank = obj if obj is not None else h
+        rows.append((-rank, tag, r))
+    rows.sort()
     best = rows[:top_n]
 
     best_dir = p["best_dir"]
@@ -726,24 +719,24 @@ def refresh_best(off_threshold=0.8, top_n=10, targets=("HTR1A", "BIN1")):
             shutil.rmtree(old, ignore_errors=True)
 
     index = []
-    for rank, (_, neg_rank, tag, r, feas) in enumerate(best, 1):
+    for rank_no, (neg_rank, tag, r) in enumerate(best, 1):
         src = ensure_best_structure(tag)
-        dest = os.path.join(best_dir, f"rank{rank:02d}_{tag}_HTR1A.zip")
+        dest = os.path.join(best_dir, f"rank{rank_no:02d}_{tag}_HTR1A.zip")
         if src:
             shutil.copy(src, dest)
-        index.append({"rank": rank, "tag": tag, "peptide": r.get("peptide", ""),
+        index.append({"rank": rank_no, "tag": tag, "peptide": r.get("peptide", ""),
                       "objective_product": r.get("objective_product"),
                       "iptm_asic1a": r.get("iptm_asic1a"),
                       "iptm_htr1a": r.get("iptm_htr1a"),
                       "iptm_bin1": r.get("iptm_bin1"),
                       "iptm_unc13c": r.get("iptm_unc13c"),
-                      "feasible": feas, "has_structure": bool(src)})
+                      "has_structure": bool(src)})
     with open(os.path.join(best_dir, "BEST_TOP10.csv"), "w", newline="",
               encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=["rank", "tag", "peptide",
                                           "objective_product", "iptm_asic1a",
                                           "iptm_htr1a", "iptm_bin1", "iptm_unc13c",
-                                          "feasible", "has_structure"])
+                                          "has_structure"])
         w.writeheader()
         for it in index:
             w.writerow(it)
@@ -874,3 +867,12 @@ def migrate_legacy(legacy_results_dir=None, dry_run=False):
                     pass
         migrated += 1
     return migrated, skipped
+
+
+def get_objective(tag):
+    """查询 tag 的当前 objective = ipTM(HTR1A) × ipTM(BIN1)；任一因子缺失时返回 None"""
+    by_tag = load_database()
+    r = by_tag.get(tag)
+    if not r:
+        return None
+    return objective_product(r)

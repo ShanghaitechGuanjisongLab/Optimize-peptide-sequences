@@ -26,7 +26,7 @@
     python 小肽优化_无限.py                  # 默认 --targets HTR1A,BIN1
     python 小肽优化_无限.py --migrate       # 先把家目录旧结果迁入共享库再开跑
     python 小肽优化_无限.py --batch 6 --poll 300
-    python 小肽优化_无限.py --status         # 只打印数据库统计与最佳结果，不开跑
+    python 小肽优化_无限.py --status         # 只打印数据库统计与 BEST_TOP10, 不启动搜索
 终止：kill <PID>（或 Ctrl+C）；已提交的 SLURM 作业不受影响，重跑即续作。
 
 共享数据库（小肽数据库，默认 /public_bme2/Share200T/管吉松/peptide_opt_db）：
@@ -478,10 +478,10 @@ def submit_candidates(seqs, active_targets):
 
 
 def harvest_and_report(active_targets, new_sample_fn=None):
-    """收割新完成结果入库，序贯采样入库（β 统计量），刷新 BEST_TOP10，打印统计。返回收割新增条数。
+    """收割新完成结果入库，序贯采样入库（β 统计量），刷新 BEST_TOP10，打印统计。返回（收割新增条数，新增 tags 集合）。
 
     new_sample_fn 透传给数据库整理做补采（真跑 AF3 新 seed）；留 None 时整理只消费池内免费样本。"""
-    n_new, skipped = db.harvest_results()
+    n_new, skipped, new_tags = db.harvest_results()
     n_fit = seq_sample.ingest_new_records(new_sample_fn)
     if n_fit:
         print(f"  🧮 序贯采样入库 {n_fit} 条（β 统计量已写入 obj_* 列）", flush=True)
@@ -520,7 +520,35 @@ def harvest_and_report(active_targets, new_sample_fn=None):
                             if t in OFF_COL)
             print(f"     🏅 {r['peptide']}  ipTM_HTR1A={1 - r['score_htr1a']:.3f}  {cons}",
                   flush=True)
-    return n_new
+    return n_new, new_tags
+
+
+def climb_new_records(new_tags, active_targets, new_sample_fn, max_rounds=10):
+    """对新入库的记录做首次爬山：重复补采新 seed，直到 objective 不再打破记录。
+
+    策略：每个 tag 初始 objective = ipTM(HTR1A) × ipTM(BIN1)，循环补采（new_sample_fn 真跑 AF3），每轮后刷新 objective，若新值 > 旧值则继续，否则停止。最多 max_rounds 轮防死循环。"""
+    if not new_tags or new_sample_fn is None:
+        return
+    print(f"  🧗 首次爬山: 对 {len(new_tags)} 个新记录重复补采直到不破纪录", flush=True)
+    for tag in sorted(new_tags):
+        best_obj = db.get_objective(tag)
+        if best_obj is None:
+            continue
+        print(f"    • {tag}: 初始 {best_obj:.4f}", end="", flush=True)
+        for rnd in range(1, max_rounds + 1):
+            samples = new_sample_fn(tag, n=1)
+            if not samples:
+                print(" (补采失败)", flush=True)
+                break
+            n_fit = seq_sample.ingest_new_records(None)
+            new_obj = db.get_objective(tag)
+            if new_obj is None or new_obj <= best_obj:
+                print(f" → {rnd} 轮后 {new_obj or 'N/A'}（未破纪录，停止）", flush=True)
+                break
+            print(f" → {new_obj:.4f}", end="", flush=True)
+            best_obj = new_obj
+        else:
+            print(f" (达 {max_rounds} 轮上限)", flush=True)
 
 
 # ===================== 主循环 =====================

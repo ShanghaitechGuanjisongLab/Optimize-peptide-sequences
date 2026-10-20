@@ -253,12 +253,8 @@ def append_eval_row(row):
 
 
 def feasible(row):
-    """可行 = 至少一个已启用底线蛋白的 ipTM < 阈值。未启用/未评估（NaN）的底线蛋白不参与判定；全部未启用时只看 HTR1A。"""
-    checks = [row[_OFF_COL[t]] < OFF_THRESHOLD for t in ACTIVE_OFF
-              if pd.notna(row[_OFF_COL[t]])]
-    if checks:
-        return any(checks)
-    return not ACTIVE_OFF
+    """约束已全部取消：所有行都可行（HTR1A 和 BIN1 不设上限）。"""
+    return True
 
 
 # ---------------- 主循环 ----------------
@@ -354,9 +350,6 @@ def run_bo(predict_fn, pool_size=DEFAULT_POOL, batch_size=DEFAULT_BATCH,
 
         if n_eval >= 3:
             gp_t = fit_gp(X_obs_s, y_obs)
-            gp_u = fit_active_gp(X_obs_s, rows, "UNC13C")
-            gp_b = fit_active_gp(X_obs_s, rows, "BIN1")
-            gp_con = [g for g in (gp_u, gp_b) if g is not None]
 
             uneval = [i for i in range(len(pool))
                       if pool[i] not in set(rows["peptide"])]
@@ -367,13 +360,11 @@ def run_bo(predict_fn, pool_size=DEFAULT_POOL, batch_size=DEFAULT_BATCH,
 
             if best_feasible_row is not None:
                 best_y = best_feasible_row["score_htr1a"]
-                acq = constrained_acquisition(gp_t, gp_con, X_cand_s, best_y)
+                acq = constrained_acquisition(gp_t, [], X_cand_s, best_y)
                 picked = select_batch(acq, X_cand_s, uneval, batch_size)
             else:
-                # 尚无可行解：退化为对约束可行性概率采样（仍优先低风险候选）；无激活约束 GP 时取常数采集值，由多样性贪心决定短名单顺序
+                # 无可行解时：用常数采集值，由多样性贪心决定短名单顺序
                 acq = np.ones(len(X_cand_s))
-                for gp in gp_con:
-                    acq = acq * feasible_prob(gp, X_cand_s)
                 picked = select_batch(acq, X_cand_s, uneval, batch_size)
 
             print(f"  🎯 采集函数选出 {len(picked)} 个候选: "

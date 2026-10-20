@@ -75,7 +75,9 @@ python -c "import sklearn, scipy, pandas, numpy" 2>/dev/null || {
 TASKD="$REPO_DIR/../任务中间层/任务守护.sh"
 TASKD_PID=""
 if [ -f "$TASKD" ]; then
-    bash "$TASKD" --gpus "${CUDA_VISIBLE_DEVICES:-none}" \
+    # SLURM 的 CUDA_VISIBLE_DEVICES 在 prolog 里才被设，此刻未必已注入 → 直接探测可见 GPU 数
+    NGPUS=$(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | wc -l)
+    bash "$TASKD" --gpus "${NGPUS:-0}" \
         --cpus "${SLURM_CPUS_PER_TASK:-${SLURM_CPUS_ON_NODE:-$(nproc)}}" \
         >>"${TASKCTL_STATE:-$REPO_DIR/../任务中间层/运行状态}/logs/taskd.out" 2>&1 &
     TASKD_PID=$!
