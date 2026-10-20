@@ -3,21 +3,16 @@
 # AlphaFold3 打包推理作业脚本（独立文件）
 #
 # 由 optimize_peptide_local.py 的 submit_pending_bundle() 提交：
-#     sbatch <SLURM 选项> --export=ALL,AF3_CODE_DIR=...,... \
-#         scripts/af3_bundle_runner.sh
-# SLURM 资源指令走命令行参数，作业配置走环境变量，本脚本只负责作业逻辑，
-# 因此没有任何 shell 代码内嵌在 Python 字符串里。
+#     sbatch <SLURM 选项> --export=ALL,AF3_CODE_DIR=…………\         scripts/af3_bundle_runner.sh
+# SLURM 资源指令走命令行参数，作业配置走环境变量，本脚本只负责作业逻辑，因此没有任何 shell 代码内嵌在 Python 字符串里。
 #
 # 【两阶段容错设计】
 #   阶段1  用 --input_dir 整包一次跑。AF3 的 MSA 缓存（data/pipeline.py 里的
-#          functools.cache）作用域是**单个 python 进程**：同一靶标的 chain B MSA
-#          第二次起仅需 ~0.06 s，而首次可达数千秒，整包跑能省下大量重复 MSA。
+#          functools.cache）作用域是**单个 python 进程**：同一靶标的 chain B MSA          第二次起仅需 ~0.06 s，而首次可达数千秒，整包跑能省下大量重复 MSA。
 #   阶段2  阶段1 中断时，逐任务用 --json_path 补跑，每个任务独立容错。
-#          必要性：AF3 主循环（run_alphafold.py 的 for fold_input 循环）**没有
-#          try/except**，单任务异常（如显存 OOM）会终止整个进程，导致同包排在
+#          必要性：AF3 主循环（run_alphafold.py 的 for fold_input 循环）**没有          try/except**，单任务异常（如显存 OOM）会终止整个进程，导致同包排在
 #          它之后的任务全部得不到执行（真实踩过的坑）。
-#   两阶段开始前都把已出结果的任务移入 _done/ 子目录，故 SLURM 重试或阶段2
-#   接管时都不会重复计算。_done/ 是子目录，而 AF3 用非递归 glob('*.json') +
+#   两阶段开始前都把已出结果的任务移入 _done/ 子目录，故 SLURM 重试或阶段2   接管时都不会重复计算。_done/ 是子目录，而 AF3 用非递归 glob('*.json') +
 #   is_file() 加载输入，不会被误读。
 #
 # 必需环境变量（未设置即报错退出）：
@@ -55,7 +50,7 @@ AF3_HMMER_DIR="${AF3_HMMER_DIR:-}"
 AF3_FLASH_ATTN="${AF3_FLASH_ATTN:-xla}"
 AF3_MSA_CPUS="${AF3_MSA_CPUS:-6}"
 AF3_NEED_XLA_7X_FLAG="${AF3_NEED_XLA_7X_FLAG:-1}"
-# 单作业可用 GPU 数: >1 时阶段1把任务按靶标分组拆到各卡并行（见 stage1_parallel）
+# 单作业可用 GPU 数：>1 时阶段1把任务按靶标分组拆到各卡并行（见 stage1_parallel）
 AF3_GPUS_PER_JOB="${AF3_GPUS_PER_JOB:-1}"
 
 RUN_AF3="${AF3_CODE_DIR%/}/run_alphafold.py"
@@ -87,12 +82,12 @@ else
 fi
 [ -n "$AF3_HMMER_DIR" ] && export PATH="$AF3_HMMER_DIR:$PATH"
 
-# ---- CUDA 算力 7.x GPU (V100/T4 等) 必须禁用该 HLO 融合通道, 否则 JAX 启动即报错 ----
+# ---- CUDA 算力 7.x GPU （V100/T4 等）必须禁用该 HLO 融合通道，否则 JAX 启动即报错 ----
 if [ "$AF3_NEED_XLA_7X_FLAG" = "1" ]; then
     export XLA_FLAGS="${XLA_FLAGS:+$XLA_FLAGS }--xla_disable_hlo_passes=custom-kernel-fusion-rewriter"
 fi
 
-# ---- 官方推荐的 unified memory: 显存不足时溢出到主机内存以防 OOM（代价是变慢）----
+# ---- 官方推荐的 unified memory：显存不足时溢出到主机内存以防 OOM（代价是变慢）----
 # 见 alphafold3/docs/performance.md 的 "Unified Memory" 一节
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
 export TF_FORCE_UNIFIED_MEMORY=true
@@ -107,8 +102,7 @@ has_result() {
     for f in "$AF3_OUT_DIR/$1"/*_summary_confidences.json; do
         [ -e "$f" ] && return 0
     done
-    # AF3 向已存在的输出目录写结果时会另建 <名>_YYYYMMDD_HHMMSS/ 兄弟目录,
-    # 一并识别, 否则已完成任务会被当"无结果"重跑
+    # AF3 向已存在的输出目录写结果时会另建 <名>_YYYYMMDD_HHMMSS/ 兄弟目录，一并识别，否则已完成任务会被当“无结果”重跑
     for sib in "$AF3_OUT_DIR/$1"_[0-9]*_[0-9]*; do
         [ -d "$sib" ] || continue
         for f in "$sib"/*_summary_confidences.json; do
@@ -118,9 +112,7 @@ has_result() {
     return 1
 }
 
-# consolidate_outputs —— 把 AF3 生成的 <名>_<时间戳>/ 兄弟目录折叠进规范
-# 目录 <名>/, 使规范目录成为唯一结果位置（登录节点据此收割/去重/打包,
-# 也不再对已完成任务重跑）。多次重跑时任意一份含 summary 的兄弟保留到规范目录。
+# consolidate_outputs —— 把 AF3 生成的 <名>_<时间戳>/ 兄弟目录折叠进规范目录 <名>/，使规范目录成为唯一结果位置（登录节点据此收割/去重/打包，也不再对已完成任务重跑）。多次重跑时任意一份含 summary 的兄弟保留到规范目录。
 consolidate_outputs() {
     local sib base canon entry b
     for sib in "$AF3_OUT_DIR"/*_[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]_[0-9][0-9][0-9][0-9][0-9][0-9]; do
@@ -151,12 +143,9 @@ run_once() {
         --nhmmer_n_cpu="$AF3_MSA_CPUS"
 }
 
-# ---- 多卡阶段1: 把包内任务按靶标后缀分组拆到 AF3_GPUS_PER_JOB 张卡并行 ----
-# 分组策略: 出现 ≥2 种靶标时同靶标同流（MSA 每流只建一次、流内全复用,
-# 与串行整包的缓存收益一致）; 仅单一靶标时轮转均分到各卡（每流各建一次
-# MSA, 但并行把壁钟时间减半以上, 净赚）。
-# 卡号优先用 SLURM 已注入的 CUDA_VISIBLE_DEVICES（即本作业分到的真实卡）,
-# 未注入时才退回 0..N-1, 避免在共享节点上踩到其他作业的卡。
+# ---- 多卡阶段1：把包内任务按靶标后缀分组拆到 AF3_GPUS_PER_JOB 张卡并行 ----
+# 分组策略：出现 ≥2 种靶标时同靶标同流（MSA 每流只建一次、流内全复用，与串行整包的缓存收益一致）；仅单一靶标时轮转均分到各卡（每流各建一次 MSA，但并行把壁钟时间减半以上，净赚）。
+# 卡号优先用 SLURM 已注入的 CUDA_VISIBLE_DEVICES（即本作业分到的真实卡），未注入时才退回 0..N-1，避免在共享节点上踩到其他作业的卡。
 stage1_parallel() {
     local ngpu="$1"
     local split_root="$AF3_BUNDLE_DIR/_split"
@@ -242,7 +231,7 @@ done
 remaining=("$AF3_BUNDLE_DIR"/*.json)
 if [ ${#remaining[@]} -eq 0 ]; then
     echo "AF3 打包推理结束: $(date) | 本包任务均已有结果, 无需运行"
-    consolidate_outputs        # 折叠可能残留的时间戳兄弟目录, 令规范目录成为唯一位置
+    consolidate_outputs        # 折叠可能残留的时间戳兄弟目录，令规范目录成为唯一位置
     exit 0
 fi
 echo "本包待跑任务 ${#remaining[@]} 个: $(printf '%s ' "${remaining[@]##*/}" | tr ' ' '\n' | sed 's/\.json$//' | tr '\n' ' ')"
@@ -276,6 +265,6 @@ fi
 
 echo "AF3 打包推理结束: $(date) | 阶段1退出码: $rc1 | 最终失败任务数: $rc"
 
-# 把本次产生的 <名>_<时间戳>/ 输出折叠进规范目录, 供登录节点统一收割与去重
+# 把本次产生的 <名>_<时间戳>/ 输出折叠进规范目录，供登录节点统一收割与去重
 consolidate_outputs
 exit "$rc"

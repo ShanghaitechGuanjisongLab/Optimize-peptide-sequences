@@ -3,19 +3,14 @@
 =============================================================
 本文件只是流程入口，逻辑拆分在两个库中：
 
-  - peptide_common.py  公共逻辑（序列常量、突变规则、AF3 JSON 格式、
-                       评分提取、蒙特卡洛主循环）。导入零副作用。
-  - peptide_server.py  云端后端库（JSON 生成/批量分批、结果缓存、
-                       可选的 af3_automator 浏览器自动化、云端编排）。
+  - peptide_common.py  公共逻辑（序列常量、突变规则、AF3 JSON 格式、评分提取、蒙特卡洛主循环）。导入零副作用。
+  - peptide_server.py  云端后端库（JSON 生成/批量分批、结果缓存、可选的 af3_automator 浏览器自动化、云端编排）。
 
-只有走云端后端时才需要运行本脚本；本地集群推理请用
-optimize_peptide_local.py，贝叶斯优化请用 optimize_peptide_BO.py。
+只有走云端后端时才需要运行本脚本；本地集群推理请用 optimize_peptide_local.py，贝叶斯优化请用 optimize_peptide_BO.py。
 
-使用方式:
-  - 全自动模式: 先运行 setup_auth.py 完成 Google 登录，再运行本脚本
-    （需自备 af3_automator 模块与 Playwright）
-  - 手动模式: 脚本生成 JSON 到 af3_jobs/，人工上传到
-    https://alphafoldserver.com/ 并把结果 zip 放入 af3_results/ 后重跑
+使用方式：
+  - 全自动模式：先运行 setup_auth.py 完成 Google 登录，再运行本脚本（需自备 af3_automator 模块与 Playwright）
+  - 手动模式：脚本生成 JSON 到 af3_jobs/，人工上传到 https://alphafoldserver.com/ 并把结果 zip 放入 af3_results/ 后重跑
 """
 
 import random
@@ -64,7 +59,7 @@ if __name__ == "__main__":
         print("  4. optimize_with_server() → 自动提取评分并完成优化")
     print()
 
-    # 第一步：批量生成 JSON (并尝试自动提交)
+    # 第一步：批量生成 JSON （并尝试自动提交）
     batch_generate_all_json()
 
     # 检查结果并尝试优化

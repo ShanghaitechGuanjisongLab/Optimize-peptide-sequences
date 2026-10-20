@@ -2,46 +2,36 @@
 小肽序列优化 — 贝叶斯优化（Bayesian Optimization）入口
 =============================================================
 为什么换掉蒙特卡洛：
-  AF3 单次评估昂贵（每候选 ×3 次预测），本项目真正的瓶颈是"评估预算"
-  （服务器版每日约 30 个任务 ≈ 每天 10 个候选）。贝叶斯优化用
-  代理模型（高斯过程）从已评估样本中学习"序列特征 → 分数"的映射，
-  每轮只把评估机会花在最有希望的候选上，样本效率远高于随机抽样式
-  的蒙特卡洛/遗传算法。
+  AF3 单次评估昂贵（每候选 ×3 次预测），本项目真正的瓶颈是“评估预算”（服务器版每日约 30 个任务 ≈ 每天 10 个候选）。贝叶斯优化用代理模型（高斯过程）从已评估样本中学习“序列特征 → 分数”的映射，每轮只把评估机会花在最有希望的候选上，样本效率远高于随机抽样式的蒙特卡洛/遗传算法。
 
 搜索策略：
-  1. 候选库: 预生成约 1500 个编辑距离 ≤ 2 的可变区突变（与原版相同规则）
-  2. 初始设计: 评估初始序列 + 一组随机候选，作为冷启动
-  3. 每轮:
-     a) 拟合 3 个独立高斯过程（GP）:
-        - GP_target: score = 1 - ipTM(HTR1A)          （要最小化）
-        - GP_unc   : ipTM(UNC13C)                      （约束 < 0.8）
-        - GP_bin   : ipTM(BIN1)                        （约束 < 0.8）
-     b) 采集函数 = 约束期望改进（constrained Expected Improvement）:
-        cEI(x) = EI(x) × P(ipTM_unc < 0.8 | x) × P(ipTM_bin < 0.8 | x)
-        即"改进潜力 × 对每个底线蛋白的可行概率"，比原版硬阈值
-        （双 ≥0.8 即丢弃）更平滑，避免阈值附近的浪费。
-     c) 按 cEI 贪心选出 batch 个候选（带特征空间多样性约束），
-        提交评估；完成后写入 CSV，进入下一轮。
+  1. 候选库：预生成约 1500 个编辑距离 ≤ 2 的可变区突变（与原版相同规则）
+  2. 初始设计：评估初始序列 + 一组随机候选，作为冷启动
+  3. 每轮：
+     a）拟合 3 个独立高斯过程（GP）：
+        - GP_target：score = 1 - ipTM(HTR1A)          （要最小化）
+        - GP_unc：ipTM(UNC13C)                      （约束 < 0.8）
+        - GP_bin：ipTM(BIN1)                        （约束 < 0.8）
+     b）采集函数 = 约束期望改进（constrained Expected Improvement）：
+        cEI(x) = EI(x) × P(ipTM_unc < 0.8 | x) × P(ipTM_bin < 0.8 | x) 即“改进潜力 × 对每个底线蛋白的可行概率”，比原版硬阈值（双 ≥0.8 即丢弃）更平滑，避免阈值附近的浪费。
+     c）按 cEI 贪心选出 batch 个候选（带特征空间多样性约束），提交评估；完成后写入 CSV，进入下一轮。
 
 复用的部分（从 optimize_peptide_AF3 导入）：
-  - 序列常量、generate_mutant() 突变规则、create_af3_json()、
-    extract_scores_from_zip() 评分提取；
+  - 序列常量、generate_mutant() 突变规则、create_af3_json()、extract_scores_from_zip() 评分提取；
   - predict_and_score()（服务器版：JSON 生成/缓存评分）。
 
-运行方式:
-    python optimize_peptide_BO.py             # 默认: 本地集群推理（无每日配额限制）
+运行方式：
+    python optimize_peptide_BO.py             # 默认：本地集群推理（无每日配额限制）
     python optimize_peptide_BO.py --server    # 改用 AlphaFold Server 云端预测（手动/自动模式同主脚本）
-  与其他入口一样支持断点续跑：已评估候选记录在 output_bo/bo_evaluations.csv，
-  已完成的 AF3 结果缓存直接复用。
+  与其他入口一样支持断点续跑：已评估候选记录在 output_bo/bo_evaluations.csv，已完成的 AF3 结果缓存直接复用。
 
-输出:
-    output_bo/bo_evaluations.csv    已评估候选: 序列 + 三个靶标的分数/约束值
+输出：
+    output_bo/bo_evaluations.csv    已评估候选：序列 + 三个靶标的分数/约束值
     output_bo/bo_curve.png          最优 score 随评估数的改进曲线
     output_bo/BEST_STRUCTURE/       最佳序列的 AF3 结果包（复制）
     output_bo/result_bo.xlsx        最终最优序列表
 
-合规/评分说明: score = 1 - ipTM 仅是界面置信度的代理，并非真实亲和度，
-最优序列仍需湿实验验证。AlphaFold 服务器版受每日配额、本地版受 GPU 排队约束。
+合规/评分说明：score = 1 - ipTM 仅是界面置信度的代理，并非真实亲和度，最优序列仍需湿实验验证。AlphaFold 服务器版受每日配额、本地版受 GPU 排队约束。
 """
 
 import os
@@ -76,7 +66,7 @@ from peptide_common import (SEQ_202, FIXED_A, ORIG_TAIL,
 
 # ===================== 靶标配置 =====================
 
-# 三个靶标各自独立预测。UNC13C 复合物约 2233 tokens, 超过 bme_gpupub 分区 V100 的官方上限 1280 tokens (见 optimize_peptide_local.GPU_MAX_TOKENS),在 V100 上必然显存溢出, 因此支持 --targets HTR1A,BIN1 只跑 V100 放得下的两个靶标（结果独立存放）; 待申请到 A100/H100 再以全靶标运行补齐 UNC13C 约束。
+# 三个靶标各自独立预测。UNC13C 复合物约 2233 tokens，超过 bme_gpupub 分区 V100 的官方上限 1280 tokens （见 optimize_peptide_local.GPU_MAX_TOKENS），在 V100 上必然显存溢出，因此支持 --targets HTR1A,BIN1 只跑 V100 放得下的两个靶标（结果独立存放）；待申请到 A100/H100 再以全靶标运行补齐 UNC13C 约束。
 TARGET_SEQS    = {"HTR1A": HTR1A_SEQ, "UNC13C": UNC13C_SEQ, "BIN1": BIN1_SEQ}
 TARGET_ORDER   = ["HTR1A", "UNC13C", "BIN1"]   # 固定评估顺序
 OFF_TARGETS    = ["UNC13C", "BIN1"]            # 底线蛋白（结合越低越好）
@@ -92,7 +82,7 @@ OFF_THRESHOLD  = 0.8                          # 底线蛋白约束阈值（ipTM 
 N_INIT         = 8                            # 冷启动随机评估数（不含初始序列）
 DEFAULT_POOL   = 1500                         # 候选库大小
 DEFAULT_BATCH  = 8                            # 每轮评估数（≈ 每日配额 / 3）
-DEFAULT_BUDGET = 120                          # 总评估预算（候选数, 不含初始序列亦可含）
+DEFAULT_BUDGET = 120                          # 总评估预算（候选数，不含初始序列亦可含）
 XI             = 1e-3                         # EI 探索项
 TOP_K          = 50                           # 贪心多样性选择时的短名单长度
 
@@ -102,7 +92,7 @@ TOP_K          = 50                           # 贪心多样性选择时的短�
 def set_active_targets(names):
     """只启用 names 中的靶标（必须含 HTR1A）。
 
-    非全集时输出根目录改为 output_bo_<靶标小写连字符>, 与全量评估的记录分开存放, 避免同一 CSV 中混入 NaN 约束列。AF3 推理结果目录(af3_local_results/<seq_任务名>) 按 序列×靶标 命名, 与本设置无关,将来补齐 UNC13C 时已完成的 HTR1A/BIN1 结果仍直接复用。返回被搁置（未启用）的靶标列表。"""
+    非全集时输出根目录改为 output_bo_<靶标小写连字符>，与全量评估的记录分开存放，避免同一 CSV 中混入 NaN 约束列。AF3 推理结果目录（af3_local_results/<seq_任务名>）按 序列×靶标 命名，与本设置无关，将来补齐 UNC13C 时已完成的 HTR1A/BIN1 结果仍直接复用。返回被搁置（未启用）的靶标列表。"""
     global ACTIVE_TARGETS, ACTIVE_OFF, BO_ROOT, EVAL_CSV
     ACTIVE_TARGETS = [t for t in TARGET_ORDER if t in names]
     ACTIVE_OFF = [t for t in OFF_TARGETS if t in ACTIVE_TARGETS]
@@ -123,7 +113,7 @@ _POLAR = set("STNQ")
 
 
 def featurize(seq):
-    """序列 → 26 维数值特征: 20 个氨基酸组成 + 长度/净电荷/疏水/芳香/极性/破结构比例"""
+    """序列 → 26 维数值特征：20 个氨基酸组成 + 长度/净电荷/疏水/芳香/极性/破结构比例"""
     n = max(len(seq), 1)
     comp = [seq.count(a) / n for a in AA_LIST]
     charge = (sum(seq.count(a) for a in "RKH") - sum(seq.count(a) for a in "DE")) / n
@@ -185,14 +175,14 @@ def expected_improvement(mu, sd, best_y, xi=XI):
 
 
 def feasible_prob(gp_off, X):
-    """P(ipTM_off < 阈值 | x)"""
+    """P（ipTM_off < 阈值 | x）"""
     mu, sd = gp_off.predict(X, return_std=True)
     sd = np.maximum(sd, 1e-9)
     return norm.cdf((OFF_THRESHOLD - mu) / sd)
 
 
 def constrained_acquisition(gp_target, gp_con_list, X_cand, best_y):
-    """cEI: 期望改进 × 对每个已启用底线蛋白的可行概率（gp_con_list 只含本次运行激活的约束 GP, 可为空 = 纯 EI）。"""
+    """cEI：期望改进 × 对每个已启用底线蛋白的可行概率（gp_con_list 只含本次运行激活的约束 GP，可为空 = 纯 EI）。"""
     mu, sd = gp_target.predict(X_cand, return_std=True)
     acq = expected_improvement(mu, sd, best_y)
     for gp in gp_con_list:
@@ -218,17 +208,16 @@ def select_batch(acq, X_cand, indices, batch_size):
 # ---------------- 评估流程 ----------------
 
 def evaluate_sequence(seq, seq_tag, out_root, predict_fn):
-    """对单个序列评估全部激活靶标（默认 3 个, --targets 可缩减），
-    全部就绪时返回 dict，否则 None。
+    """对单个序列评估全部激活靶标（默认 3 个，--targets 可缩减），全部就绪时返回 dict，否则 None。
 
-    关键: 先遍历所有激活靶标、逐个创建并提交预测任务, **不因某个靶标结果未就绪就提前 return**。否则该靶标后面的靶标任务永远不会被创建——例如 UNC13C 因token超限被拦截而始终未就绪时, 排在它后面的 BIN1 会被连带锁死, 表现为"BIN1 尚未生成任务"。所有激活靶标任务都创建/提交后, 只要有任一未就绪就返回 None（已创建的任务下次重跑继续, 不会重复提交）。"""
+    关键：先遍历所有激活靶标、逐个创建并提交预测任务，**不因某个靶标结果未就绪就提前 return**。否则该靶标后面的靶标任务永远不会被创建——例如 UNC13C 因token超限被拦截而始终未就绪时，排在它后面的 BIN1 会被连带锁死，表现为“BIN1 尚未生成任务”。所有激活靶标任务都创建/提交后，只要有任一未就绪就返回 None（已创建的任务下次重跑继续，不会重复提交）。"""
     res = {}
     for target_name in ACTIVE_TARGETS:
         target_seq = TARGET_SEQS[target_name]
         out_dir = os.path.join(out_root, f"{seq_tag}_{target_name}")
         score, iptm, path = predict_fn(seq, target_seq, target_name, out_dir,
                                        auto_submit=True)
-        # 未就绪不 return, 继续把后续靶标任务创建出来
+        # 未就绪不 return，继续把后续靶标任务创建出来
         res[target_name] = None if iptm is None else {
             "score": score, "iptm": iptm, "path": path}
     if any(v is None for v in res.values()):
@@ -237,7 +226,7 @@ def evaluate_sequence(seq, seq_tag, out_root, predict_fn):
 
 
 def load_evaluations():
-    """续跑: 读取已评估候选记录（返回 DataFrame；直接用 csv 模块避免pandas对 .csv 写入时的压缩依赖探测问题）"""
+    """续跑：读取已评估候选记录（返回 DataFrame；直接用 csv 模块避免pandas对 .csv 写入时的压缩依赖探测问题）"""
     cols = ["peptide", "score_htr1a", "iptm_unc13c", "iptm_bin1", "round"]
     if os.path.isfile(EVAL_CSV):
         rows = []
@@ -264,7 +253,7 @@ def append_eval_row(row):
 
 
 def feasible(row):
-    """可行 = 至少一个已启用底线蛋白的 ipTM < 阈值。未启用/未评估（NaN）的底线蛋白不参与判定; 全部未启用时只看 HTR1A。"""
+    """可行 = 至少一个已启用底线蛋白的 ipTM < 阈值。未启用/未评估（NaN）的底线蛋白不参与判定；全部未启用时只看 HTR1A。"""
     checks = [row[_OFF_COL[t]] < OFF_THRESHOLD for t in ACTIVE_OFF
               if pd.notna(row[_OFF_COL[t]])]
     if checks:
@@ -285,7 +274,7 @@ def run_bo(predict_fn, pool_size=DEFAULT_POOL, batch_size=DEFAULT_BATCH,
     df_eval = load_evaluations()
     evaluated_seqs = set(df_eval["peptide"]) if len(df_eval) else set()
 
-    # ---- 冷启动: 初始序列 + 随机候选 ----
+    # ---- 冷启动：初始序列 + 随机候选 ----
     init_needed = []
     if SEQ_202 not in evaluated_seqs:
         init_needed.append(pool.index(SEQ_202))
@@ -381,7 +370,7 @@ def run_bo(predict_fn, pool_size=DEFAULT_POOL, batch_size=DEFAULT_BATCH,
                 acq = constrained_acquisition(gp_t, gp_con, X_cand_s, best_y)
                 picked = select_batch(acq, X_cand_s, uneval, batch_size)
             else:
-                # 尚无可行解: 退化为对约束可行性概率采样（仍优先低风险候选）；无激活约束 GP 时取常数采集值, 由多样性贪心决定短名单顺序
+                # 尚无可行解：退化为对约束可行性概率采样（仍优先低风险候选）；无激活约束 GP 时取常数采集值，由多样性贪心决定短名单顺序
                 acq = np.ones(len(X_cand_s))
                 for gp in gp_con:
                     acq = acq * feasible_prob(gp, X_cand_s)
@@ -489,7 +478,7 @@ if __name__ == "__main__":
         print("运行模式: AlphaFold Server（--server，与主脚本相同的手动/自动流程，受每日配额限制）")
     else:
         import optimize_peptide_local as loc
-        # 预检查 + 解压作业实时进度跟随（运行中则等待, 不继续后续步骤）
+        # 预检查 + 解压作业实时进度跟随（运行中则等待，不继续后续步骤）
         loc.ensure_local_ready()
         predict_fn = loc.local_predict_and_score
         print("运行模式: 本地集群推理（默认，自动提交 SLURM GPU 作业，无配额限制）")

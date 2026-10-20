@@ -1,30 +1,24 @@
 #!/usr/bin/env bash
 # =============================================================================
-# 无限循环作业 —— SLURM 侧包装脚本（单作业形态, 计算节点上运行）
+# 无限循环作业 —— SLURM 侧包装脚本（单作业形态，计算节点上运行）
 #
-# 由 optimize_peptide_local.submit_loop_job() 提交（资源指令走命令行参数,
-# 作业配置走 --export 环境变量, 与仓库既有约定一致）。
+# 由 optimize_peptide_local.submit_loop_job() 提交（资源指令走命令行参数，作业配置走 --export 环境变量，与仓库既有约定一致）。
 #
-# ⭐ 为什么需要这个形态（2026-10-04 定案）:
-#   旧形态 = 登录节点常驻 Python 驱动 + 反复 sbatch 小包作业。它脆弱在:
-#   登录节点把所有交互进程塞进同一个 cgroup /system.slice/sshd.service,
-#   setsid 逃不出去 → 会话被清理时驱动无声消失 → GPU 空转、结果滞留未入库
-#   （已发生两次, 其中一次空转 8h22m）。
-#   新形态 = **一个长驻作业内部自带无限循环**（见 optimize_peptide_node.py）:
-#   作业跑满分区时限 MaxTime(5 天)才退出, 期间反复 {挑候选→跑AF3→收割入库}。
-#   于是既不需要登录节点常驻进程, 也不需要"计算节点里 sbatch 下一包"
-#   （那会与 QoS MaxJobsPerUser=1 的运行槽互斥）。
-#   登录节点只留 cron 看门狗, 职责退化为"队列里没这个作业了就再交一个"。
+# ⭐ 为什么需要这个形态（2026-10-04 定案）：
+#   旧形态 = 登录节点常驻 Python 驱动 + 反复 sbatch 小包作业。它脆弱在：
+#   登录节点把所有交互进程塞进同一个 cgroup /system.slice/sshd.service，setsid 逃不出去 → 会话被清理时驱动无声消失 → GPU 空转、结果滞留未入库（已发生两次，其中一次空转 8h22m）。
+#   新形态 = **一个长驻作业内部自带无限循环**（见 optimize_peptide_node.py）：
+#   作业跑满分区时限 MaxTime（5 天）才退出，期间反复 {挑候选→跑AF3→收割入库}。
+#   于是既不需要登录节点常驻进程，也不需要“计算节点里 sbatch 下一包”（那会与 QoS MaxJobsPerUser=1 的运行槽互斥）。
+#   登录节点只留 cron 看门狗，职责退化为“队列里没这个作业了就再交一个”。
 #
-# 环境分工（实测: af3_old **不含** sklearn/pandas, 故两套环境必须并存）:
+# 环境分工（实测：af3_old **不含** sklearn/pandas，故两套环境必须并存）：
 #   conda base   → 本脚本与 optimize_peptide_node.py（编排 / GP / 入库）
 #   conda af3_old→ AF3 推理那一步（由 scripts/af3_bundle_runner.sh 自行激活）
 #
-# 可选环境变量:
+# 可选环境变量：
 #   PEPOPT_TARGETS=HTR1A+BIN1   待评估靶标（V100 放不下 UNC13C）
-#                               ⭐ 分隔符必须是 '+'：该变量经 SLURM --export 下发,
-#                               而 --export 列表以逗号分隔, 值内含逗号会被截断
-#                               （PEPOPT_TARGETS=HTR1A,BIN1 → 只收到 HTR1A）。
+#                               ⭐ 分隔符必须是 '+'：该变量经 SLURM --export 下发，而 --export 列表以逗号分隔，值内含逗号会被截断（PEPOPT_TARGETS=HTR1A,BIN1 → 只收到 HTR1A）。
 #                               本脚本与 python 侧均已兼容 ',' 与 '+' 两种写法。
 #   PEPOPT_CYCLE_SEQS=24        每轮序列数
 #   PEPOPT_MAX_HOURS=118        时间预算（= MaxTime 减去续交余量）
@@ -45,14 +39,14 @@ echo "   每轮序列 : ${PEPOPT_CYCLE_SEQS:-24}"
 echo "   仓库     : $REPO_DIR"
 echo "   数据库   : ${PEPOPT_DB_ROOT:-/public_bme2/Share200T/管吉松/peptide_opt_db}"
 echo "=============================================================="
-# 提交时就拦住靶标被截断（SLURM --export 以逗号分隔, 值内含逗号会被静默截断）
+# 提交时就拦住靶标被截断（SLURM --export 以逗号分隔，值内含逗号会被静默截断）
 case ",${PEPOPT_TARGETS:-HTR1A+BIN1}," in
   *",,"*|*BIN1*|*UNC13C*) : ;;
   *) echo "❌ 靶标下发异常: '${PEPOPT_TARGETS:-}' 未含 BIN1 → 拒绝启动以免白烧 5 天机时"
      echo "   （请确认 build_loop_job_cmd 用 '+' 而非 ',' 拼接靶标）"; exit 4 ;;
 esac
 
-# ---- 激活编排环境（base: 含 sklearn/pandas/matplotlib）----
+# ---- 激活编排环境（base：含 sklearn/pandas/matplotlib）----
 CONDA_SH="${PEPOPT_CONDA_SH:-}"
 if [ -z "$CONDA_SH" ]; then
     for c in "$HOME/miniconda3/etc/profile.d/conda.sh" \
@@ -69,15 +63,33 @@ else
     echo "⚠️ 未定位到 conda.sh, 沿用节点默认 python（可能缺 sklearn）"
 fi
 
-# 依赖自检: 缺 GP 依赖就**立刻**退出, 别把 5 天的 GPU 槽浪费在报错循环上
+# 依赖自检：缺 GP 依赖就**立刻**退出，别把 5 天的 GPU 槽浪费在报错循环上
 python -c "import sklearn, scipy, pandas, numpy" 2>/dev/null || {
     echo "❌ base 环境缺 sklearn/scipy/pandas/numpy → 安装后重交:" >&2
     echo "   pip install scikit-learn scipy pandas matplotlib openpyxl" >&2
     exit 3
 }
 
-# -u: 关闭输出缓冲, 使 SLURM 日志可实时 tail
-exec python -u optimize_peptide_node.py \
+# ---- 先起任务中间层（HyperQueue server+worker），AF3 任务经其调度 ----
+# 作用：作业内随时添加/取消单个 AF3 预测（任务控制.sh），不动作业本体。taskd随作业退出而清理（SLURM 杀进程组 + 自身 trap 双保险）。
+TASKD="$REPO_DIR/../任务中间层/任务守护.sh"
+TASKD_PID=""
+if [ -f "$TASKD" ]; then
+    bash "$TASKD" --gpus "${CUDA_VISIBLE_DEVICES:-none}" \
+        --cpus "${SLURM_CPUS_PER_TASK:-${SLURM_CPUS_ON_NODE:-$(nproc)}}" \
+        >>"${TASKCTL_STATE:-$REPO_DIR/../任务中间层/state}/logs/taskd.out" 2>&1 &
+    TASKD_PID=$!
+    echo "🧭 任务守护已启动 (pid=$TASKD_PID); 客户端: 任务中间层/任务控制.sh"
+else
+    echo "⚠️ 未找到 $TASKD, AF3 将走整包直跑路径"
+    export PEPOPT_HQ_MODE=0
+fi
+
+# -u：关闭输出缓冲，使 SLURM 日志可实时 tail
+python -u optimize_peptide_node.py \
     --targets "${PEPOPT_TARGETS:-HTR1A+BIN1}" \
     --cycle-seqs "${PEPOPT_CYCLE_SEQS:-24}" \
     --max-hours "${PEPOPT_MAX_HOURS:-118}"
+rc=$?
+[ -n "$TASKD_PID" ] && kill "$TASKD_PID" 2>/dev/null
+exit $rc

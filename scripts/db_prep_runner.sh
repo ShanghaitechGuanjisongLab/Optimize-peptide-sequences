@@ -3,12 +3,9 @@
 # AlphaFold3 序列数据库解压作业脚本（独立文件）
 #
 # 由 optimize_peptide_local.py 的 submit_db_prep_job() 提交：
-#     sbatch <SLURM 选项> --export=ALL,PEPOPT_WORK_DIR=...,... \
-#         scripts/db_prep_runner.sh
+#     sbatch <SLURM 选项> --export=ALL,PEPOPT_WORK_DIR=…………\         scripts/db_prep_runner.sh
 #
-# 实际的磁盘空间检查与逐项解压逻辑在 Python 侧
-# （optimize_peptide_local.py --prepare-db，见 prepare_database()），
-# 本脚本只负责在计算节点上准备好环境并调用它，因此提交后即可断开 SSH。
+# 实际的磁盘空间检查与逐项解压逻辑在 Python 侧（optimize_peptide_local.py --prepare-db，见 prepare_database()），本脚本只负责在计算节点上准备好环境并调用它，因此提交后即可断开 SSH。
 # 用 python -u 关闭输出缓冲，使进度可被 `tail -f db_prep_<jobid>.out` 实时看到。
 #
 # 必需环境变量：
@@ -58,7 +55,7 @@ if ! command -v zstd >/dev/null 2>&1; then
     echo "✅ 提示: 当前 PATH 无 zstd, prepare_database() 会自行处理并报错中止" >&2
 fi
 
-# -u: 关闭缓冲, 让解压进度能被 tail -f 实时看到
+# -u：关闭缓冲，让解压进度能被 tail -f 实时看到
 python -u "$PEPOPT_ENTRY" --prepare-db
 rc=$?
 

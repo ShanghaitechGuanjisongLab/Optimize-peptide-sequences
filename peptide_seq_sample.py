@@ -24,9 +24,9 @@ from peptide_stats import BetaFit, consolidation_pass, trigger_power_of_two
 def build_product_samples(target_samples, fixed_factors):
     """构造目标乘积样本序列（β 用标准 [0,1]，乘积本身 ∈ [0,1] 无需缩放）。
 
-    target_samples: {靶标: [逐样本 ipTM]} —— 本次新算的（变因子）。
-    fixed_factors:  {靶标: 常数 ipTM}   —— 归档复用的（固定因子）。
-    返回 products 列表。按样本下标配对相乘; 长度取变因子的最短者。
+    target_samples：{靶标：[逐样本 ipTM]} —— 本次新算的（变因子）。
+    fixed_factors：{靶标：常数 ipTM}   —— 归档复用的（固定因子）。
+    返回 products 列表。按样本下标配对相乘；长度取变因子的最短者。
     """
     if not target_samples:
         raise ValueError("target_samples 不能为空")
@@ -75,15 +75,16 @@ def ingest_record(tag, target_samples, fixed_factors, peptide=None, var=None):
             "pool_size": len(fit.pool)}
 
 
-# ==================== 逐样本入库与整理补采（集成入口） ====================
+# ==================== 逐样本入库与整理补采（集成入口）====================
 
-PRODUCT_TARGETS = ("ASIC1A", "HTR1A", "BIN1")   # 目标乘积的三因子（与 optimize_peptide_infinite.PRODUCT_TARGETS 同义; 此处自带一份以免反向依赖入口模块）
+# 目标乘积因子：真源在 peptide_db.PRODUCT_TARGETS（总开关；2026-10-20 停算 ASIC1A）。此处转发以免反向依赖入口模块。
+PRODUCT_TARGETS = db.PRODUCT_TARGETS
 
 
 def collect_product_factors(tag, row=None, product_targets=PRODUCT_TARGETS):
-    """收集一条记录的乘积因子: 结果目录里有逐样本数据的靶标 → 变因子（样本列表）; 无逐样本但库中有值 → 固定因子（常数）。
+    """收集一条记录的乘积因子：结果目录里有逐样本数据的靶标 → 变因子（样本列表）；无逐样本但库中有值 → 固定因子（常数）。
 
-    任一产品靶标两者皆无 → 返回 None（因子不齐, 乘积无法构造）。"""
+    任一产品靶标两者皆无 → 返回 None（因子不齐，乘积无法构造）。"""
     row = row if row is not None else (db.load_database().get(tag) or {})
     target_samples, fixed_factors = {}, {}
     for t in product_targets:
@@ -100,9 +101,9 @@ def collect_product_factors(tag, row=None, product_targets=PRODUCT_TARGETS):
 
 
 def ingest_record_from_results(tag, row=None):
-    """一条记录的序贯采样入库（幂等: 已有 β 统计量则跳过）。返回 ingest_record 结果或 None。
+    """一条记录的序贯采样入库（幂等：已有 β 统计量则跳过）。返回 ingest_record 结果或 None。
 
-    全固定因子（三个靶标都只有常数）时不开统计量: 无可采样随机性, 后续补采也无从谈起。"""
+    全固定因子（三个靶标都只有常数）时不开统计量：无可采样随机性，后续补采也无从谈起。"""
     row = row if row is not None else (db.load_database().get(tag) or {})
     if (row.get("obj_n") or 0) > 0:
         return None
@@ -117,9 +118,9 @@ def ingest_record_from_results(tag, row=None):
 
 
 def ingest_new_records(new_sample_fn=None):
-    """序贯采样入库总入口: 扫描库里"因子齐备且尚无 β 统计量"的记录逐条入库; 每入一条做一次 2^k 整理触发检查。返回入库条数。
+    """序贯采样入库总入口：扫描库里“因子齐备且尚无 β 统计量”的记录逐条入库；每入一条做一次 2^k 整理触发检查。返回入库条数。
 
-    new_sample_fn: 整理阶段的批量补采生成器（见 run_consolidation）; 留 None 时整理只消费池内免费样本。"""
+    new_sample_fn：整理阶段的批量补采生成器（见 run_consolidation）；留 None 时整理只消费池内免费样本。"""
     D = db.load_database()
     fitted = sum(1 for r in D.values() if (r.get("obj_n") or 0) > 0)
     n = 0
@@ -136,14 +137,14 @@ def ingest_new_records(new_sample_fn=None):
 
 
 def run_consolidation(new_sample_fn, max_rounds=24):
-    """数据库整理主流程（用户规格, 补采批量化）:
-      1) 按最优乘积 obj_max 降序;
-      2) 对第 K 名: 阈值 = 第 K-1 名 obj_max（K=1 用（max+1）/2）, P̃ = min(β尾概率, CP上界); 若 P̃×(N-K+2)>1 补采, 更新拟合与排名, 循环。
+    """数据库整理主流程（用户规格，补采批量化）：
+      1）按最优乘积 obj_max 降序；
+      2）对第 K 名：阈值 = 第 K-1 名 obj_max（K=1 用（max+1）/2），P̃ = min（β尾概率，CP上界）；若 P̃×(N-K+2)>1 补采，更新拟合与排名，循环。
 
-    补采以"批量真跑 AF3"实现, 两阶段循环（AF3 一次可打包多任务, chain-B MSA 每靶标只建一次, 逐条单跑太浪费）:
-      阶段1  consolidation_pass 配"只登记需求"的 sampler 跑到收敛: 免费消费各记录 pool 里的样本,并收集所有"池空但 P̃·N>M 仍成立"的记录;
-      阶段2  对登记需求批量真跑 AF3 生成新乘积样本, 全部挂进对应记录的 pool, 交下一轮 pass 按设计逐个消费、重排、再判; 直到无人达标、补采无果或补采批数用尽。
-    new_sample_fn: fn(tags) -> {tag: [新乘积样本]}（批量接口, 无法生成的 tag 不出现在结果里）; None 时只消费池内免费样本。
+    补采以“批量真跑 AF3”实现，两阶段循环（AF3 一次可打包多任务，chain-B MSA 每靶标只建一次，逐条单跑太浪费）：
+      阶段1  consolidation_pass 配“只登记需求”的 sampler 跑到收敛：免费消费各记录 pool 里的样本，并收集所有“池空但 P̃·N>M 仍成立”的记录；
+      阶段2  对登记需求批量真跑 AF3 生成新乘积样本，全部挂进对应记录的 pool，交下一轮 pass 按设计逐个消费、重排、再判；直到无人达标、补采无果或补采批数用尽。
+    new_sample_fn：fn(tags) -> {tag：[新乘积样本]}（批量接口，无法生成的 tag 不出现在结果里）；None 时只消费池内免费样本。
     返回 consolidation_pass 各轮统计之和 {"added", "rounds", "capped"}。"""
     max_batches = max(1, int(os.environ.get("PEPOPT_RESAMPLE_BATCHES", "2")))
     max_tags = max(1, int(os.environ.get("PEPOPT_RESAMPLE_TAGS", "2")))
@@ -161,7 +162,7 @@ def run_consolidation(new_sample_fn, max_rounds=24):
     for _ in range(max_rounds):
         demand = []
 
-        def sampler(tag):                 # 只登记需求; 样本由阶段2 批量补给 pool
+        def sampler(tag):                 # 只登记需求；样本由阶段2 批量补给 pool
             demand.append(tag)
             return None
 
@@ -178,7 +179,7 @@ def run_consolidation(new_sample_fn, max_rounds=24):
             fit = fits.get(tag)
             if fit is not None:
                 fit.pool.extend(float(v) for v in xs)
-        for rec in records:               # 每轮写回: 中途断电最多丢一轮
+        for rec in records:               # 每轮写回：中途断电最多丢一轮
             db.save_obj_stats(rec["tag"], rec["fit"])
     for rec in records:                   # 把更新后的统计量写回
         db.save_obj_stats(rec["tag"], rec["fit"])

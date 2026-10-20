@@ -1,8 +1,7 @@
 """
 小肽序列优化 — AlphaFold Server 云端预测后端库。
 
-仅当使用官方 AlphaFold Server 作为预测后端时导入本模块
-（入口: optimize_peptide_AF3.py；BO 入口加 --server）。
+仅当使用官方 AlphaFold Server 作为预测后端时导入本模块（入口：optimize_peptide_AF3.py；BO 入口加 --server）。
 
 云端专属内容：
   - 任务 JSON 生成与批量分批逻辑（af3_jobs/）
@@ -65,7 +64,7 @@ except ImportError:
 
     DAILY_LIMIT = 30
 
-    # 占位实现: 保证本库的公共接口在缺少 af3_automator 时依然完整，
+    # 占位实现：保证本库的公共接口在缺少 af3_automator 时依然完整，
     # 调用方无需做条件判断。
     def submit_batch_and_collect(json_file, wait=True, max_wait_minutes=120):
         print("  ⚠️  af3_automator 不可用，无法自动提交，请手动上传 JSON")
@@ -90,27 +89,27 @@ MAX_JOBS_PER_BATCH = 100            # 单次 JSON 上传最大任务数
 DAILY_LIMIT = 30                    # 每日免费配额（af3_automator 存在时被其覆盖）
 
 # 自动化模式开关
-AUTO_MODE = True                    # True=自动提交到AF3服务器, False=手动模式
+AUTO_MODE = True                    # True=自动提交到AF3服务器，False=手动模式
 
 # =====================================================================
 
 
 def predict_and_score(peptide_seq, target_seq, target_name, out_dir, auto_submit=True):
     """
-    预测 peptide_seq (小肽) 与 target_seq 的复合物，返回 (score, iptm, best_cif)。
+    预测 peptide_seq （小肽）与 target_seq 的复合物，返回 (score, iptm, best_cif)。
 
     工作流程：
       1. 生成 AF3 JSON 文件 → af3_jobs/
       2. 检查 af3_results/ 中是否已有对应结果 zip
       3. 如有结果则直接提取评分
-      4. 如无结果且 auto_submit=True: 自动提交到 AF3 Server，等待并下载
-      5. 如无结果且 auto_submit=False: 提示用户手动上传
+      4. 如无结果且 auto_submit=True：自动提交到 AF3 Server，等待并下载
+      5. 如无结果且 auto_submit=False：提示用户手动上传
 
     评分策略：score = 1 - iptm（值越小代表结合越强，与原版一致）
     同时记录 ranking_score 作为辅助参考。
 
-    target_name: 靶标名称（如 "HTR1A", "UNC13C", "BIN1"）
-    auto_submit: 是否尝试自动提交 (需要 af3_automator 模块和认证)
+    target_name：靶标名称（如 "HTR1A"，"UNC13C"，"BIN1"）
+    auto_submit：是否尝试自动提交（需要 af3_automator 模块和认证）
     """
     os.makedirs(out_dir, exist_ok=True)
     os.makedirs(JSON_OUTPUT_DIR, exist_ok=True)
@@ -184,7 +183,7 @@ def predict_and_score(peptide_seq, target_seq, target_name, out_dir, auto_submit
             print(f"  ⚠️  [{target_name}] 未完成认证，无法自动提交")
             print(f"  ⚠️  请先运行 setup_auth.py 完成首次登录")
 
-    # ---- 第4步：提示用户手动操作（当自动提交不可用时） ----
+    # ---- 第4步：提示用户手动操作（当自动提交不可用时）----
     print(f"  ⚠️  [{target_name}] 请在 AlphaFold Server 上传此 JSON 并运行预测")
     print(f"  ⚠️  登录 https://alphafoldserver.com/ → Upload JSON → 选择 {json_file}")
     print(f"  ⚠️  完成后下载结果 zip，重命名为 {job_name}.zip 放入 {RESULTS_DIR}/")
@@ -234,10 +233,10 @@ def batch_generate_all_json():
     批量生成当前 MC 步骤需要的所有 JSON 文件。
     同时尝试自动提交到 AlphaFold Server。
 
-    工作流程:
+    工作流程：
       1. 预生成所有突变序列
       2. 为每个序列×靶标生成 JSON
-      3. 自动分批提交到 AlphaFold Server (如果可用)
+      3. 自动分批提交到 AlphaFold Server （如果可用）
       4. 等待结果并下载
     """
     print("\n" + "=" * 60)
@@ -355,8 +354,7 @@ def check_results_status():
 
 def optimize_with_server(mc_steps=MC_STEPS, temperature=TEMPERATURE):
     """
-    云端版蒙特卡洛编排：检查自动化可用性与待处理任务，
-    然后调用通用 MC 主循环（预测函数 = 云端 predict_and_score）。
+    云端版蒙特卡洛编排：检查自动化可用性与待处理任务，然后调用通用 MC 主循环（预测函数 = 云端 predict_and_score）。
     """
     os.makedirs(JSON_OUTPUT_DIR, exist_ok=True)
     os.makedirs(RESULTS_DIR, exist_ok=True)

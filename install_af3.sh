@@ -7,10 +7,8 @@
 #   - Python 下限    ← 解析 pyproject.toml 的 requires-python
 #   - numpy pin      ← 解析 pyproject.toml 中的 numpy==x.y.z（如有）
 #   - cmake 版本     ← 解析 pyproject.toml 中 build-system 的 cmake 约束
-#   - sysroot 版本   ← `ldd --version` 读系统 glibc，再对 `conda search`
-#                      结果取「≤ 系统 glibc 的最高版本」
-#   - gcc 版本       ← `conda search` 全部候选，降序逐个安装并自检
-#                      （按探测到的 C++ 标准编译+链接+运行），失败自动降级重试
+#   - sysroot 版本   ← `ldd --version` 读系统 glibc，再对 `conda search` 结果取「≤ 系统 glibc 的最高版本」
+#   - gcc 版本       ← `conda search` 全部候选，降序逐个安装并自检（按探测到的 C++ 标准编译+链接+运行），失败自动降级重试
 #
 # 用法：
 #   bash install_af3.sh          # 前台运行
@@ -38,7 +36,7 @@ log "开始安装，完整日志: $LOG_FILE"
 source "$CONDA_ROOT/etc/profile.d/conda.sh" || die "无法加载 conda"
 conda activate "$ENV_NAME" || die "无法激活环境 $ENV_NAME（如不存在请先 conda create -n $ENV_NAME python=<项目要求版本>）"
 
-# ------------- 动态探测 1: 项目自身要求（从 AF3 源码解析） -------------
+# ------------- 动态探测 1：项目自身要求（从 AF3 源码解析）-------------
 CXX_STD="$(sed -nE 's/.*set[(]CMAKE_CXX_STANDARD[[:space:]]+([0-9]+)[)].*/\1/p' "$AF3_SRC/CMakeLists.txt" | head -1)"
 [[ -n "$CXX_STD" ]] || die "无法从 $AF3_SRC/CMakeLists.txt 解析 CMAKE_CXX_STANDARD"
 REQ_PY_SPEC="$(sed -nE 's/^requires-python[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' "$AF3_SRC/pyproject.toml" | head -1)"
@@ -74,11 +72,10 @@ for f in "/public_bme2/Share200T/管吉松/weights/af3.bin" \
 done
 log "✅ 权重与数据库可读性预检通过"
 
-# ------------- 动态探测 2: 系统 glibc → 选 conda sysroot -------------
+# ------------- 动态探测 2：系统 glibc → 选 conda sysroot -------------
 SYS_GLIBC="$(ldd --version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+' | tail -1)"
 [[ -n "$SYS_GLIBC" ]] || die "无法探测系统 glibc 版本"
-# 在 conda 可用的 sysroot 中取「≤ 系统 glibc 的最高版本」，保证链接符号本机存在
-# （若 sysroot 过高，产物会引用本机 glibc 没有的符号，运行/链接时报 undefined reference）
+# 在 conda 可用的 sysroot 中取「≤ 系统 glibc 的最高版本」，保证链接符号本机存在（若 sysroot 过高，产物会引用本机 glibc 没有的符号，运行/链接时报 undefined reference）
 SYSROOT_VER="$(conda search -c conda-forge sysroot_linux-64 2>/dev/null \
   | awk '/^sysroot_linux-64/ {print $2}' | sort -Vu | uniq \
   | awk -v g="$SYS_GLIBC" '{split($1,a,"."); split(g,b,".");
@@ -86,7 +83,7 @@ SYSROOT_VER="$(conda search -c conda-forge sysroot_linux-64 2>/dev/null \
 [[ -n "$SYSROOT_VER" ]] || die "conda-forge 无 ≤ 系统 glibc($SYS_GLIBC) 的 sysroot_linux-64"
 log "系统 glibc: $SYS_GLIBC → 选定 sysroot_linux-64=$SYSROOT_VER"
 
-# ------------- 动态探测 3: gcc 候选（降序逐个自检, 失败自动降级）-------------
+# ------------- 动态探测 3：gcc 候选（降序逐个自检，失败自动降级）-------------
 GCC_MAJORS="$(conda search -c conda-forge gcc_linux-64 2>/dev/null \
   | awk '/^gcc_linux-64/ {print $2}' | sort -Vru | awk -F. '{print $1}' | uniq)"
 [[ -n "$GCC_MAJORS" ]] || die "conda-forge 无可用 gcc_linux-64"

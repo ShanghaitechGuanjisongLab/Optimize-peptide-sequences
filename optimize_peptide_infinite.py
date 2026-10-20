@@ -37,8 +37,7 @@
 
 将来 UNC13C 解锁（申请到 A100/H100-80G）：
     PEPOPT_GPU_MAX_TOKENS=5120 PEPOPT_FLASH_ATTN=triton PEPOPT_XLA_7X=0 \
-    PEPOPT_PARTITION=<新分区> python optimize_peptide_infinite.py --targets HTR1A,BIN1,UNC13C
-  已入库序列只补算 UNC13C（HTR1A/BIN1 直接复用），refresh_best 自动按全约束重排。
+    PEPOPT_PARTITION=<新分区> python optimize_peptide_infinite.py --targets HTR1A,BIN1,UNC13C 已入库序列只补算 UNC13C（HTR1A/BIN1 直接复用），refresh_best 自动按全约束重排。
 """
 
 import os
@@ -71,7 +70,8 @@ OFF_TARGETS   = ["UNC13C", "BIN1"]               # 旧阶段底线蛋白（越�
 OFF_COL       = {"UNC13C": "iptm_unc13c", "BIN1": "iptm_bin1"}
 # 同源多聚体靶标的拷贝数（AF3 输入挂几个链 ID）；新阶段目标乘积的三因子
 TARGET_COPIES = {"ASIC1A": 3}
-PRODUCT_TARGETS = ["ASIC1A", "HTR1A", "BIN1"]   # 目标乘积 = 三者 ipTM 之积
+# 目标乘积因子：真源在 peptide_db.PRODUCT_TARGETS（**总开关**；2026-10-20 停算ASIC1A，目标 = ipTM(HTR1A)×ipTM(BIN1)），此处只转发不重复定义。
+PRODUCT_TARGETS = list(db.PRODUCT_TARGETS)
 
 DEFAULT_TARGETS      = "HTR1A,BIN1"              # 旧阶段默认（V100 搁置 UNC13C）
 OFF_THRESHOLD        = 0.8                       # 底线蛋白可行阈值
@@ -92,7 +92,7 @@ def _handle_stop(signum, frame):
     print(f"\n🛑 收到信号 {signum}, 本轮结束后优雅退出（已提交的 SLURM 作业继续运行, 重跑本脚本即续作）…", flush=True)
 
 
-# ===================== 候选池（按需无限扩展） =====================
+# ===================== 候选池（按需无限扩展）=====================
 
 class CandidateStream:
     """编辑距离 ≤2 变异序列的惰性无限流（去重，固定种子可复现）。"""
@@ -508,9 +508,13 @@ def harvest_and_report(active_targets, new_sample_fn=None):
           f"完整评估 {len(rows)} | 当前可行 {len(evaluable)}", flush=True)
     for r in best3:
         if r.get("objective") is not None:
-            print(f"     🏅 {r['peptide']}  乘积={r['objective']:.4f}  "
-                  f"(Asic1a={r['iptm_asic1a']:.2f} HTR1A={r['iptm_htr1a']:.2f} "
-                  f"BIN1={r['iptm_bin1']:.2f})", flush=True)
+            # 明细因子跟随 PRODUCT_TARGETS 开关：已停算的靶标值为 None，
+            # 直接按旧三靶标硬格式化会 TypeError（2026-10-20 停算 ASIC1A 后实测崩过）。
+            factors = " ".join(f"{t}={r[f'iptm_{t.lower()}']:.2f}"
+                               for t in PRODUCT_TARGETS
+                               if r.get(f"iptm_{t.lower()}") is not None)
+            print(f"     🏅 {r['peptide']}  乘积={r['objective']:.4f}  ({factors})",
+                  flush=True)
         else:
             cons = " ".join(f"{t}={r['cons'].get(OFF_COL[t])}" for t in active_targets
                             if t in OFF_COL)

@@ -2,37 +2,28 @@
 # =====================================================
 # 一键运行优化任务并实时输出进度（隐藏作业号等中间细节）
 #
-# 用法:
-#   ./run.sh            # 默认: 提交**单个长驻循环作业**（当前形态, 推荐）
-#   ./run.sh loop       # 同上（显式写法）; 计算节点作业内部无限循环搜索
+# 用法：
+#   ./run.sh            # 默认：提交**单个长驻循环作业**（当前形态，推荐）
+#   ./run.sh loop       # 同上（显式写法）；计算节点作业内部无限循环搜索
 #   ./run.sh stop       # 停止（scancel 循环作业 + 阻止看门狗续交）
 #   ./run.sh status     # 作业/看门狗状态 + 穷尽覆盖进度 + 数据库统计与 BEST_TOP10
-#   ./run.sh restart-loop # 改完代码后**在周期边界**优雅重启（新代码生效, 不废已完成周期）
+#   ./run.sh restart-loop # 改完代码后**在周期边界**优雅重启（新代码生效，不废已完成周期）
 #   ./run.sh watchdog   # 单独安装 cron 看门狗（loop 会自动装）
 #   ./run.sh no-watchdog# 卸载看门狗
-#   ./run.sh infinite   # 【legacy】登录节点常驻驱动形态（脆弱, 仅保留兼容）
-#   ./run.sh bo         # 有限预算贝叶斯优化（前台, output_bo*/）
-#   ./run.sh v100       # 同上, 但只跑 V100 放得下的 HTR1A+BIN1
+#   ./run.sh infinite   # 【legacy】登录节点常驻驱动形态（脆弱，仅保留兼容）
+#   ./run.sh bo         # 有限预算贝叶斯优化（前台，output_bo*/）
+#   ./run.sh v100       # 同上，但只跑 V100 放得下的 HTR1A+BIN1
 #   ./run.sh mc         # 蒙特卡洛 + 本地集群推理后端
 #   ./run.sh bo-server  # 贝叶斯优化 + AlphaFold Server 云端后端
 #   ./run.sh mc-server  # 蒙特卡洛 + AlphaFold Server 云端后端
 #
-# 两种形态的取舍（2026-10-04 定案, 详见 optimize_peptide_node.py 文件头）:
-#   - **loop（当前形态）**: sbatch 一个时限=分区 MaxTime（5 天）的作业, 搜索循环
-#     整个跑在**计算节点内部**（optimize_peptide_node.py）: 挑候选 → 跑 AF3 →
-#     收割入库 → 下一轮。登录节点**不留任何常驻进程**, 只有一个 cron 看门狗
-#     负责"队列里没这个作业了就再交一个"（正常每 5 天才动作一次）。
-#     可行性实测依据: PreemptMode=OFF 不被抢占; 分区无 MaxWall; --test-only 下
-#     48h/2天/3天/5天 的预计启动时间**完全相同** → 长时限不受精调度惩罚。
-#   - infinite（legacy）: 登录节点常驻 Python 驱动 + 反复 sbatch 小包。它脆弱:
-#     本机把所有交互进程塞进同一 cgroup `/system.slice/sshd.service` 且 loginctl
-#     查不到会话 → setsid 只换会话/进程组而**逃不出 cgroup** → 会话被清理时
-#     驱动无声消失（已发生两次, 一次 GPU 空转 8h22m、29 个结果滞盘未入库）。
-#   - 另注: 编排**不能**做成独立的计算节点作业——QoS MaxJobsPerUser=1 是运行
-#     并发上限, 编排作业会与 GPU 作业互斥（实测 --test-only 预测 24h 后才启动）。
-#     把编排塞进 GPU 作业内部循环, 正是为了绕开这个约束。
-#   - 云端后端: 提交轻量编排作业到计算节点, 实时跟踪其日志
-#   - Ctrl+C 只是停止查看进度, 已提交的计算任务仍会继续运行
+# 两种形态的取舍（2026-10-04 定案，详见 optimize_peptide_node.py 文件头）：
+#   - **loop（当前形态）**：sbatch 一个时限=分区 MaxTime（5 天）的作业，搜索循环整个跑在**计算节点内部**（optimize_peptide_node.py）：挑候选 → 跑 AF3→收割入库 → 下一轮。登录节点**不留任何常驻进程**，只有一个 cron 看门狗负责“队列里没这个作业了就再交一个”（正常每 5 天才动作一次）。
+#     可行性实测依据：PreemptMode=OFF 不被抢占；分区无 MaxWall；--test-only 下48h/2天/3天/5天的预计启动时间**完全相同** → 长时限不受精调度惩罚。
+#   - infinite（legacy）：登录节点常驻 Python 驱动 + 反复 sbatch 小包。它脆弱：
+#     本机把所有交互进程塞进同一 cgroup `/system.slice/sshd.service` 且loginctl查不到会话 → setsid 只换会话/进程组而**逃不出 cgroup** → 会话被清理时驱动无声消失（已发生两次，一次 GPU 空转 8h22m、29 个结果滞盘未入库）。
+#   - 另注：编排**不能**做成独立的计算节点作业——QoS MaxJobsPerUser=1 是运行并发上限，编排作业会与 GPU 作业互斥（实测 --test-only 预测 24h 后才启动）。把编排塞进 GPU 作业内部循环，正是为了绕开这个约束。
+#   - 云端后端：提交轻量编排作业到计算节点，实时跟踪其日志   - Ctrl+C 只是停止查看进度，已提交的计算任务仍会继续运行
 # =====================================================
 set -u
 cd "$(dirname "$0")"
@@ -49,7 +40,7 @@ BLOCK_END="# <<< pepopt-watchdog <<<"
 # ---- 【当前形态】单个长驻循环作业 ----
 LOOP_JOB_NAME="pepopt-loop"
 # 新阶段默认三靶标（目标 = ipTM(Asic1a)×ipTM(HTR1A)×ipTM(BIN1) 乘积最大）
-LOOP_TARGETS="${PEPOPT_TARGETS:-HTR1A,BIN1,ASIC1A}"
+LOOP_TARGETS="${PEPOPT_TARGETS:-HTR1A,BIN1}"   # 开关：2026-10-20 停算 ASIC1A
 LOOP_CYCLE_SEQS="${PEPOPT_CYCLE_SEQS:-24}"
 LOOP_DISABLED="$RUNS_DIR/loop.disabled"       # stop 写入 → 看门狗不再续交
 LOOP_WLOG="$RUNS_DIR/loop_watchdog.log"
@@ -61,8 +52,7 @@ DISABLED_FILE="$RUNS_DIR/infinite.disabled"
 WLOG="$RUNS_DIR/watchdog.log"
 WATCHDOG="$LOOP_WATCHDOG"                     # 看门狗已换代为监督循环作业
 
-# 存活判定: PID 在 + cmdline 确为本驱动（单看 PID 会被重用误导,
-# 导致“以为活着”而不拉起 → GPU 空转）
+# 存活判定：PID 在 + cmdline 确为本驱动（单看 PID 会被重用误导，导致“以为活着”而不拉起 → GPU 空转）
 driver_alive() {
   [[ -f "$PID_FILE" ]] || return 1
   local p; p="$(cat "$PID_FILE" 2>/dev/null)"
@@ -71,19 +61,18 @@ driver_alive() {
 }
 
 install_watchdog() {
-  local wd="${1:-$LOOP_WATCHDOG}"          # 默认监督循环作业; legacy 传驱动看门狗
+  local wd="${1:-$LOOP_WATCHDOG}"          # 默认监督循环作业；legacy 传驱动看门狗
   command -v crontab >/dev/null 2>&1 || { echo "⚠️  无 crontab, 无法装看门狗"; return 1; }
   [[ -f "$wd" ]] || { echo "⚠️  缺看门狗脚本 $wd"; return 1; }
   chmod +x "$wd" 2>/dev/null
   local tmp; tmp="$(mktemp)"
-  # 保留用户既有 crontab, 仅剔除我们上次装的标记块（幂等）
+  # 保留用户既有 crontab，仅剔除我们上次装的标记块（幂等）
   crontab -l 2>/dev/null | awk -v b="$BLOCK_BEGIN" -v e="$BLOCK_END" \
       'index($0,b){f=1;next} index($0,e){f=0;next} !f' > "$tmp"
   {
     echo "$BLOCK_BEGIN"
     echo "SHELL=/bin/bash"
-    # cron 环境 PATH 极简, 不含 SLURM(/opt/gridview/slurm/bin) 与 conda,
-    # 而驱动要调 sbatch/squeue/scontrol → 必须把登录时的完整 PATH 写进来。
+    # cron 环境 PATH 极简，不含 SLURM(/opt/gridview/slurm/bin) 与 conda，而驱动要调 sbatch/squeue/scontrol → 必须把登录时的完整 PATH 写进来。
     echo "PATH=$PATH"
     # 战役参数必须烙进 crontab 行：cron 无登录环境，缺省会读到默认 DB/靶标→续交的作业会打回旧库或跑错靶标（多战役并存时串库）。
     echo "PEPOPT_DB_ROOT=${PEPOPT_DB_ROOT:-/public_bme2/Share200T/管吉松/peptide_opt_db}"
@@ -118,9 +107,7 @@ uninstall_watchdog() {
 loop_jobs() { squeue -u "$USER" -h -n "$LOOP_JOB_NAME" -o '%i' 2>/dev/null | tr '\n' ' '; }
 loop_log()  { ls -t "$RUNS_DIR"/loop_*.out 2>/dev/null | head -1; }
 # 按 jobid 定位循环作业日志（sbatch 为 --output=runs/loop_%j.out）。
-# loop_log() 取"最近修改"的日志, 在新作业还 PENDING（日志未创建）时会
-# 错误地指向上一个已结束作业 → 把人引到死文件上。本函数优先返回活跃
-# 作业的日志, 不存在时退回 loop_log() 并说明原因。
+# loop_log() 取“最近修改”的日志，在新作业还 PENDING（日志未创建）时会错误地指向上一个已结束作业 → 把人引到死文件上。本函数优先返回活跃作业的日志，不存在时退回 loop_log() 并说明原因。
 active_loop_log() {
   local jid="$1" lg="$RUNS_DIR/loop_${1}.out"
   [[ -n "$jid" && -f "$lg" ]] && { echo "$lg"; return 0; }
@@ -142,8 +129,8 @@ kill_legacy_driver() {
 submit_loop() {
   source ~/miniconda3/etc/profile.d/conda.sh
   conda activate base
-  # submit_loop_job 内部会做预检查(PREFLIGHT_OK)并自行避免重复提交;
-  # 若 QoS 提交窗口被旧 bundle 作业占满而失败, 看门狗会在窗口空出后自动补交。
+  # submit_loop_job 内部会做预检查(PREFLIGHT_OK)并自行避免重复提交；
+  # 若 QoS 提交窗口被旧 bundle 作业占满而失败，看门狗会在窗口空出后自动补交。
   python -u - <<PY
 import re
 import sys
@@ -173,9 +160,7 @@ start_loop() {
   echo
   echo "♾️  无限搜索由**单个计算节点作业**承担, 登录节点不再需要常驻进程:"
   echo "   🗄️  数据库: $DB_ROOT"
-  # 日志路径按 jobid 推算（sbatch 用 --output=runs/loop_%j.out），而不是取
-  # "最近修改的 loop_*.out"：新作业还在 PENDING 时它的日志尚未创建，后者会
-  # 错误地指向上一个已结束作业的日志，把人引到死文件上。
+  # 日志路径按 jobid 推算（sbatch 用 --output=runs/loop_%j.out），而不是取 “最近修改的 loop_*.out”：新作业还在 PENDING 时它的日志尚未创建，后者会错误地指向上一个已结束作业的日志，把人引到死文件上。
   local lg jid
   jid="${j%% *}"; jid="${jid// /}"
   if [[ -n "$jid" ]]; then
@@ -229,10 +214,8 @@ else:
 PY
 }
 
-# 在**周期边界**优雅重启循环作业 → 让新代码生效, 不浪费已完成周期的计算。
-# 必要性: 正在跑的作业已把 .py 载入内存, 改源文件对它无效; 直接 scancel 则会
-# 丢掉当前周期尚未算完的任务。标志由 optimize_peptide_node.run_loop 在每轮
-# 开头消费(取走后 break), cron 看门狗 ≤5min 内续交加载了新代码的作业。
+# 在**周期边界**优雅重启循环作业 → 让新代码生效，不浪费已完成周期的计算。
+# 必要性：正在跑的作业已把 .py 载入内存，改源文件对它无效；直接 scancel 则会丢掉当前周期尚未算完的任务。标志由 optimize_peptide_node.run_loop 在每轮开头消费（取走后 break），cron 看门狗 ≤5min 内续交加载了新代码的作业。
 restart_loop() {
   local j; j="$(loop_jobs)"
   if [[ -z "${j// /}" ]]; then
@@ -297,17 +280,16 @@ start_infinite() {
     echo "   日志: tail -f \"$RUNS_DIR\"/infinite_*.log | ./run.sh stop 停止"
     exit 0
   fi
-  rm -f "$PID_FILE" "$DISABLED_FILE" 2>/dev/null   # 清理陈旧状态, 重新允许自愈
+  rm -f "$PID_FILE" "$DISABLED_FILE" 2>/dev/null   # 清理陈旧状态，重新允许自愈
   mkdir -p "$RUNS_DIR"
   local ts; ts=$(date +%Y%m%d_%H%M%S)
   local log="$RUNS_DIR/infinite_${ts}.log"
   source ~/miniconda3/etc/profile.d/conda.sh
   conda activate base
-  # --migrate: 把家目录旧结果迁入共享库（幂等, 已迁过会自动跳过）
-  # 后台日志由共享库的 runs/ 目录持久化, 计算节点与登录节点都可见。
-  # 注: setsid 只能脱离会话/进程组, 逃不出 sshd.service 的 cgroup（实测）,
-  #   故仍需 cron 看门狗兵托（见 scripts/driver_watchdog.sh 文件头）。
-  #   setsid→nohup→python 为 exec 链, 不换 PID, 故 $! 即真实 python PID。
+  # --migrate：把家目录旧结果迁入共享库（幂等，已迁过会自动跳过）
+  # 后台日志由共享库的 runs/ 目录持久化，计算节点与登录节点都可见。
+  # 注：setsid 只能脱离会话/进程组，逃不出 sshd.service 的 cgroup（实测），故仍需 cron 看门狗兵托（见 scripts/driver_watchdog.sh 文件头）。
+  #   setsid→nohup→python 为 exec 链，不换 PID，故 $！即真实 python PID。
   setsid nohup python -u optimize_peptide_infinite.py --migrate "$@" \
         </dev/null >"$log" 2>&1 &
   local pid=$!
@@ -324,7 +306,7 @@ start_infinite() {
 }
 
 stop_infinite() {
-  # 先立标, 避免 5 分钟内 cron 看门狗把刚停掉的驱动又拉起来
+  # 先立标，避免 5 分钟内 cron 看门狗把刚停掉的驱动又拉起来
   mkdir -p "$RUNS_DIR"; date '+%F %T' > "$DISABLED_FILE"
   if ! driver_alive; then
     echo "无限搜索未在运行。"
@@ -365,7 +347,7 @@ status_infinite() {
   python -u optimize_peptide_infinite.py --status
 }
 
-# ---- 本地集群推理后端(有限入口): 编排跑在登录节点, 进度实时输出 ----
+# ---- 本地集群推理后端（有限入口）：编排跑在登录节点，进度实时输出 ----
 run_local() {
   local entry="$1"; shift
   source ~/miniconda3/etc/profile.d/conda.sh
@@ -420,20 +402,20 @@ fi
 jobid=${jobid%%;*}
 echo "🚀 ${NAME}任务已提交，进入队列…"
 
-final_state() {   # 用 sacct 取作业最终状态(权威), 避免 squeue 竞态
+final_state() {   # 用 sacct 取作业最终状态（权威），避免 squeue 竞态
   sacct -j "$jobid" -o State -n -P 2>/dev/null | head -1 | awk '{print $1}'
 }
-batch_done() {    # .batch 步 COMPLETED 意味着输出已刷盘, 可以安全读取日志
+batch_done() {    # .batch 步 COMPLETED 意味着输出已刷盘，可以安全读取日志
   sacct -j "${jobid}.batch" -o State -n -P 2>/dev/null | head -1 | grep -q COMPLETED
 }
 
-# ---- 等待日志出现(作业可能很快跑完, 最长等 10 分钟; 结束后靠 sacct 判定) ----
+# ---- 等待日志出现（作业可能很快跑完，最长等 10 分钟；结束后靠 sacct 判定）----
 for i in $(seq 1 300); do
   if [[ -s "$out" ]]; then break; fi
   fs=$(final_state)
   case "$fs" in
     COMPLETED|FAILED|CANCELLED*|TIMEOUT|NODE_FAIL)
-      # 作业已结束: 若仍无日志, 给一点缓冲再退出
+      # 作业已结束：若仍无日志，给一点缓冲再退出
       sleep 1; break ;;
   esac
   sleep 2
@@ -457,8 +439,7 @@ if [[ -s "$out" ]]; then
   cleanup; wait "$tailpid" 2>/dev/null
   echo "------------------------------------------------------"
 else
-  # 作业很快结束: 输出经共享文件系统回写有延迟, 耐心等它落盘
-  # (.batch 步 COMPLETED 且文件非空 = 输出已收集完毕)
+  # 作业很快结束：输出经共享文件系统回写有延迟，耐心等它落盘（.batch 步 COMPLETED 且文件非空 = 输出已收集完毕）
   for i in $(seq 1 30); do
     [[ -s "$out" ]] && batch_done && break
     sleep 3

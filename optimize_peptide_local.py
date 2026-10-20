@@ -21,24 +21,20 @@
 
 使用步骤：
   1. 首次准备（一次性，大部分已自动处理）：
-     a) 推理环境: conda 环境 af3_old 已含 alphafold3 + jax
-        若缺 hmm 工具: conda install -n af3_old -c bioconda hmmer
-     b) 驱动依赖: 运行本脚本的环境需要 pandas / matplotlib / openpyxl
-        pip install pandas matplotlib openpyxl
-     c) 数据库: 共享目录中是压缩的 .zst 文件; 首次运行会自动提交一个解压作业到计算节点异步执行，无需保持 SSH 连接，解压完成后重跑本脚本即可继续。
-  2. 运行:
+     a）推理环境：conda 环境 af3_old 已含 alphafold3 + jax 若缺 hmm 工具：conda install -n af3_old -c bioconda hmmer b）驱动依赖：运行本脚本的环境需要 pandas / matplotlib / openpyxl
+        pip install pandas matplotlib openpyxl c）数据库：共享目录中是压缩的 .zst 文件；首次运行会自动提交一个解压作业到计算节点异步执行，无需保持 SSH 连接，解压完成后重跑本脚本即可继续。
+  2. 运行：
         conda activate base      # 或任意装好驱动依赖的环境
-        python optimize_peptide_local.py
-     首次运行会为初始序列×3 个靶标提交推理作业；作业完成后重跑本脚本即可自动评分并继续推进（支持断点续跑）。
+        python optimize_peptide_local.py 首次运行会为初始序列×3 个靶标提交推理作业；作业完成后重跑本脚本即可自动评分并继续推进（支持断点续跑）。
 
 检查策略：入口的预检查只做提示、不会退出——即使资源尚未就绪也会照常运行流程：已完成的旧结果仍可被评分复用，新的提交失败会打印原因，补齐条件后重跑即可。
 
-数据库自动准备（异步在计算节点解压，无需保持 SSH 连接）:
-  预检查发现数据库缺失时:
+数据库自动准备（异步在计算节点解压，无需保持 SSH 连接）：
+  预检查发现数据库缺失时：
     1. 先读取各 .zst 帧头汇总预计解压体积，用 statvfs 检查目标盘剩余空间，不足（低于预计体积×1.05）则中止并提示；
     2. 通过后把解压作为 SLURM 作业提交到计算节点异步执行（--prepare-db 模式），提交后即可断开 SSH；用 tail -f db_prep_<jobid>.out 查看进度，完成后重跑继续。
-  解压目标: /public_bme2/Share200T/管吉松/databases/alphafold3（家目录有 ~500G NFS 配额放不下, 用共享大容量目录, 计算节点可见）。
-  环境变量: SKIP_DB_PREPARE=1 跳过自动解压。
+  解压目标：/public_bme2/Share200T/管吉松/databases/alphafold3（家目录有 ~500G NFS 配额放不下，用共享大容量目录，计算节点可见）。
+  环境变量：SKIP_DB_PREPARE=1 跳过自动解压。
 
 合规提示：AlphaFold3 模型权重与输出受官方条款约束（见 /public_bme2/Share200T/管吉松/AlphaFold3/WEIGHTS_TERMS_OF_USE.md），仅限非商业学术用途。
 """
@@ -74,33 +70,33 @@ from peptide_common import create_af3_json, run_monte_carlo, ROOT_DIR
 AF3_CODE_DIR   = "/public_bme2/Share200T/管吉松/AlphaFold3"         # 本地 AF3 代码目录
 LOCAL_MODEL_DIR = "/public_bme2/Share200T/管吉松/weights"        # 含 af3.bin 权重文件的目录
 
-# 数据库: 共享目录中是压缩的 .zst 文件（只读）; 预检查发现缺失时会先检查磁盘空间,再把解压作为作业提交到计算节点异步执行。
-# 注意: 家目录有 ~500G NFS 配额(不够放全量数据库), 必须放共享大容量目录。
+# 数据库：共享目录中是压缩的 .zst 文件（只读）；预检查发现缺失时会先检查磁盘空间，再把解压作为作业提交到计算节点异步执行。
+# 注意：家目录有 ~500G NFS 配额（不够放全量数据库），必须放共享大容量目录。
 SHARED_DB_SRC = "/public_bme2/Share200T/AlphaFold3/DB_DIR/alphafold3"
 LOCAL_DB_DIR  = "/public_bme2/Share200T/管吉松/databases/alphafold3"
 
-# AF3 的数据管线构造时会解析全部数据库路径, 即使纯蛋白体系也要求 RNA 库文件存在（仅在含 RNA 链时真正参与搜索）, 因此下列文件均为必需。
+# AF3 的数据管线构造时会解析全部数据库路径，即使纯蛋白体系也要求 RNA 库文件存在（仅在含 RNA 链时真正参与搜索），因此下列文件均为必需。
 DB_FASTA_FILES = [
     "uniref90_2022_05.fa",                       # 主 MSA 库 (UniRef90)
     "bfd-first_non_consensus_sequences.fasta",   # 深度补充 MSA 库 (BFD)
     "mgy_clusters_2022_05.fa",                   # 宏基因组补充库 (MGnify)
-    "uniprot_all_2021_04.fa",                    # 链间 MSA 配对 (UniProt全量)
+    "uniprot_all_2021_04.fa",                    # 链间 MSA 配对（UniProt全量）
     "pdb_seqres_2022_09_28.fasta",               # 模板搜索序列索引 (PDB)
     "nt_rna_2023_02_23_clust_seq_id_90_cov_80_rep_seq.fasta",     # RNA 库
     "rfam_14_9_clust_seq_id_90_cov_80_rep_seq.fasta",             # RNA 库
     "rnacentral_active_seq_id_90_cov_80_linclust.fasta",          # RNA 库
 ]
-DB_MMCIF_ARCHIVE = "pdb_2022_09_28_mmcif_files.tar.zst"   # 解压为目录: <DB>/mmcif_files/
+DB_MMCIF_ARCHIVE = "pdb_2022_09_28_mmcif_files.tar.zst"   # 解压为目录：<DB>/mmcif_files/
 
-# 本地推理结果目录。环境变量 PEPOPT_RESULTS_DIR 可覆盖（无限搜索/共享库模式把它指向共享目录 <PEPOPT_DB_ROOT>/af3_results, 结果直接落共享盘）。
-# 必须是绝对路径: 计算节点在 AF3_WORK_DIR(仓库目录)下解析相对路径，家目录相对路径在共享盘场景会指错位置。
+# 本地推理结果目录。环境变量 PEPOPT_RESULTS_DIR 可覆盖（无限搜索/共享库模式把它指向共享目录 <PEPOPT_DB_ROOT>/af3_results，结果直接落共享盘）。
+# 必须是绝对路径：计算节点在 AF3_WORK_DIR（仓库目录）下解析相对路径，家目录相对路径在共享盘场景会指错位置。
 LOCAL_RESULTS_DIR = os.environ.get("PEPOPT_RESULTS_DIR", "").strip() \
     or os.path.join(os.path.dirname(os.path.abspath(__file__)), "af3_local_results")
 
-# 外置作业脚本目录: SLURM 实际执行的 .sh 脚本存放处, 不再把 shell 内嵌进 Python 字符串
+# 外置作业脚本目录：SLURM 实际执行的 .sh 脚本存放处，不再把 shell 内嵌进 Python 字符串
 SCRIPTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts")
 
-# SLURM 资源配置（每个"序列×靶标"为一个推理任务, 多任务打包进单个作业）
+# SLURM 资源配置（每个“序列×靶标”为一个推理任务，多任务打包进单个作业）
 # PEPOPT_PARTITION 可覆盖（将来申请到 A100/H100 分区时切换）
 LOCAL_PARTITION = os.environ.get("PEPOPT_PARTITION", "").strip() or "bme_gpupub"
 LOCAL_ACCOUNT   = "v-jiamh"                   # SLURM 账户（无此分区/账户组合会被拒）
@@ -110,20 +106,19 @@ LOCAL_TIME      = "48:00:00"                  # 单个作业最长时限（打�
 
 
 # ---------------------------------------------------------------------
-# 分区 QoS 自动探测（关键: 可用 GPU 数不由分区总卡数决定, 而由 QoS 决定）
+# 分区 QoS 自动探测（关键：可用 GPU 数不由分区总卡数决定，而由 QoS 决定）
 # ---------------------------------------------------------------------
-# 分区总容量 16×V100 是**公共**的, 但分区自带 QoS 对每个用户硬限资源:
+# 分区总容量 16×V100 是**公共**的，但分区自带 QoS 对每个用户硬限资源：
 #   partition_bme_gpupub: MaxTRESPU=cpu=8,gres/gpu=1  MaxJobsPerUser=1
 #                         MaxSubmitJobsPerUser=2
-# 即**每用户峰值只有 1 张 GPU / 8 CPU**, 同时 1 个作业在跑 + 1 个排队。
-# 管理员策略, 代码无法绕过; 超限作业不会报错而是**永远 PENDING**(QOSMaxTRESPULimit / QOSMaxJobsPerUserLimit), 因此必须主动钳制。
+# 即**每用户峰值只有 1 张 GPU / 8 CPU**，同时 1 个作业在跑 + 1 个排队。
+# 管理员策略，代码无法绕过；超限作业不会报错而是**永远 PENDING**(QOSMaxTRESPULimit / QOSMaxJobsPerUserLimit)，因此必须主动钳制。
 
 
 def _probe_qos_limits(partition="bme_gpupub"):
-    """读分区的 QoS 限制 → {gpu, cpu, running, submit}; 探测失败返回保守默认。
+    """读分区的 QoS 限制 → {gpu, cpu, running, submit}；探测失败返回保守默认。
 
-    running = MaxJobsPerUser（可同时运行）, submit = MaxSubmitJobsPerUser
-    （运行+排队总数）。gpu/cpu 取自 MaxTRESPU 的 gres/gpu 与 cpu（每用户合计）。"""
+    running = MaxJobsPerUser（可同时运行），submit = MaxSubmitJobsPerUser （运行+排队总数）。gpu/cpu 取自 MaxTRESPU 的 gres/gpu 与 cpu（每用户合计）。"""
     limits = {"gpu": 1, "cpu": 8, "running": 1, "submit": 2}
     try:
         part = subprocess.run(["scontrol", "show", "partition", partition],
@@ -158,10 +153,9 @@ QOS_LIMITS = _probe_qos_limits(LOCAL_PARTITION)
 
 
 def _env_int(name, default):
-    """读整数环境变量: 未设/空串用默认, 非法值告警后用默认。
+    """读整数环境变量：未设/空串用默认，非法值告警后用默认。
 
-    注意不能用 `os.environ.get(name, "0") or default` 的写法 —— 字符串 "0"
-    是真值, 会把默认值吃掉（实际踩过: BUNDLE_SIZE 被错置为 1）。"""
+    注意不能用 `os.environ.get(name, "0") or default` 的写法 —— 字符串 "0" 是真值，会把默认值吃掉（实际踩过：BUNDLE_SIZE 被错置为 1）。"""
     v = os.environ.get(name, "").strip()
     if not v:
         return default
@@ -172,10 +166,10 @@ def _env_int(name, default):
         return default
 
 
-# 单作业 GPU 数: QoS 的 gpu 上限是**每用户所有运行中作业的合计**, 故平分给可同时
-# 运行的作业数。当前 1÷1=1（包内任务串行, runner 的 stage1_parallel 不启用）;
-# 管理员放开 MaxTRESPU 后本值自动变大 → 每作业多卡并行, 无需改代码。
-# PEPOPT_GPUS_PER_JOB 可手动指定（仍被 QoS 上限钳制, 避免永远 PENDING）。
+# 单作业 GPU 数：QoS 的 gpu 上限是**每用户所有运行中作业的合计**，故平分给可同时
+# 运行的作业数。当前 1÷1=1（包内任务串行，runner 的 stage1_parallel 不启用）；
+# 管理员放开 MaxTRESPU 后本值自动变大 → 每作业多卡并行，无需改代码。
+# PEPOPT_GPUS_PER_JOB 可手动指定（仍被 QoS 上限钳制，避免永远 PENDING）。
 _GPU_SHARE = max(1, QOS_LIMITS["gpu"] // max(1, QOS_LIMITS["running"]))
 _want_gpu = max(0, _env_int("PEPOPT_GPUS_PER_JOB", 0))
 if _want_gpu > QOS_LIMITS["gpu"]:
@@ -188,54 +182,54 @@ LOCAL_GPUS_PER_JOB = max(1, min(_want_gpu, QOS_LIMITS["gpu"])) if _want_gpu else
 LOCAL_CPUS_PER_GPU = max(1, min(LOCAL_CPUS, QOS_LIMITS["cpu"] // LOCAL_GPUS_PER_JOB))
 
 # 每条 GPU 流喂给 jackhmmer/nhmmer 的线程数。
-# 实测 MSA 占总时长 ~85%, 是绝对的临界路径; 而 QoS 给了 8 CPU 却只用 6 是浪费。
-# AF3 用 pyhmmer(OpenMP 多线程), 数据管线阶段主线程阻塞等待, 并不额外抢 CPU,
+# 实测 MSA 占总时长 ~85%，是绝对的临界路径；而 QoS 给了 8 CPU 却只用 6 是浪费。
+# AF3 用 pyhmmer（OpenMP 多线程），数据管线阶段主线程阻塞等待，并不额外抢 CPU，
 # 故线程数 = 全部可用 CPU 最优（不再像早期版本那样留 2 核余量）。
 # PEPOPT_MSA_CPUS 可覆盖。
 MSA_CPUS_PER_GPU = max(1, _env_int("PEPOPT_MSA_CPUS", LOCAL_CPUS_PER_GPU))
 
-# 单个作业打包的任务数。**这是 1 卡限额下最大的吞吐杠杆**, 依据实测(2026-10-03,
-# bme_gpu09, V100-SXM2, 6 任务包 2h)的 MSA/推理拆解:
-#   chain B(靶标) MSA: HTR1A 1738s + BIN1 1555s ≈ 55min **每进程只建一次**(包内复用);
-#   chain A(肽)    MSA: ~670s **每个不同肽都要重算**(不可摊销, 占大头);
-#   推理: HTR1A 93s / BIN1 230s, 仅占总时长 ~14%。
-# 关键: chain B 的两个靶标序列恒定不变, 但 MSA 缓存(data/pipeline.py 的
-# functools.cache)作用域仅单个 python 进程 → 每个作业都要白重建 55min。
-# 故包越大, 这 55min 摊得越薄。按实测值建模的**单序列**成本 3293/N + 1010s:
-#   N=3(包6)  → 2108s   N=6(包12)  → 1559s   N=12(包24) → 1284s
-#   N=24(包48)→ 1147s   N=48(包96) → 1079s   N=∞        → 1010s
-# 取 48（24 序列×2 靶标, 约 7.7h/包, 分区 MaxTime=5 天绰绰有余）: 比包 24 提升
-# 12% 吞吐; 再大一档只多 6%, 却要 14.4h/包且降低 GP 反馈频率, 不划算。
-# 注意: 提交的 --time 恒为 LOCAL_TIME(48h), 与包大小无关, 故加大包不会增加排队等待。
+# 单个作业打包的任务数。**这是 1 卡限额下最大的吞吐杠杆**，依据实测（2026-10-03，
+# bme_gpu09，V100-SXM2，6 任务包 2h）的 MSA/推理拆解：
+#   chain B（靶标）MSA：HTR1A 1738s + BIN1 1555s ≈ 55min **每进程只建一次**（包内复用）；
+#   chain A（肽）MSA：~670s **每个不同肽都要重算**（不可摊销，占大头）；
+#   推理：HTR1A 93s / BIN1 230s，仅占总时长 ~14%。
+# 关键：chain B 的两个靶标序列恒定不变，但 MSA 缓存（data/pipeline.py 的
+# functools.cache）作用域仅单个 python 进程 → 每个作业都要白重建 55min。
+# 故包越大，这 55min 摊得越薄。按实测值建模的**单序列**成本 3293/N + 1010s：
+#   N=3（包6）→ 2108s   N=6（包12）→ 1559s   N=12（包24）→ 1284s
+#   N=24（包48）→ 1147s   N=48（包96）→ 1079s   N=∞        → 1010s
+# 取 48（24 序列×2 靶标，约 7.7h/包，分区 MaxTime=5 天绰绰有余）：比包 24 提升
+# 12% 吞吐；再大一档只多 6%，却要 14.4h/包且降低 GP 反馈频率，不划算。
+# 注意：提交的 --time 恒为 LOCAL_TIME(48h)，与包大小无关，故加大包不会增加排队等待。
 # PEPOPT_BUNDLE_SIZE 可覆盖。
 BUNDLE_SIZE     = max(1, _env_int("PEPOPT_BUNDLE_SIZE", 48))
-# 提交窗口 = QoS 允许的运行+排队总数: 用满它可让下个作业在上个作业结束
+# 提交窗口 = QoS 允许的运行+排队总数：用满它可让下个作业在上个作业结束
 # 的瞬间接续（零空隙），又不会因超限而被拒
 MAX_INFLIGHT    = max(1, QOS_LIMITS["submit"])
 
-# 单个任务的最大 token 数。超出者注定显存溢出, 提交前直接拦截, 避免白烧机时。
-# 依据 AlphaFold3 官方 docs/performance.md 的硬件上限（均指已启用 unified memory）:
-#   V100 (CUDA 算力 7.x) -> 1,280 tokens   <- 当前 bme_gpupub 分区全是 V100 32GB
-#   A100 40GB            -> 4,352 tokens（还需改 model_config.py 的 pair_transition_shard_spec）
-#   A100/H100 80GB       -> 官方支持全尺寸（默认最大 bucket 5,120 tokens）
-# 官方 1,280 是"保证不溢出"的保守值而非硬上限: 实测 Asic1a 三聚体 1,597 tokens 在V100-32GB上真跑成功（unified memory 溢出到主机内存, ≈2735s/5样本, 计时注释见 optimize_peptide_node.py）,故闸门设 2048: 放行 Asic1a（1,597）, 仍拦截 UNC13C（≈2,233, 维持搁置）。
-# 若申请到 A100/H100-80G: 设环境变量 PEPOPT_GPU_MAX_TOKENS=5120 与
-# PEPOPT_FLASH_ATTN=triton（见下）, 并把 runner 的 AF3_NEED_XLA_7X_FLAG 置 0,
-# 即可补齐 UNC13C; 代码无需改动。
+# 单个任务的最大 token 数。超出者注定显存溢出，提交前直接拦截，避免白烧机时。
+# 依据 AlphaFold3 官方 docs/performance.md 的硬件上限（均指已启用 unified memory）：
+#   V100 （CUDA 算力 7.x）-> 1，280 tokens   <- 当前 bme_gpupub 分区全是 V100 32GB
+#   A100 40GB            -> 4，352 tokens（还需改 model_config.py 的 pair_transition_shard_spec）
+#   A100/H100 80GB       -> 官方支持全尺寸（默认最大 bucket 5，120 tokens）
+# 官方 1，280 是“保证不溢出”的保守值而非硬上限：实测 Asic1a 三聚体 1，597 tokens 在V100-32GB上真跑成功（unified memory 溢出到主机内存，≈2735s/5样本，计时注释见 optimize_peptide_node.py），故闸门设 2048：放行 Asic1a（1，597），仍拦截 UNC13C（≈2，233，维持搁置）。
+# 若申请到 A100/H100-80G：设环境变量 PEPOPT_GPU_MAX_TOKENS=5120 与
+# PEPOPT_FLASH_ATTN=triton（见下），并把 runner 的 AF3_NEED_XLA_7X_FLAG 置 0，
+# 即可补齐 UNC13C；代码无需改动。
 GPU_MAX_TOKENS  = int(os.environ.get("PEPOPT_GPU_MAX_TOKENS", "") or 2048)
 
-# flash attention 实现（对应 run_alphafold.py 的 --flash_attention_implementation）:
-#   "xla"    : 不用 flash attention, 跨设备可用, 但注意力显存 O(N^2)。
+# flash attention 实现（对应 run_alphafold.py 的 --flash_attention_implementation）：
+#   "xla"：不用 flash attention，跨设备可用，但注意力显存 O(N^2)。
 #              CUDA 算力 7.x（V100/T4）**必须**用此值（AF3 会强制校验）。
-#   "triton" : 真正的 flash attention, 显存 O(N) 且更快, 但需 Ampere（算力 8.0+,
-#              即 A100/H100）。A100-80G 上换成 triton 后, 大体系不再受显存平方律限制。
-#   "cudnn"  : cuDNN 实现, 同样需 Ampere, 测试不如 triton 充分。
+#   "triton"：真正的 flash attention，显存 O(N) 且更快，但需 Ampere（算力 8.0+，
+#              即 A100/H100）。A100-80G 上换成 triton 后，大体系不再受显存平方律限制。
+#   "cudnn"：cuDNN 实现，同样需 Ampere，测试不如 triton 充分。
 FLASH_ATTENTION_IMPL = os.environ.get("PEPOPT_FLASH_ATTN", "").strip() or "xla"
-# CUDA 算力 7.x (V100/T4) 需要给 JAX 注入禁用 HLO 融合通道的 XLA_FLAGS;
-# Ampere+ (A100/H100) 不需要, 置 "0" 跳过。PEPOPT_XLA_7X=0 可覆盖默认值。
+# CUDA 算力 7.x (V100/T4) 需要给 JAX 注入禁用 HLO 融合通道的 XLA_FLAGS；
+# Ampere+ (A100/H100) 不需要，置 "0" 跳过。PEPOPT_XLA_7X=0 可覆盖默认值。
 NEED_XLA_7X_FLAG = os.environ.get("PEPOPT_XLA_7X", "1") == "1"
 
-# token 数超限的任务不提交, 写入此标记, 以免每次重跑都重复刷警告
+# token 数超限的任务不提交，写入此标记，以免每次重跑都重复刷警告
 OOM_SKIP_MARKER = ".oom_skipped"
 
 # hmm 工具（jackhmmer/nhmmer/hmmalign/hmmsearch/hmmbuild）所在目录；
@@ -252,7 +246,7 @@ FORCE_RESUBMIT  = os.environ.get("FORCE_RESUBMIT", "0") == "1"   # 强制重提�
 # ---------------- 数据库自动解压 ----------------
 
 def zstd_content_size(path):
-    """从 zstd 帧头解析解压后体积（只读文件前 ≤18 字节, 瞬时完成）。
+    """从 zstd 帧头解析解压后体积（只读文件前 ≤18 字节，瞬时完成）。
     解析失败返回 None（帧头未记录内容大小时会发生）。"""
     try:
         with open(path, "rb") as f:
@@ -267,7 +261,7 @@ def zstd_content_size(path):
     dict_flag = fhd & 0x03                 # Dictionary_ID_Flag
     pos = 5
     if not single_segment:
-        pos += 1                           # Window_Descriptor (1 字节)
+        pos += 1                           # Window_Descriptor （1 字节）
     pos += {0: 0, 1: 1, 2: 2, 3: 4}[dict_flag]
     if fcs_flag == 0:
         if not single_segment:
@@ -283,13 +277,12 @@ def zstd_content_size(path):
     return value + 256 if fcs_flag == 1 else value
 
 
-# PDB 2022-09 全量约 20 万个 .cif; 顶层铺开的 .cif 少于此数视为解压不完整
+# PDB 2022-09 全量约 20 万个 .cif；顶层铺开的 .cif 少于此数视为解压不完整
 MMCIF_MIN_CIFS = 100000
 
 
 def mmcif_ready():
-    """mmCIF 模板库就绪判定: 有完成标记, 或顶层已铺开足够 .cif
-    （仅看目录存在会把残缺解压误判为就绪）。"""
+    """mmCIF 模板库就绪判定：有完成标记，或顶层已铺开足够 .cif （仅看目录存在会把残缺解压误判为就绪）。"""
     mmcif_dir = os.path.join(LOCAL_DB_DIR, "mmcif_files")
     if not os.path.isdir(mmcif_dir):
         return False
@@ -318,8 +311,8 @@ def database_ready():
 
 
 def prepare_database():
-    """解压共享目录中的压缩数据库: 先检查磁盘空间, 不足则中止；
-    够用则逐项解压（中断后重跑自动续作, 不留半个文件）。返回是否全部就绪。
+    """解压共享目录中的压缩数据库：先检查磁盘空间，不足则中止；
+    够用则逐项解压（中断后重跑自动续作，不留半个文件）。返回是否全部就绪。
     本函数在计算节点上由 '--prepare-db' 作业调用（见 submit_db_prep_job）。"""
     os.makedirs(LOCAL_DB_DIR, exist_ok=True)
 
@@ -381,7 +374,7 @@ def prepare_database():
                 if os.path.exists(tmp):
                     os.remove(tmp)
                 continue
-            os.replace(tmp, dst)   # 原子改名, 避免残留半个文件被误认为就绪
+            os.replace(tmp, dst)   # 原子改名，避免残留半个文件被误认为就绪
         else:
             os.makedirs(dst, exist_ok=True)
             log_path = os.path.join(LOCAL_DB_DIR, ".mmcif_uncompress.log")
@@ -407,8 +400,7 @@ def prepare_database():
 
 
 def db_prep_job_state():
-    """查询数据库解压作业状态。返回 (state, jobid)，
-    state ∈ none/pending/running/done/failed/unknown。"""
+    """查询数据库解压作业状态。返回 (state, jobid)，state ∈ none/pending/running/done/failed/unknown。"""
     marker = os.path.join(LOCAL_DB_DIR, ".db_prep_submitted")
     if not os.path.isfile(marker):
         return "none", None
@@ -419,7 +411,7 @@ def db_prep_job_state():
         return "none", None
     if not jobid:
         return "none", None
-    # 先查 squeue（活动作业的权威来源, 无记账延迟）; 不在队列再用 sacct 查终态
+    # 先查 squeue（活动作业的权威来源，无记账延迟）；不在队列再用 sacct 查终态
     try:
         out = subprocess.run(["squeue", "-j", jobid, "-h", "-o", "%T"],
                              capture_output=True, text=True, timeout=15)
@@ -449,7 +441,7 @@ def db_prep_job_state():
 
 def follow_db_prep_job(jobid):
     """实时跟踪解压作业进度直到结束（Ctrl+C 退出跟踪不影响作业运行）。
-    检测到解压作业在运行时应转入本函数的进度回报, 而不是继续后续步骤。"""
+    检测到解压作业在运行时应转入本函数的进度回报，而不是继续后续步骤。"""
     out_file = os.path.join(LOCAL_DB_DIR, f"db_prep_{jobid}.out")
     print(f"\n⏳ 检测到解压作业正在运行 (jobid={jobid})，转入实时进度跟踪…")
     print(f"   日志: {out_file}")
@@ -480,19 +472,19 @@ def follow_db_prep_job(jobid):
 
 def submit_db_prep_job():
     """把数据库解压作为 SLURM 作业提交到计算节点异步执行；
-    提交后即可断开 SSH，无需维持连接。返回正在执行/新提交的 jobid, 否则 None。"""
+    提交后即可断开 SSH，无需维持连接。返回正在执行/新提交的 jobid，否则 None。"""
     os.makedirs(LOCAL_DB_DIR, exist_ok=True)
     marker = os.path.join(LOCAL_DB_DIR, ".db_prep_submitted")
 
     state, jobid = db_prep_job_state()
     if state in ("pending", "running"):
-        return jobid                      # 已在跑, 由调用方转入进度跟踪
+        return jobid                      # 已在跑，由调用方转入进度跟踪
     if state in ("done", "failed", "unknown") and os.path.isfile(marker):
         print(f"📦 上次解压作业已结束 ({state}, jobid={jobid})，清理陈旧标记后重新提交。")
         os.remove(marker)
 
-    # 作业脚本外置于 scripts/db_prep_runner.sh；SLURM 资源走参数, 配置走 --export,
-    # Python 侧不再内嵌 shell, 也不生成临时 .sbatch 文件。
+    # 作业脚本外置于 scripts/db_prep_runner.sh；SLURM 资源走参数，配置走 --export，
+    # Python 侧不再内嵌 shell，也不生成临时 .sbatch 文件。
     repo_dir = os.path.dirname(os.path.abspath(__file__))
     runner = os.path.join(SCRIPTS_DIR, "db_prep_runner.sh")
     env_pairs = [
@@ -530,7 +522,7 @@ def submit_db_prep_job():
 
 # =====================================================================
 
-# 预检查状态: 未通过时 submit_local_job 会跳过提交，
+# 预检查状态：未通过时 submit_local_job 会跳过提交，
 # 避免向队列投递注定失败的 GPU 作业
 PREFLIGHT_OK = False
 
@@ -585,8 +577,7 @@ def preflight_check():
 
 
 def ensure_local_ready():
-    """本地推理就绪保障: 预检查 → 若解压作业运行中则转入其实时进度回报
-    （不继续后续步骤）→ 完成后复查。返回 (ok, errors)。
+    """本地推理就绪保障：预检查 → 若解压作业运行中则转入其实时进度回报（不继续后续步骤）→ 完成后复查。返回 (ok, errors)。
     本地入口与 BO 入口共用此函数。"""
     ok, errors = preflight_check()
     state, jobid = db_prep_job_state()
@@ -633,10 +624,7 @@ def _summary_in(d):
 def find_summary_json(result_dir):
     """在 AF3 输出目录中查找 *_summary_confidences.json。
 
-    AF3 向已存在且非空的输出目录写结果时, 会另建 <名>_YYYYMMDD_HHMMSS/ 兄弟
-    目录以免覆盖（本流程为打包提交预先在 result_dir 写了 input.json, 故输出常落在
-    兄弟目录）。因此同时搜索 result_dir 及其时间戳兄弟, 避免把已完成任务误判为
-    "未完成"而重复提交重跑。"""
+    AF3 向已存在且非空的输出目录写结果时，会另建 <名>_YYYYMMDD_HHMMSS/ 兄弟目录以免覆盖（本流程为打包提交预先在 result_dir 写了 input.json，故输出常落在兄弟目录）。因此同时搜索 result_dir 及其时间戳兄弟，避免把已完成任务误判为 “未完成”而重复提交重跑。"""
     s = _summary_in(result_dir)
     if s:
         return s
@@ -705,20 +693,14 @@ def queue_depth():
 def build_bundle_sbatch_cmd(bundle_id, bundle_dir):
     """构建提交打包推理作业的 sbatch 命令（返回 argv 列表）。
 
-    作业脚本外置于 scripts/af3_bundle_runner.sh（两阶段容错逻辑见该文件头注释）;
-    SLURM 资源指令走命令行参数, 作业配置走 --export 环境变量,
-    Python 侧不内嵌任何 shell 脚本字符串。
+    作业脚本外置于 scripts/af3_bundle_runner.sh（两阶段容错逻辑见该文件头注释）；
+    SLURM 资源指令走命令行参数，作业配置走 --export 环境变量，Python 侧不内嵌任何 shell 脚本字符串。
 
-    **提交的是 runner 的快照副本**（复制进 bundle 目录, 命名下划线开头以免被
-    收割/打包逻辑当作任务）。原因: bash 边读边执行、按字节偏移回读脚本, 而
-    编辑器写文件是**原地截断重写**（inode 不变）——若在作业运行期间修改
-    scripts/ 下的 runner, 正在执行的作业会在下一条命令处读到错位内容而
-    语法崩溃或行为失控。快照副本让作业与本仓库后续改动完全解耦
-    （2026-10-04 实测踩到, 当时靠临时回滚救回运行中的作业）。"""
+    **提交的是 runner 的快照副本**（复制进 bundle 目录，命名下划线开头以免被收割/打包逻辑当作任务）。原因：bash 边读边执行、按字节偏移回读脚本，而编辑器写文件是**原地截断重写**（inode 不变）——若在作业运行期间修改 scripts/ 下的 runner，正在执行的作业会在下一条命令处读到错位内容而语法崩溃或行为失控。快照副本让作业与本仓库后续改动完全解耦（2026-10-04 实测踩到，当时靠临时回滚救回运行中的作业）。"""
     work_dir = os.path.dirname(os.path.abspath(__file__))
     src_runner = os.path.join(SCRIPTS_DIR, "af3_bundle_runner.sh")
     runner = os.path.join(os.path.abspath(bundle_dir), "_runner_snapshot.sh")
-    shutil.copyfile(src_runner, runner)          # 快照: 与仓库后续修改解耦
+    shutil.copyfile(src_runner, runner)          # 快照：与仓库后续修改解耦
     os.chmod(runner, 0o755)
     n_gpu = LOCAL_GPUS_PER_JOB
     cpu_total = LOCAL_CPUS_PER_GPU * n_gpu            # 合计不超 QoS 的 cpu 上限
@@ -757,18 +739,18 @@ def build_bundle_sbatch_cmd(bundle_id, bundle_dir):
 
 
 # =====================================================================
-# 单作业无限循环形态（推荐; 见 scripts/af3_loop_job.sh 文件头的取舍理由）
+# 单作业无限循环形态（推荐；见 scripts/af3_loop_job.sh 文件头的取舍理由）
 # ---------------------------------------------------------------------
-# 旧形态是"登录节点常驻驱动 + 反复 sbatch 小包"。它的结构性缺陷：
+# 旧形态是“登录节点常驻驱动 + 反复 sbatch 小包”。它的结构性缺陷：
 #   ① 登录节点进程脆弱 —— 本机把所有交互进程塞进同一 cgroup
-#      (/system.slice/sshd.service), setsid 逃不出去, 会话被清理即无声消失
-#      （已发生两次, 其中一次 GPU 空转 8h22m、29 个结果滞留未入库）;
-#   ② QoS MaxJobsPerUser=1 是**运行并发**上限 → 编排作业与计算作业互斥,
+#      (/system.slice/sshd.service)，setsid 逃不出去，会话被清理即无声消失
+#      （已发生两次，其中一次 GPU 空转 8h22m、29 个结果滞留未入库）；
+#   ② QoS MaxJobsPerUser=1 是**运行并发**上限 → 编排作业与计算作业互斥，
 #      故也不能把编排做成一个独立的计算节点作业。
-# 解法 = 把整个搜索放进**一个长驻作业内部循环**（optimize_peptide_node.py）:
-#   分区 MaxTime=5 天、PreemptMode=OFF（不被抢占）, 且 --test-only 实测
+# 解法 = 把整个搜索放进**一个长驻作业内部循环**（optimize_peptide_node.py）：
+#   分区 MaxTime=5 天、PreemptMode=OFF（不被抢占），且 --test-only 实测
 #   48h/2天/3天/5天 的预计启动时间**完全相同** → 长时限不受精调度惩罚。
-#   登录节点从此不留常驻进程, 只有一个 cron 看门狗负责"5 天到期/意外死亡
+#   登录节点从此不留常驻进程，只有一个 cron 看门狗负责"5 天到期/意外死亡
 #   后再交一个作业"。
 # =====================================================================
 
@@ -778,7 +760,7 @@ DEFAULT_MAX_HOURS_FALLBACK = 120.0   # 探测分区 MaxTime 失败时的回退�
 
 
 def probe_partition_max_hours(fallback=DEFAULT_MAX_HOURS_FALLBACK):
-    """读分区 MaxTime → 小时数（向下取整到整点）; 探测失败返回 fallback。"""
+    """读分区 MaxTime → 小时数（向下取整到整点）；探测失败返回 fallback。"""
     try:
         out = subprocess.run(["scontrol", "show", "partition", LOCAL_PARTITION],
                              capture_output=True, text=True, timeout=20).stdout
@@ -810,11 +792,9 @@ def loop_job_active():
 def _check_export_pairs(env_pairs):
     """校验 `--export=a,b,c` 的各值不得含逗号。
 
-    SLURM 的 --export 列表自身以**逗号**分隔, 若某个值内部含逗号（如
-    `PEPOPT_TARGETS=HTR1A,BIN1`）, SLURM 会把它截断成 `PEPOPT_TARGETS=HTR1A`
-    加一个孤立的 `BIN1` → 参数**静默丢失**且不报错。
-    2026-10-04 实测踩到: 已跑起的 5 天作业因此只算 HTR1A, BIN1 约束全丢。
-    故在提交前就报错, 不让它变成一个跑几天才被发现的数据事故。"""
+    SLURM 的 --export 列表自身以**逗号**分隔，若某个值内部含逗号（如 `PEPOPT_TARGETS=HTR1A,BIN1`），SLURM 会把它截断成 `PEPOPT_TARGETS=HTR1A` 加一个孤立的 `BIN1` → 参数**静默丢失**且不报错。
+    2026-10-04 实测踩到：已跑起的 5 天作业因此只算 HTR1A，BIN1 约束全丢。
+    故在提交前就报错，不让它变成一个跑几天才被发现的数据事故。"""
     for kv in env_pairs:
         if "," in kv:
             raise ValueError(
@@ -824,12 +804,10 @@ def _check_export_pairs(env_pairs):
 
 
 def build_loop_job_cmd(targets, cycle_seqs, max_hours=None):
-    """构建"单个长驻循环作业"的 sbatch 命令（返回 argv 列表）。
+    """构建“单个长驻循环作业”的 sbatch 命令（返回 argv 列表）。
 
-    资源与 bundle 作业一致（受 QoS 的 gpu=1 / cpu=8 钳制）, 但时限取分区
-    MaxTime（默认 5 天）, 并把 MaxTime-余量 作为 Python 侧时间预算下发,
-    使作业能自适应地把最后一轮排满、到期前优雅退出（而非被 SLURM 掐断）。"""
-    import peptide_db as db                       # 延迟导入: 保持本模块可独立使用
+    资源与 bundle 作业一致（受 QoS 的 gpu=1 / cpu=8 钳制），但时限取分区 MaxTime（默认 5 天），并把 MaxTime-余量 作为 Python 侧时间预算下发，使作业能自适应地把最后一轮排满、到期前优雅退出（而非被 SLURM 掐断）。"""
+    import peptide_db as db                       # 延迟导入：保持本模块可独立使用
     p = db.paths(ensure=True)
     runs = os.path.join(p["root"], "runs")
     os.makedirs(runs, exist_ok=True)
@@ -841,7 +819,7 @@ def build_loop_job_cmd(targets, cycle_seqs, max_hours=None):
     n_gpu = LOCAL_GPUS_PER_JOB
     cpu_total = LOCAL_CPUS_PER_GPU * n_gpu
     mem_total = f"{int(LOCAL_MEMORY.rstrip('Gg')) * n_gpu}G"
-    # ⭐ 靶标用 '+' 而非 ',' 分隔（见 _check_export_pairs）; node 入口两种都认
+    # ⭐ 靶标用 '+' 而非 ',' 分隔（见 _check_export_pairs）；node 入口两种都认
     targets_s = "+".join(targets)
     env_pairs = [
         f"PEPOPT_DB_ROOT={p['root']}",
@@ -877,7 +855,7 @@ def build_loop_job_cmd(targets, cycle_seqs, max_hours=None):
 
 
 def submit_loop_job(targets, cycle_seqs, max_hours=None):
-    """提交长驻循环作业; 已在队列中则不重复提交。返回 jobid 或 None。"""
+    """提交长驻循环作业；已在队列中则不重复提交。返回 jobid 或 None。"""
     if not PREFLIGHT_OK:
         print("  ⏸️  预检查未通过, 跳过提交（请先补齐数据库/权重/工具条件）")
         return None
@@ -925,10 +903,10 @@ def estimate_tokens(input_json_path):
 
 
 def submit_pending_bundle():
-    """把积压任务打包成一个作业提交（集群每用户在途作业有限, 打包提高吞吐）。
-    自动跳过在途任务; 作业已终结但无结果的任务会清理标记后重新排队（失败自动重试）。
-    token 数超过 GPU_MAX_TOKENS 的任务注定 OOM, 直接拦截不提交, 避免白烧机时。
-    返回新提交的作业号, 无提交则 None。"""
+    """把积压任务打包成一个作业提交（集群每用户在途作业有限，打包提高吞吐）。
+    自动跳过在途任务；作业已终结但无结果的任务会清理标记后重新排队（失败自动重试）。
+    token 数超过 GPU_MAX_TOKENS 的任务注定 OOM，直接拦截不提交，避免白烧机时。
+    返回新提交的作业号，无提交则 None。"""
     if not PREFLIGHT_OK:
         print("  ⏸️  预检查未通过, 跳过提交, 请先补齐数据库/工具条件")
         return None
@@ -941,7 +919,7 @@ def submit_pending_bundle():
                 continue
             if find_summary_json(d) or not os.path.isfile(os.path.join(d, "input.json")):
                 continue
-            # token 预检: 超出当前 GPU 官方上限者必然 OOM, 拦截并留痕（仅首次警告）
+            # token 预检：超出当前 GPU 官方上限者必然 OOM，拦截并留痕（仅首次警告）
             oom_marker = os.path.join(d, OOM_SKIP_MARKER)
             tk = estimate_tokens(os.path.join(d, "input.json"))
             if tk > GPU_MAX_TOKENS:
@@ -961,8 +939,8 @@ def submit_pending_bundle():
                     jid = ""
                 st = job_state(jid)
                 if st in ("pending", "running") and not FORCE_RESUBMIT:
-                    continue                  # 在途, 不重复打包
-                os.remove(marker)             # 终结但无结果 → 失败, 重新排队
+                    continue                  # 在途，不重复打包
+                os.remove(marker)             # 终结但无结果 → 失败，重新排队
             pending.append((name, d))
 
     if not pending:
@@ -972,7 +950,7 @@ def submit_pending_bundle():
         return None
 
     bundle = pending[:BUNDLE_SIZE]
-    # 攒批: 未满一包且队列仍有作业在跑时, 继续积压以提高单作业吞吐
+    # 攒批：未满一包且队列仍有作业在跑时，继续积压以提高单作业吞吐
     if len(bundle) < BUNDLE_SIZE and queue_depth() > 0:
         print(f"  📦 攒批中: 已积压 {len(pending)}/{BUNDLE_SIZE} 个任务"
               "（满包或队列空闲时提交）")
@@ -1019,12 +997,11 @@ def local_predict_and_score(peptide_seq, target_seq, target_name, out_dir,
                             auto_submit=True, verbose=True):
     """
     服务器版 predict_and_score 的本地替身：
-      - 已有结果 → 提取评分并返回 (score, iptm, zip路径)
+      - 已有结果 → 提取评分并返回（score，iptm，zip路径）
       - 已提交未完成 → 返回 (None, None, None)，等下次重跑
-      - 未提交 → 生成并提交本地作业，返回 (None, None, None)
-    verbose=False 时不打印逐靶标评分行（无限搜索入口自己有收割日志）。
+      - 未提交 → 生成并提交本地作业，返回 (None, None, None) verbose=False 时不打印逐靶标评分行（无限搜索入口自己有收割日志）。
     """
-    job_name = os.path.basename(out_dir).lower()   # AF3 的 sanitised_name() 转小写, 必须一致
+    job_name = os.path.basename(out_dir).lower()   # AF3 的 sanitised_name() 转小写，必须一致
     result_dir = os.path.join(LOCAL_RESULTS_DIR, job_name)
     os.makedirs(result_dir, exist_ok=True)
 
@@ -1039,7 +1016,7 @@ def local_predict_and_score(peptide_seq, target_seq, target_name, out_dir,
                 print(f"  📊 [{target_name}] 该靶标界面 ipTM={iptm:.3f} | "
                       f"score={score} (=1-ipTM, 优化目标, 越小越好) | "
                       f"ranking={scores['ranking_score']:.3f} (AF3综合分, 仅供参考)")
-            # 结果可能在 AF3 的时间戳兄弟目录: 以含 summary 的顶层目录为打包源,
+            # 结果可能在 AF3 的时间戳兄弟目录：以含 summary 的顶层目录为打包源，
             # 保证 zip 非空（规范目录仅 input.json 时尤其重要）。
             src_root = result_dir
             try:
@@ -1068,7 +1045,7 @@ def local_predict_and_score(peptide_seq, target_seq, target_name, out_dir,
 
 
 def job_queue_info(jobid):
-    """查询作业的排队/运行信息: 状态 + SLURM 预计启动时间。"""
+    """查询作业的排队/运行信息：状态 + SLURM 预计启动时间。"""
     state = job_state(jobid)
     start = ""
     try:
@@ -1127,7 +1104,7 @@ if __name__ == "__main__":
     print("🧬 AlphaFold3 本地推理 — 蒙特卡洛肽优化")
     print("=" * 60)
 
-    # 就绪保障: 预检查 + 解压作业实时进度跟随（运行中则等待，不继续后续步骤）
+    # 就绪保障：预检查 + 解压作业实时进度跟随（运行中则等待，不继续后续步骤）
     ok, errors = ensure_local_ready()
 
     if not ok:

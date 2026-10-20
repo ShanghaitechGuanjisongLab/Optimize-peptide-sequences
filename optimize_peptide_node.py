@@ -1,83 +1,40 @@
 """
-小肽序列优化 — **计算节点内**的无限循环作业入口（单作业版, 无需登录节点常驻）
+小肽序列优化 — **计算节点内**的无限循环作业入口（单作业版，无需登录节点常驻）
 =============================================================
-为什么是这个形态（2026-10-04 定案, 用户提问纠偏后）：
+为什么是这个形态（2026-10-04 定案，用户提问纠偏后）：
 
-  此前的形态是"登录节点常驻 Python 驱动 + 反复 sbatch 小包作业"。它有两个
-  结构性缺陷:
-    1) **登录节点进程脆弱**: 本机把所有交互进程塞进同一个 cgroup
-       `/system.slice/sshd.service`, 且 `who` / `loginctl` 查不到会话 →
-       `setsid` 只能换会话/进程组而**逃不出该 cgroup**。VS Code 会话被清理时
-       驱动**无声消失**（无异常栈、无退出日志）。已发生两次, 其中一次造成
-       GPU 空转 8h22m、29 个已算完的结果滞留磁盘未入库。
-    2) **QoS 使编排作业与计算作业互斥**: `partition_bme_gpupub` 的
-       `MaxJobsPerUser=1` 是**运行并发**上限, 而分区 QoS 未给 MaxWall
-       → 单作业最长可跑 `MaxTime=5 天`, 且 `PreemptMode=OFF`（不会被抢占）。
-       实测 `--test-only` 下 48h / 2天 / 3天 / 5天 的预计启动时间**完全相同**
-       → 申请长时限**不受精调度/回填惩罚**（瓶颈是 QoS 运行槽, 不是节点空间）。
-       因此把整个搜索放进**一个长驻作业**里循环, 就不必在计算节点 sbatch
-       下一包, 也不必在登录节点留任何进程。
+  此前的形态是“登录节点常驻 Python 驱动 + 反复 sbatch 小包作业”。它有两个结构性缺陷：
+    1）**登录节点进程脆弱**：本机把所有交互进程塞进同一个 cgroup `/system.slice/sshd.service`，且 `who` / `loginctl` 查不到会话 →`setsid`只能换会话/进程组而**逃不出该 cgroup**。VS Code 会话被清理时驱动**无声消失**（无异常栈、无退出日志）。已发生两次，其中一次造成GPU空转 8h22m、29 个已算完的结果滞留磁盘未入库。
+    2）**QoS 使编排作业与计算作业互斥**：`partition_bme_gpupub` 的`MaxJobsPerUser=1`是**运行并发**上限，而分区 QoS 未给 MaxWall→单作业最长可跑 `MaxTime=5 天`，且 `PreemptMode=OFF`（不会被抢占）。实测 `--test-only` 下 48h / 2天 / 3天 / 5天 的预计启动时间**完全相同**→申请长时限**不受精调度/回填惩罚**（瓶颈是 QoS 运行槽，不是节点空间）。因此把整个搜索放进**一个长驻作业**里循环，就不必在计算节点 sbatch下一包，也不必在登录节点留任何进程。
 
-  形态对比:
-    旧: 登录节点常驻驱动 → sbatch 48 任务包 → 每 7.6h 重新排队/被调度
-    新: sbatch **一个** 5 天作业 → 作业内部循环 {挑候选 → 跑 AF3 → 收割入库}
-        登录节点只留一个 cron 看门狗, 职责退化为"队列里没作业了就再交一个"
-        （每 5 天才触发一次; 它只跑 squeue/sbatch, 几秒即退, 极难出错）
+  形态对比：
+    旧：登录节点常驻驱动 → sbatch 48 任务包 → 每 7.6h 重新排队/被调度新：sbatch **一个** 5 天作业 → 作业内部循环 {挑候选 → 跑 AF3 → 收割入库} 登录节点只留一个 cron 看门狗，职责退化为“队列里没作业了就再交一个”（每 5 天才触发一次；它只跑 squeue/sbatch，几秒即退，极难出错）
 
-循环内部为何仍要"分批"跑 AF3（而不是一口气喂几千条）：
-  贝叶斯优化需要**已完成的评估结果**来拟合 GP 并挑选下一批候选。若把整个
-  候选池一次性丢给 AF3, 就退化成纯随机搜索、失去引导。故每轮（cycle）大小
-  = `CYCLE_SEQS`（默认 24 序列 = 48 任务 ≈ 7.7h）, 轮与轮之间做 GP 反馈。
-  这个尺寸同时是最优摊销点: chain B(靶标) 的 MSA 是**每进程**重建一次的
-  固定开销 ≈ 55min（HTR1A 1738s + BIN1 1555s, 实测）, 而 MSA 缓存
-  (`data/pipeline.py` 的 `functools.cache`) 作用域仅限单个 python 进程 →
-  轮太大则 GP 反馈太慢, 轮太小则 55min 摊不薄。单序列成本 ≈ 3293/N + 1010s,
-  N=24 时 1147s（比 N=3 的 2108s 快 46%, 距渐近线 1010s 仅差 14%）。
+循环内部为何仍要“分批”跑 AF3（而不是一口气喂几千条）：
+  贝叶斯优化需要**已完成的评估结果**来拟合 GP 并挑选下一批候选。若把整个候选池一次性丢给 AF3，就退化成纯随机搜索、失去引导。故每轮（cycle）大小=`CYCLE_SEQS`（默认 24 序列 = 48 任务 ≈ 7.7h），轮与轮之间做 GP 反馈。
+  这个尺寸同时是最优摊销点：chain B（靶标）的 MSA 是**每进程**重建一次的固定开销 ≈ 55min（HTR1A 1738s + BIN1 1555s，实测），而 MSA 缓存（`data/pipeline.py` 的 `functools.cache`）作用域仅限单个 python 进程→轮太大则 GP 反馈太慢，轮太小则 55min 摊不薄。单序列成本 ≈ 3293/N + 1010s，N=24时 1147s（比 N=3 的 2108s 快 46%，距渐近线 1010s 仅差 14%）。
 
 时间预算自适应：
-  作业临近 5 天上限时, 最后一轮按剩余时间**反向定尺寸**（能塞几个序列就塞
-  几个）, 把 GPU 用到极限而不是提前空停; 完成后正常退出, 由看门狗续交下一个
-  5 天作业（间隙 ≤ 5min）。被 SLURM 掐断也只损失"当前正在算的 1 个任务"
-  —— 已完成任务的结果早就逐个落在共享盘上, 下一个作业的收割阶段即入库。
+  作业临近 5 天上限时，最后一轮按剩余时间**反向定尺寸**（能塞几个序列就塞几个），把 GPU 用到极限而不是提前空停；完成后正常退出，由看门狗续交下一个5天作业（间隙 ≤ 5min）。被 SLURM 掐断也只损失“当前正在算的 1 个任务”——已完成任务的结果早就逐个落在共享盘上，下一个作业的收割阶段即入库。
 
-候选从哪来（2026-10-04 第二次定案: 穷尽队列取代随机采样）：
-  旧形态用 `CandidateStream` 随机采样 + "重试并排除已评估"取候选。它有两个
-  结构性缺陷, 都在实测中被量化过:
-    1) **候选池是抽样的, 不是全集**: 每周期只撒 ~720 个随机点做 GP 排序,
-       argmax 是在这个子集上取的, 不是在整个搜索空间上取的;
-    2) **随机采样有 665 条序列永远采不到**（`generate_mutant` 的模式B 只做
-       单次插入或删除, 故"净长度不变的插入+删除"两步编辑生成不出来）。
-  现改为 `ExhaustiveQueue`: 候选全集 = `peptide_common.enumerate_space()`
-  精确枚举的 51091 条（编辑距离 ≤2、长 6~10、20 种标准氨基酸）, 每周期从
-  「全集 − 已派发台账」里按 GP 的 cEI 次序取 24 条。由此得到三条**可证明**的
-  性质（详见该类文档）: 不重复、每周期待办精确定量递减、至多 2129 个周期
-  ≈ 680 天必然全覆盖。GP 只决定"先跑谁", 对覆盖保证零贡献 —— 即便 GP 完全
-  失效, 次序退化为字典序游标, 上述性质依然成立。
-  代价护栏: 全空间打分实测仅 ≈1s（故 SCORE_POOL_CAP 默认 0 = 不限制）; 真正
-  的瓶颈是 GP 拟合的 O(n_train^3)（4000 条已 52s, 外推 5 万条 ≈9.6h > 周期
-  预算）, 故 TRAIN_CAP=2000 做确定性分层子采样, best_y 仍取全量最优。
+候选从哪来（2026-10-04 第二次定案：穷尽队列取代随机采样）：
+  旧形态用 `CandidateStream` 随机采样 + “重试并排除已评估”取候选。它有两个结构性缺陷，都在实测中被量化过：
+    1）**候选池是抽样的，不是全集**：每周期只撒 ~720 个随机点做 GP 排序，argmax是在这个子集上取的，不是在整个搜索空间上取的；
+    2）**随机采样有 665 条序列永远采不到**（`generate_mutant` 的模式B 只做单次插入或删除，故“净长度不变的插入+删除”两步编辑生成不出来）。
+  现改为 `ExhaustiveQueue`：候选全集 = `peptide_common.enumerate_space()`精确枚举的 51091 条（编辑距离 ≤2、长 6~10、20 种标准氨基酸），每周期从「全集 − 已派发台账」里按 GP 的 cEI 次序取 24 条。由此得到三条**可证明**的性质（详见该类文档）：不重复、每周期待办精确定量递减、至多 2129 个周期≈680 天必然全覆盖。GP 只决定“先跑谁”，对覆盖保证零贡献 —— 即便 GP 完全失效，次序退化为字典序游标，上述性质依然成立。
+  代价护栏：全空间打分实测仅 ≈1s（故 SCORE_POOL_CAP 默认 0 = 不限制）；真正的瓶颈是 GP 拟合的 O(n_train^3)（4000 条已 52s，外推 5 万条 ≈9.6h > 周期预算），故 TRAIN_CAP=2000 做确定性分层子采样，best_y 仍取全量最优。
 
 优雅重启（换代码用）：
-  正在运行的作业已把 .py 载入内存, **改源文件对它无效**。要把新代码投出去,
-  在 `<db_root>/runs/` 下放一个名为 `restart.requested` 的空文件
-  （`run.sh restart-loop`）即可: 作业会在**下一个周期起点**正常退出, 由 cron
-  看门狗 ≤5min 内续交新作业。已完成周期的结果早已收割入库, 因此不丢数据,
-  唯一代价是新作业首轮重建 chain-B MSA（实测 ≈55min）。标志会被自动消费,
-  不会让续交的作业又立刻退出。
+  正在运行的作业已把 .py 载入内存，**改源文件对它无效**。要把新代码投出去，在 `<db_root>/runs/` 下放一个名为 `restart.requested` 的空文件（`run.sh restart-loop`）即可：作业会在**下一个周期起点**正常退出，由 cron看门狗 ≤5min 内续交新作业。已完成周期的结果早已收割入库，因此不丢数据，唯一代价是新作业首轮重建 chain-B MSA（实测 ≈55min）。标志会被自动消费，不会让续交的作业又立刻退出。
 
-运行方式（都由 run.sh 封装, 手动亦可）：
-    sbatch <resource flags> --export=ALL,PEPOPT_MAX_HOURS=118,... \\
-        scripts/af3_loop_job.sh
-    # 登录节点直接调试（会占用 QoS 运行槽, 仅在队列空时用）：
+运行方式（都由 run.sh 封装，手动亦可）：
+    sbatch <resource flags> --export=ALL,PEPOPT_MAX_HOURS=118……\\ scripts/af3_loop_job.sh
+    # 登录节点直接调试（会占用 QoS 运行槽，仅在队列空时用）：
     PEPOPT_MAX_HOURS=0.05 python optimize_peptide_node.py --targets HTR1A,BIN1
 
 依赖的环境分工（实测）：
-    conda base   : sklearn / pandas / matplotlib（编排、GP、入库）
-    conda af3_old: jax 0.4.34 / alphafold3 / jackhmmer（AF3 推理）—— **无**
-                   sklearn、pandas, 故两套环境必须并存; 本脚本在 base 下运行,
-                   并把 AF3 那一步整体委托给 scripts/af3_bundle_runner.sh
-                   （它自己 conda activate af3_old）。这样两环境互不污染,
-                   也复用了 runner 里已验证过的两阶段容错与输出折叠逻辑。
+    conda base：sklearn / pandas / matplotlib（编排、GP、入库）
+    conda af3_old：jax 0.4.34 / alphafold3 / jackhmmer（AF3 推理）—— **无**sklearn、pandas，故两套环境必须并存；本脚本在 base 下运行，并把 AF3 那一步整体委托给scripts/af3_bundle_runner.sh（它自己 conda activate af3_old）。这样两环境互不污染，也复用了 runner 里已验证过的两阶段容错与输出折叠逻辑。
 """
 
 import os
@@ -99,7 +56,7 @@ import peptide_db as db
 os.environ.setdefault("PEPOPT_RESULTS_DIR", db.results_dir())
 
 import optimize_peptide_local as loc
-loc.LOCAL_RESULTS_DIR = db.results_dir()          # 防御: 强制对齐到共享库
+loc.LOCAL_RESULTS_DIR = db.results_dir()          # 防御：强制对齐到共享库
 
 import optimize_peptide_infinite as inf          # 复用候选流/启发式挑选/收割报告
 import peptide_seq_sample as seq_sample        # 序贯采样×目标乘积×β拟合入库与数据库整理
@@ -109,7 +66,8 @@ from peptide_common import create_af3_json     # 补采任务的 AF3 输入构�
 
 # 靶标真源在 optimize_peptide_infinite（已含 ASIC1A 同源三聚体），此处不重复定义
 TARGET_ORDER      = inf.TARGET_ORDER
-DEFAULT_TARGETS   = "HTR1A,BIN1,ASIC1A"  # 新阶段：目标 = 三 ipTM 乘积最大
+# 评估靶标开关：2026-10-20 停算 ASIC1A（目标 = HTR1A×BIN1 两乘积；数据/路径保留，恢复时改回 "HTR1A,BIN1,ASIC1A" 并同步 peptide_db.PRODUCT_TARGETS）
+DEFAULT_TARGETS   = "HTR1A,BIN1"
 CYCLE_SEQS        = 8                  # 每轮序列数（×靶标数 = 每轮任务数）
 CYCLE_FIXED_SEC   = 4703.0             # 每轮固定开销：三个 chain B 的 MSA（实测 2026-10-13）ASIC1a 526aa=1410s + HTR1A 422aa=1738s + BIN1 593aa=1555s ≈ 78min（同源多聚体的拷贝链 MSA 被 functools.cache 缓存：chain C/D 实测仅 0.02s）
 CYCLE_PER_SEQ_SEC = 3500.0             # 每序列边际（实测）：肽链A MSA 708s +ASIC1a 理 2735s（1597 tokens×5 samples，显存99%溢出）+ HTR1A/BIN1 推理 ~400s gap-fill 行（只缺 ASIC1A）约 3440s/序列；新序列（三靶标）约 3970s/序列
@@ -117,10 +75,10 @@ SAFETY_MARGIN_SEC = 1200               # 距 SLURM 时限的安全余量（20min
 MAX_HOURS_DEFAULT = 118.0              # 5 天(120h)上限减去 2h 余量
 EMPTY_CYCLE_LIMIT = 3                  # 连续 N 轮零产出即退出（避免空烧 5 天）
 CYCLE_TAG_FMT     = "cycle_%Y%m%d_%H%M%S"
-# 优雅重启标志: 在 <db_root>/runs/ 下放同名空文件, 作业会在**下一个周期起点**
-# 正常退出(而非被 scancel 打断), 看门狗 ≤5min 内续交新作业 → 新代码生效, 且
-# 不浪费已完成周期的计算。代价仅新作业首轮重建 chain-B MSA(实测 ~55min)。
-# 为何不能靠改代码生效: 正在跑的作业已把 .py 载入内存, 编辑源文件对它无效。
+# 优雅重启标志：在 <db_root>/runs/ 下放同名空文件，作业会在**下一个周期起点**
+# 正常退出（而非被 scancel 打断），看门狗 ≤5min 内续交新作业 → 新代码生效，且
+# 不浪费已完成周期的计算。代价仅新作业首轮重建 chain-B MSA（实测 ~55min）。
+# 为何不能靠改代码生效：正在跑的作业已把 .py 载入内存，编辑源文件对它无效。
 RESTART_FLAG      = "restart.requested"
 
 _STOP = False
@@ -135,13 +93,13 @@ def _handle_stop(signum, frame):
 
 def cycle_seconds(n_seq):
     """估计一轮（n_seq 个序列 × 激活靶标数）的墙钟秒数。"""
-    # 任务数 = 序列数 × 靶标数, 但 chain B MSA 每靶标只建一次（进程内缓存）,
-    # 故固定开销与靶标数成正比, 边际成本与任务数成正比。
+    # 任务数 = 序列数 × 靶标数，但 chain B MSA 每靶标只建一次（进程内缓存），
+    # 故固定开销与靶标数成正比，边际成本与任务数成正比。
     return CYCLE_FIXED_SEC + CYCLE_PER_SEQ_SEC * n_seq
 
 
 def size_next_cycle(remaining_sec, max_seqs):
-    """按剩余时间反推这一轮该放几个序列（尽量把 GPU 用满, 又不被时限掐断）。"""
+    """按剩余时间反推这一轮该放几个序列（尽量把 GPU 用满，又不被时限掐断）。"""
     budget = remaining_sec - SAFETY_MARGIN_SEC
     if budget <= CYCLE_FIXED_SEC:
         return 0                              # 连一轮固定开销都放不下 → 收工
@@ -153,7 +111,7 @@ def size_next_cycle(remaining_sec, max_seqs):
 
 def build_runner_env(bundle_dir, out_dir=None):
     """组装 scripts/af3_bundle_runner.sh 需要的全部 AF3_* 环境变量。
-    与 loc.build_bundle_sbatch_cmd() 的 --export 列表保持一致, 差别仅在于:这里是**进程内 subprocess 继承**而非 sbatch --export。out_dir 覆盖输出根（补采任务写到 _resamples/ 下, 与主结果隔离, 收割路径自动忽略）。"""
+    与 loc.build_bundle_sbatch_cmd() 的 --export 列表保持一致，差别仅在于：这里是**进程内 subprocess 继承**而非 sbatch --export。out_dir 覆盖输出根（补采任务写到 _resamples/ 下，与主结果隔离，收割路径自动忽略）。"""
     env = os.environ.copy()
     env.update({
         "AF3_CODE_DIR": loc.AF3_CODE_DIR,
@@ -173,17 +131,67 @@ def build_runner_env(bundle_dir, out_dir=None):
     return env
 
 
+# ---- 任务中间层（通用 HyperQueue 封装）接入；AF3 适配层在本项目内 ----
+TASKCTL_DIR = os.path.join(os.path.dirname(_ROOT), "任务中间层")
+AF3_TASKS_PY = os.path.join(_ROOT, "af3适配", "af3任务.py")
+
+
+def run_af3_cycle_hq(bundle_dir, out_dir=None):
+    """把 bundle 里每个 JSON 提交为独立 HQ 任务，等待全部终态。
+
+    好处：一任务一 job → `任务控制.sh cancel <id>` 精确取消单个预测，`add`随时插队（priority 越大越先跑）；任务内 MSA 经 msa缓存.py磁盘缓存免重复搜索（内嵌即免搜索，特征逐字节等价于现场搜索）。
+
+    部分失败容错：逐任务提交，单个提交失败不中断其余；全部失败才抛异常（此时队列为空，调用方可安全回退整包直跑，不会重复计算）。个别任务运行失败不致命：结果已落盘，交给收割阶段入库，下一周期 drain 补齐。"""
+    import importlib.util
+    names = sorted(f for f in os.listdir(bundle_dir)
+                   if f.endswith(".json") and not f.startswith(("_", ".")))
+    if not names:
+        print("  ⚠️ bundle 内无 JSON, 跳过", flush=True)
+        return 0
+    spec = importlib.util.spec_from_file_location("af3任务", AF3_TASKS_PY)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    env = build_runner_env(bundle_dir, out_dir)
+    env["AF3_GPUS_PER_JOB"] = "1"             # 每任务独占 1 个 GPU 槽
+    task_root = os.path.join(os.path.abspath(bundle_dir), "_hq_tasks")
+    os.makedirs(task_root, exist_ok=True)
+
+    ids, failed = [], []
+    for n in names:
+        try:
+            ids.append(mod.submit(os.path.join(bundle_dir, n), env, task_root,
+                                  priority=0))
+        except Exception as e:               # noqa：BLE001 - 单任务失败不中断
+            failed.append((n, str(e)))
+            print(f"  ⚠️ 提交失败 {n}: {e}", flush=True)
+    if not ids:
+        raise RuntimeError(f"任务中间层全部提交失败: {failed[:2]}")
+    print(f"  🚀 已提交 {len(ids)}/{len(names)} 个 AF3 任务到任务中间层"
+          f"（可随时 add/cancel）: {ids}", flush=True)
+    mod.wait(ids)
+    if failed:
+        print(f"  ⚠️ {len(failed)} 个任务提交失败, 由下周期 drain 补齐",
+              flush=True)
+    print("  ✅ 本周期全部 AF3 任务已到终态", flush=True)
+    return 0
+
+
 def run_af3_cycle(bundle_dir, out_dir=None):
-    """在**本作业内**直接跑 AF3（不再 sbatch）; 返回 runner 退出码。
+    """在**本作业内**跑 AF3；返回退出码。
 
-    runner 先复制成**快照**再执行: bash 按字节偏移边读边执行脚本, 而编辑器
-    写 scripts/*.sh 是**原地截断重写**（inode 不变）→ 若本长驻作业执行期间
-    有人修改了仓库里的 runner, bash 回读到下一条命令时就会错位（语法崩
-    或行为失控; 2026-10-04 实测踩到, 靠临时回滚才救回在跑的 5 天作业）。
-    快照使长驻作业与仓库后续改动彻底解耦。
+    双路径：
+      * HQ 路径（默认，PEPOPT_HQ_MODE=1）：每个 JSON 一个独立任务提交到任务中间层，可随时添加/取消单个预测，MSA 走磁盘缓存免重复搜索。
+      * 直跑路径（PEPOPT_HQ_MODE=0 或 HQ 路径异常时自动回退）：整包跑af3_bundle_runner.sh（MSA 进程内摊销 + 两阶段容错）。
 
-    runner 自带两阶段容错（整包失败时逐任务补跑）与时间戳输出折叠, 故这里
-    只需容忍非零退出码：已完成的任务结果都在盘上, 交给收割阶段入库。"""
+    直跑路径的 runner 先复制成**快照**再执行：bash 按字节偏移边读边执行脚本，而编辑器写 scripts/*.sh 是**原地截断重写**（inode 不变）→ 若本长驻作业执行期间有人修改了仓库里的 runner，bash 回读到下一条命令时就会错位（语法崩或行为失控；2026-10-04 实测踩到，靠临时回滚才救回在跑的5天作业）。快照使长驻作业与仓库后续改动彻底解耦。
+
+    两条路径都只需容忍非零退出码：已完成任务的结果都在盘上，交给收割阶段入库。"""
+    if os.environ.get("PEPOPT_HQ_MODE", "1") != "0":
+        try:
+            return run_af3_cycle_hq(bundle_dir, out_dir)
+        except Exception as e:                   # noqa：BLE001 - 不让作业裸崩
+            print(f"  ⚠️ HQ 路径失败（{e}）, 回退整包直跑", flush=True)
     src = os.path.join(_ROOT, "scripts", "af3_bundle_runner.sh")
     if not os.path.isfile(src):
         print(f"  ❌ 缺 runner: {src}", flush=True)
@@ -199,29 +207,29 @@ def run_af3_cycle(bundle_dir, out_dir=None):
     try:
         p = subprocess.run(["bash", snap], env=build_runner_env(bundle_dir, out_dir))
         return p.returncode
-    except Exception as e:                       # noqa: BLE001 - 不能让作业裸崩
+    except Exception as e:                       # noqa：BLE001 - 不能让作业裸崩
         print(f"  ❌ runner 执行异常: {e}", flush=True)
         return 2
 
 
 # ===================== 组装一轮 =====================
 
-# 补采输出隔离根: 以下划线开头, harvest_results/in_flight/drain_backlog 都会跳过
+# 补采输出隔离根：以下划线开头，harvest_results/in_flight/drain_backlog 都会跳过
 RESAMPLE_ROOT = "_resamples"
 
 
 def make_resample_fn(deadline):
-    """构造数据库整理的批量补采生成器（真跑 AF3 新 seed, 非抽随机数）。
+    """构造数据库整理的批量补采生成器（真跑 AF3 新 seed，非抽随机数）。
 
-    契约 fn(tags) -> {tag: [新乘积样本…]}（无法生成的 tag 不出现在结果里）。
-    实现: 对每个 tag 的**变因子**靶标（有逐样本数据者, 固定因子是常数无需重跑）各跑一次新 seed 的 AF3 → 逐样本配对相乘得新乘积样本; 一次调用打包成一个 bundle 跑（chain-B MSA 每靶标只建一次, 逐条单跑太浪费）。
-    时间护栏: 距 deadline 不足 SAFETY_MARGIN×3 时不再开新补采（宁可少补, 不能把时限烧在补采上）。"""
+    契约 fn(tags) -> {tag：[新乘积样本…]}（无法生成的 tag 不出现在结果里）。
+    实现：对每个 tag 的**变因子**靶标（有逐样本数据者，固定因子是常数无需重跑）各跑一次新 seed 的 AF3 → 逐样本配对相乘得新乘积样本；一次调用打包成一个 bundle 跑（chain-B MSA 每靶标只建一次，逐条单跑太浪费）。
+    时间护栏：距 deadline 不足 SAFETY_MARGIN×3 时不再开新补采（宁可少补，不能把时限烧在补采上）。"""
     def resample(tags):
         if time.time() > deadline - 3 * SAFETY_MARGIN_SEC:
             print("  ⏭️  接近作业时限, 跳过本轮补采", flush=True)
             return {}
         D = db.load_database()
-        plan = {}                      # tag -> [(target, samples旧列表)]（只为取靶标）
+        plan = {}                      # tag -> [（target，samples旧列表）]（只为取靶标）
         fixed = {}
         for tag in tags:
             row = D.get(tag) or {}
@@ -231,12 +239,12 @@ def make_resample_fn(deadline):
             target_samples, fixed_factors = fac
             var_t = [t for t in seq_sample.PRODUCT_TARGETS if t in target_samples]
             if not var_t:
-                continue               # 全固定因子: 无可采样随机性
+                continue               # 全固定因子：无可采样随机性
             plan[tag] = var_t
             fixed[tag] = fixed_factors
         if not plan:
             return {}
-        seed = int(time.time()) % 100000 + 2   # 新 seed（初跑 seed=1）; 时间戳保证不与历史重复
+        seed = int(time.time()) % 100000 + 2   # 新 seed（初跑 seed=1）；时间戳保证不与历史重复
         res_root = os.path.join(db.results_dir(), RESAMPLE_ROOT)
         bundle = os.path.join(res_root, f"bundle_{seed}")
         out_root = os.path.join(bundle, "out")
@@ -260,7 +268,7 @@ def make_resample_fn(deadline):
         print(f"  🔁 整理补采: {len(plan)} 条记录 × 新 seed={seed} → {len(jobs)} 个 AF3 任务",
               flush=True)
         run_af3_cycle(bundle, out_dir=out_root)
-        # 逐任务提取新样本, 按靶标配对相乘（固定因子为常数）;
+        # 逐任务提取新样本，按靶标配对相乘（固定因子为常数）；
         # 变因子缺任何一个都放弃该记录——乘积缺因子会得到错误的样本值
         per_tag = {}
         for tag, t, job in jobs:
@@ -279,11 +287,10 @@ def make_resample_fn(deadline):
     return resample
 
 def prepare_cycle(seqs, active_targets, cycle_dir):
-    """为本轮挑中的序列写 AF3 输入 JSON（同时落地两处）:
-      1) 规范结果目录 <af3_results>/<tag>_<target>/input.json
-         —— 收割/折叠/BEST 打包都以它为唯一位置（见 peptide_db.consolidate_task）;
-      2) 本轮工作目录 <cycle_dir>/<job_name>.json —— runner 以 --input_dir 读它。
-    返回 (已排入的任务数, 跳过的原因列表)。token 超限的任务在提交前拦截。"""
+    """为本轮挑中的序列写 AF3 输入 JSON（同时落地两处）：
+      1）规范结果目录 <af3_results>/<tag>_<target>/input.json —— 收割/折叠/BEST 打包都以它为唯一位置（见 peptide_db.consolidate_task）；
+      2）本轮工作目录 <cycle_dir>/<job_name>.json —— runner 以 --input_dir 读它。
+    返回（已排入的任务数，跳过的原因列表）。token 超限的任务在提交前拦截。"""
     os.makedirs(cycle_dir, exist_ok=True)
     n_task, skipped = 0, []
     for seq in seqs:
@@ -293,16 +300,16 @@ def prepare_cycle(seqs, active_targets, cycle_dir):
         tag = db.resolve_tag(var)
         try:
             db.register_sequence(tag, var, seq)
-        except RuntimeError as e:                # 撞标签: 跳过该序列, 不中断搜索
+        except RuntimeError as e:                # 撞标签：跳过该序列，不中断搜索
             skipped.append(f"{tag}: {e}")
             continue
         for t in active_targets:
             job_name = f"{tag}_{t.lower()}"
             canon = db.canonical_dir(tag, t)
-            # consolidate_task 会先把 AF3 的时间戳兄弟目录折叠进规范目录再判定,
+            # consolidate_task 会先把 AF3 的时间戳兄弟目录折叠进规范目录再判定，
             # 比只查规范目录更可靠（漏判会导致已算完的任务被重算）。
             if db.consolidate_task(tag, t) is not None:
-                continue                          # 已有结果 → 复用, 不重算
+                continue                          # 已有结果 → 复用，不重算
             os.makedirs(canon, exist_ok=True)
             inp = loc.write_input_json(
                 seq, inf.TARGET_SEQS[t], job_name, canon,
@@ -319,22 +326,19 @@ def prepare_cycle(seqs, active_targets, cycle_dir):
 # ===================== 主循环 =====================
 
 def drain_backlog(active_targets, cycle_dir, seq_budget):
-    """把**历史遗留的未完成任务**排入本轮（防孤儿化）。返回 (序列数, 任务数)。
+    """把**历史遗留的未完成任务**排入本轮（防孤儿化）。返回（序列数，任务数）。
 
-    为何必需: 旧形态（登录节点驱动 + 反复 sbatch 小包）被取消或驱动被杀时,
-    会留下"已有 input.json、但永远不会有 summary"的任务目录。而新入口的候选
-    来自 `inf.known_sequences()`（= sequences.csv 全量）的排除集 → 这些序列
-    **再也不会被选中**, 于是永久缺半边结果: 既拖累"完整评估"计数, 也让 GP
-    的 BIN1 约束少一批样本。本函数直接复用它们已生成的 input.json 把缺的补上。
+    为何必需：旧形态（登录节点驱动 + 反复 sbatch 小包）被取消或驱动被杀时，会留下“已有 input.json、但永远不会有 summary”的任务目录。而新入口的候选来自 `inf.known_sequences()`（= sequences.csv 全量）的排除集 → 这些序列
+    **再也不会被选中**，于是永久缺半边结果：既拖累“完整评估”计数，也让 GP 的 BIN1 约束少一批样本。本函数直接复用它们已生成的 input.json 把缺的补上。
 
-    按 tag 分组计数, 每轮最多补 seq_budget 个序列, 以免一次塞爆时间预算。"""
+    按 tag 分组计数，每轮最多补 seq_budget 个序列，以免一次塞爆时间预算。"""
     rd = db.results_dir()
     if not os.path.isdir(rd):
         return 0, 0
 
-    pending = {}                       # tag -> [(任务名, input.json 路径)]
+    pending = {}                       # tag -> [（任务名，input.json 路径）]
 
-    # ---- 第1类: 已有 input.json 但永远等不到 summary 的遗留任务 ----
+    # ---- 第1类：已有 input.json 但永远等不到 summary 的遗留任务 ----
     for name in sorted(os.listdir(rd)):
         d = os.path.join(rd, name)
         if name.startswith("_") or name.endswith(".zip") or not os.path.isdir(d):
@@ -350,10 +354,10 @@ def drain_backlog(active_targets, cycle_dir, seq_budget):
         pending.setdefault(parsed[0], []).append((name, inp))
     n_leftover = sum(len(v) for v in pending.values())
 
-    # ---- 第2类(gap-fill): 已注册序列缺某个激活靶标, 且连 input.json 都没有 ----
-    # 来源: 旧形态被取消、或（如 2026-10-04）靶标参数被 SLURM 截断只跑了 HTR1A,
-    # 于是库里出现"有 HTR1A 无 BIN1"的半行; 这类序列已在 sequences.csv 中,
-    # 因而**永远不会被重新选中** → 不补就永久缺半边。此处按主表已有值快速预筛,
+    # ---- 第2类(gap-fill)：已注册序列缺某个激活靶标，且连 input.json 都没有 ----
+    # 来源：旧形态被取消、或（如 2026-10-04）靶标参数被 SLURM 截断只跑了 HTR1A，
+    # 于是库里出现“有 HTR1A 无 BIN1”的半行；这类序列已在 sequences.csv 中，
+    # 因而**永远不会被重新选中** → 不补就永久缺半边。此处按主表已有值快速预筛，
     # 避免对已完整的序列做无谓的目录探测。
     reg, rows = db.load_sequence_registry(), db.load_database()
     n_gap = 0
@@ -371,7 +375,7 @@ def drain_backlog(active_targets, cycle_dir, seq_budget):
             if name in has:
                 continue
             if db.consolidate_task(tag, t) is not None:
-                continue                          # 盘上已完成, 下次收割即入库
+                continue                          # 盘上已完成，下次收割即入库
             canon = db.canonical_dir(tag, t)
             try:
                 os.makedirs(canon, exist_ok=True)
@@ -416,7 +420,7 @@ def restart_requested(p):
 
 
 def consume_restart_flag(p):
-    """取走重启标志(幂等): 避免续交的新作业又立即退出。"""
+    """取走重启标志（幂等）：避免续交的新作业又立即退出。"""
     try:
         os.remove(_restart_flag_path(p))
         return True
@@ -457,8 +461,8 @@ def run_loop(active_targets, cycle_seqs, max_hours):
                   f"{SAFETY_MARGIN_SEC / 60:.0f}min）, 正常退出。", flush=True)
             break
 
-        # 周期边界优雅重启: 已完成周期的结果已在上一轮 step6 收割入库,
-        # 此处退出不会丢数据; 标志必须先消费再 break, 否则新作业会立即又退出。
+        # 周期边界优雅重启：已完成周期的结果已在上一轮 step6 收割入库，
+        # 此处退出不会丢数据；标志必须先消费再 break，否则新作业会立即又退出。
         if restart_requested(p):
             consume_restart_flag(p)
             print(f"\n🔁 检测到重启请求 → 在周期边界优雅退出（已完成 {cycle_no} 个周期）; "
@@ -477,25 +481,25 @@ def run_loop(active_targets, cycle_seqs, max_hours):
               f"剩 {remaining / 3600:.1f}h → 本轮 {n_seq} 序列 "
               f"(≈{(cycle_seconds(n_seq)) / 3600:.1f}h)", flush=True)
 
-        # 1) 先收割上一个周期的成果（首轮则收割历史遗留/其它入口的完成结果）
-        #    收割内部做序贯采样入库（β 统计量）, 并在入库数过 2^k 时触发数据库整理（P̃·N>M 决定每条记录重复搜索多少次, 补采真跑 AF3 新 seed）
+        # 1）先收割上一个周期的成果（首轮则收割历史遗留/其它入口的完成结果）
+        #    收割内部做序贯采样入库（β 统计量），并在入库数过 2^k 时触发数据库整理（P̃·N>M 决定每条记录重复搜索多少次，补采真跑 AF3 新 seed）
         n_new = inf.harvest_and_report(active_targets,
                                        new_sample_fn=make_resample_fn(deadline))
 
-        # 2) 本轮工作目录（补跑遗留与新候选共用）
+        # 2）本轮工作目录（补跑遗留与新候选共用）
         cycle_dir = os.path.join(p["root"], "cycles",
                                  time.strftime(CYCLE_TAG_FMT))
         os.makedirs(cycle_dir, exist_ok=True)
 
-        # 3) 先补上次遗留的未完成任务（防孤儿化）, 剩余预算再挑新候选
+        # 3）先补上次遗留的未完成任务（防孤儿化），剩余预算再挑新候选
         d_seq, d_task = drain_backlog(active_targets, cycle_dir, n_seq)
         picks, space_done = [], False
         want = max(0, n_seq - d_seq)
         if want > 0:
             if inf.SWEEP_ENABLED:
-                # 穷尽队列: 从「精确全集(51091) - 已派发台账(sequences.csv)」中
-                # 按 GP 次序取 want 条 → 保证不重复, 且有限周期内必然全覆盖。
-                # 返回空列表 = 空间已穷尽（**正常完成**, 不是采样失败）。
+                # 穷尽队列：从「精确全集(51091) - 已派发台账(sequences.csv)」中
+                # 按 GP 次序取 want 条 → 保证不重复，且有限周期内必然全覆盖。
+                # 返回空列表 = 空间已穷尽（**正常完成**，不是采样失败）。
                 picks = inf.sweep_pick(active_targets, want)
                 if not picks:
                     space_done = True
@@ -513,7 +517,7 @@ def run_loop(active_targets, cycle_seqs, max_hours):
                   + (" ..." if len(picks) > 8 else ""),
                   flush=True)
 
-        # 4) 组装本轮 AF3 输入（新候选; 遗留任务已在 drain 阶段复制进 cycle_dir）
+        # 4）组装本轮 AF3 输入（新候选；遗留任务已在 drain 阶段复制进 cycle_dir）
         n_task, skipped = (0, [])
         if picks:
             n_task, skipped = prepare_cycle(picks, active_targets, cycle_dir)
@@ -523,8 +527,8 @@ def run_loop(active_targets, cycle_seqs, max_hours):
                 print(f"     ⏭️  跳过 {s}", flush=True)
         if n_task == 0:
             if space_done:
-                # 与"连续空轮"区分开: 这里是穷尽搜索的**正常终点**, 不该再
-                # 耗掉 EMPTY_CYCLE_LIMIT 轮, 也不该被看门狗误判为异常退出。
+                # 与“连续空轮”区分开：这里是穷尽搜索的**正常终点**，不该再
+                # 耗掉 EMPTY_CYCLE_LIMIT 轮，也不该被看门狗误判为异常退出。
                 print("  🏁 空间已全覆盖且无遗留任务 → 搜索完成, 优雅退出。",
                       flush=True)
                 break
@@ -539,13 +543,13 @@ def run_loop(active_targets, cycle_seqs, max_hours):
               flush=True)
         empty_cycles = 0
 
-        # 5) 作业内直接跑 AF3（阻塞至本周期结束）
+        # 5）作业内直接跑 AF3（阻塞至本周期结束）
         rc = run_af3_cycle(cycle_dir)
         status = "✅" if rc == 0 else f"⚠️ 退出码 {rc}"
         print(f"  {status} 周期 {cycle_no} 的 AF3 结束 "
               f"({(time.time() - start) / 3600:.1f}h)", flush=True)
 
-        # 6) 立刻收割本周期的结果, 使下一轮的 GP 能用上最新数据
+        # 6）立刻收割本周期的结果，使下一轮的 GP 能用上最新数据
         got = inf.harvest_and_report(active_targets,
                                      new_sample_fn=make_resample_fn(deadline))
         if got == 0 and n_new == 0:
@@ -553,7 +557,7 @@ def run_loop(active_targets, cycle_seqs, max_hours):
         else:
             empty_cycles = 0
 
-        # 轮间歇: 无实质作用, 仅让共享文件系统的元数据落盘/日志可读
+        # 轮间歇：无实质作用，仅让共享文件系统的元数据落盘/日志可读
         time.sleep(5)
 
     print(f"\n👋 作业内无限循环结束（共 {cycle_no} 个周期）", flush=True)
@@ -568,11 +572,8 @@ def run_loop(active_targets, cycle_seqs, max_hours):
 def parse_targets(raw):
     """靶标字符串 → 集合。**同时**用 ',' 与 '+' 作为分隔符。
 
-    为何要支持 '+': SLURM 的 `--export=a,b,c` 列表本身以**逗号**分隔,
-    而 `PEPOPT_TARGETS=HTR1A,BIN1` 的值内部含逗号 → 会被 SLURM 截断成
-    `PEPOPT_TARGETS=HTR1A` 加一个孤立的 `BIN1`, 靶标静默退化为单靶标
-    （2026-10-04 实测踩到: 已跑起的 5 天作业只算 HTR1A, BIN1 约束全丢）。
-    故下发时用 '+' 作分隔符; 人手输入（CLI/README）两种都接受。"""
+    为何要支持 '+'：SLURM 的 `--export=a,b,c` 列表本身以**逗号**分隔，而 `PEPOPT_TARGETS=HTR1A,BIN1` 的值内部含逗号 → 会被 SLURM 截断成 `PEPOPT_TARGETS=HTR1A` 加一个孤立的 `BIN1`，靶标静默退化为单靶标（2026-10-04 实测踩到：已跑起的 5 天作业只算 HTR1A，BIN1 约束全丢）。
+    故下发时用 '+' 作分隔符；人手输入（CLI/README）两种都接受。"""
     return {t.strip().upper() for t in re.split(r"[,+]", str(raw)) if t.strip()}
 
 
@@ -601,10 +602,10 @@ def main():
         ap.error("--targets 必须包含 HTR1A（优化目标）")
     active = [t for t in TARGET_ORDER if t in want]
 
-    # 硬守卫: 只跑 HTR1A 而没有 BIN1, 等于**丢掉底线约束**（本项目目标是
-    # HTR1A↑ 且 BIN1<0.8）, 产出的序列无法筛选 → 白烧几天机时。
-    # 历史上这个退化是由 PEPOPT_TARGETS 逗号截断造成的, 故在此拦住。
-    # 确实只想跑单靶标（如调试）时, 显式 PEPOPT_ALLOW_SINGLE_TARGET=1。
+    # 硬守卫：只跑 HTR1A 而没有 BIN1，等于**丢掉底线约束**（本项目目标是
+    # HTR1A↑ 且 BIN1<0.8），产出的序列无法筛选 → 白烧几天机时。
+    # 历史上这个退化是由 PEPOPT_TARGETS 逗号截断造成的，故在此拦住。
+    # 确实只想跑单靶标（如调试）时，显式 PEPOPT_ALLOW_SINGLE_TARGET=1。
     if len(active) == 1 and os.environ.get("PEPOPT_ALLOW_SINGLE_TARGET") != "1":
         ap.error(
             f"靶标只有 {active}: BIN1 约束丢失, 产出无法用于筛选, 已拒绝启动以免"
@@ -619,7 +620,7 @@ def main():
     signal.signal(signal.SIGTERM, _handle_stop)
     signal.signal(signal.SIGINT, _handle_stop)
 
-    # 就绪检查: 数据库/权重/hmmer（与登录节点入口一致; 计算节点上通常都可用）
+    # 就绪检查：数据库/权重/hmmer（与登录节点入口一致；计算节点上通常都可用）
     ok, _ = loc.ensure_local_ready()
     if not ok:
         print("\n⚠️  预检查未通过, 仍尝试运行（已完成结果可复用）\n", flush=True)

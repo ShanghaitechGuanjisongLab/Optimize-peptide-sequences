@@ -2,14 +2,13 @@
 小肽序列优化 — 公共库。
 
 内容（纯库，导入零副作用，不依赖 af3_automator 与任何预测后端）：
-  - 序列常量: SEQ_202 / HTR1A_SEQ / UNC13C_SEQ / BIN1_SEQ
-  - 突变规则: generate_mutant()（编辑距离 ≤ 2）
-  - AF3 任务格式: create_af3_json()
-  - 评分提取: extract_scores_from_zip()
-  - 蒙特卡洛主循环: run_monte_carlo(predict_fn, opt_root)
-    后端无关，predict_fn 由各入口（云端/本地）注入
+  - 序列常量：SEQ_202 / HTR1A_SEQ / UNC13C_SEQ / BIN1_SEQ
+  - 突变规则：generate_mutant()（编辑距离 ≤ 2）
+  - AF3 任务格式：create_af3_json()
+  - 评分提取：extract_scores_from_zip()
+  - 蒙特卡洛主循环：run_monte_carlo(predict_fn, opt_root) 后端无关，predict_fn 由各入口（云端/本地）注入
 
-评分说明: score = 1 - ipTM 是界面置信度的代理指标，并非真实亲和度。
+评分说明：score = 1 - ipTM 是界面置信度的代理指标，并非真实亲和度。
 """
 
 import random
@@ -87,7 +86,7 @@ def generate_mutant(orig_tail):
                 del cur[pos]
             operations = -delta
 
-    else: # 模式C: 长度变化+点突变
+    else: # 模式C：长度变化+点突变
         delta = random.choice([1, -1])
         new_len = len(cur) + delta
         if new_len < 6 or new_len > 10:
@@ -113,7 +112,7 @@ def generate_mutant(orig_tail):
 
 # ===================== 搜索空间穷尽枚举 =====================
 
-_SPACE_CACHE = None   # ((center,max_edit,min_len,max_len), [序列...])
+_SPACE_CACHE = None   # （(center,max_edit,min_len,max_len)，[序列……]）
 
 
 def ball_edit1(word, aa=AA_LIST):
@@ -134,20 +133,15 @@ def ball_edit1(word, aa=AA_LIST):
 
 
 def enumerate_space(center=ORIG_TAIL, max_edit=2, min_len=6, max_len=10):
-    """**穷尽枚举**以 center 为中心、编辑距离 ≤max_edit、长度落在
-    [min_len, max_len] 内的全部可变区, 按字典序返回 list（确定性、可复现）。
+    """**穷尽枚举**以 center 为中心、编辑距离 ≤max_edit、长度落在 [min_len, max_len] 内的全部可变区，按字典序返回 list（确定性、可复现）。
 
-    与随机采样 generate_mutant() 的关系与区别:
-      - generate_mutant 每次随机产出球内一个成员, 上层靠"重试 + 排除已评估"
-        间接采样。实测球内 **665 个序列采样不可达**（模式B 的 delta=±1 分支
-        只做单次插入或删除, 因而"净长度不变的插入+删除"两步编辑生成不出来）。
-      - 本函数是精确构造, 覆盖全集（含那 665 个）, 且**输出顺序固定**,
-        使调度器能做"不重复、有限步内全覆盖"的游标推进。
-      - 长度过滤只在最后一步做一次（而非每轮迭代都过滤）, 否则会误剪
-        "经由越界中间态再回到界内"的合法路径 → 少算成员。
+    与随机采样 generate_mutant() 的关系与区别：
+      - generate_mutant 每次随机产出球内一个成员，上层靠“重试 + 排除已评估”间接采样。实测球内 **665 个序列采样不可达**（模式B 的 delta=±1 分支只做单次插入或删除，因而“净长度不变的插入+删除”两步编辑生成不出来）。
+      - 本函数是精确构造，覆盖全集（含那 665 个），且**输出顺序固定**，使调度器能做“不重复、有限步内全覆盖”的游标推进。
+      - 长度过滤只在最后一步做一次（而非每轮迭代都过滤），否则会误剪 “经由越界中间态再回到界内”的合法路径 → 少算成员。
 
-    规模: max_edit=2, len 6~10, 20 种氨基酸 → **51091** 条（已实测）。
-    代价: 枚举约 0.1s; 结果按参数缓存于 _SPACE_CACHE, 进程内只算一次。
+    规模：max_edit=2，len 6~10，20 种氨基酸 → **51091** 条（已实测）。
+    代价：枚举约 0.1s；结果按参数缓存于 _SPACE_CACHE，进程内只算一次。
     """
     global _SPACE_CACHE
     key = (center, max_edit, min_len, max_len)
@@ -172,7 +166,7 @@ def create_af3_json(peptide_seq, target_seq, job_name, model_seeds=[1],
 
     target_copies：靶标链数（同源多聚体）。AF3 JSON 语义：同一序列挂 N 个链ID=同源 N 聚体，等价于 AlphaFold Server 界面上的 Copies=N。例：target_copies=3 → 靶标链 id ['B','C','D']，用于 Asic1a 同源三聚体。复合物 token = len(peptide) + len(target)*copies。
 
-    返回: dict (AF3 JSON 格式)
+    返回：dict （AF3 JSON 格式）
     """
     if target_copies < 1:
         raise ValueError(f"target_copies 必须 >=1, 得到 {target_copies}")
@@ -205,30 +199,22 @@ def extract_scores_from_zip(zip_path):
     """
     从 AlphaFold3 结果 zip 包中提取评分。
 
-    AF3 结果 zip 结构:
+    AF3 结果 zip 结构：
       <job_name>/
         <job_name>_summary_confidences.json   ← 汇总评分
         <job_name>_confidences.json
-        <job_name>_model_0.cif
-        ...
+        <job_name>_model_0.cif……
 
-    summary_confidences.json 关键字段:
-      - iptm: 界面 TM-score (0~1), 衡量蛋白间界面置信度
-      - ptm: 整体结构 TM-score (0~1)
-      - ranking_score: 综合排名分 (0.8*iptm + 0.2*ptm + ...)
-      - chain_pair_iptm: 链对 ipTM 矩阵, [0,1] 是 A-B 链界面
-      - chain_pair_pae_min: 链对间最低 PAE
-      - fraction_disordered: 无序比例
-      - has_clash: 是否有严重原子冲突
+    summary_confidences.json 关键字段：
+      - iptm：界面 TM-score (0~1)，衡量蛋白间界面置信度
+      - ptm：整体结构 TM-score (0~1)
+      - ranking_score：综合排名分 (0.8*iptm + 0.2*ptm + ...)
+      - chain_pair_iptm：链对 ipTM 矩阵，[0,1] 是 A-B 链界面
+      - chain_pair_pae_min：链对间最低 PAE
+      - fraction_disordered：无序比例
+      - has_clash：是否有严重原子冲突
 
-    返回: dict {
-        "iptm": float,
-        "ptm": float,
-        "ranking_score": float,
-        "chain_pair_iptm_AB": float,   # A链-B链界面ipTM
-        "fraction_disordered": float,
-        "has_clash": bool
-    }
+    返回：dict { "iptm"：float，"ptm"：float，"ranking_score"：float，"chain_pair_iptm_AB"：float，# A链-B链界面ipTM "fraction_disordered"：float，"has_clash"：bool }
     """
     try:
         with zipfile.ZipFile(zip_path, 'r') as zf:
@@ -282,9 +268,8 @@ def run_monte_carlo(predict_fn, opt_root, mc_steps=100, temperature=0.7,
     """
     后端无关的蒙特卡洛优化主循环。
 
-    predict_fn(peptide_seq, target_seq, target_name, out_dir, auto_submit=True)
-        → (score, iptm, result_path)；结果未就绪时返回 (None, None, None)。
-    opt_root: 输出根目录（最佳结构与结果表写入其中）。
+    predict_fn(peptide_seq, target_seq, target_name, out_dir, auto_submit=True) → (score, iptm, result_path)；结果未就绪时返回 (None, None, None)。
+    opt_root：输出根目录（最佳结构与结果表写入其中）。
     """
     opt_dir = os.path.join(opt_root, "HTR1A_best")
     best_dir = os.path.join(opt_dir, "BEST_STRUCTURE")
