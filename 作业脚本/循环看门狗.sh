@@ -55,7 +55,7 @@ if [[ -n "$alive" ]]; then
   exit 0
 fi
 
-log "队列中无 $JOB_NAME 作业, 准备续交（靶标=$TARGETS, 每轮 $CYCLE_SEQS 序列）"
+log "队列中无 $JOB_NAME 作业，准备续交（靶标=$TARGETS，每轮 $CYCLE_SEQS 序列）"
 
 # 预检查由 submit_loop_job() 内部把关（PREFLIGHT_OK 为假时它会拒绝提交）。
 # 这里把 stdout/stderr 一并留痕到日志，便于事后排查“为什么没交上去”。
@@ -73,8 +73,8 @@ PY
 rc=$?
 echo "$out" | tail -6 | sed 's/^/    | /' >> "$WLOG"
 if echo "$out" | grep -qE "submit: [0-9]+"; then
-  log "已续交, jobid=$(echo "$out" | grep -oE 'submit: [0-9]+' | awk '{print $2}')"
+  log "已续交，jobid=$(echo "$out" | grep -oE 'submit: [0-9]+' | awk '{print $2}')"
 else
-  log "提交未成功(rc=$rc), 下个周期重试"
+  log "提交未成功（rc=$rc），下个周期重试"
 fi
 exit 0

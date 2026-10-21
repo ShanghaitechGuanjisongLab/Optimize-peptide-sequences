@@ -126,9 +126,9 @@ def predict_and_score(peptide_seq, target_seq, target_name, out_dir, auto_submit
             iptm = scores_dict["iptm"]
             ranking_score = scores_dict["ranking_score"]
             score = round(1.0 - iptm, 4)
-            print(f"  📊 [{target_name}] 评分: score={score} (iptm={iptm:.3f}, ranking={ranking_score:.3f}, "
-                  f"AB-iptm={scores_dict['chain_pair_iptm_AB']:.3f}, "
-                  f"disorder={scores_dict['fraction_disordered']:.3f}, clash={scores_dict['has_clash']})")
+            print(f"  📊 [{target_name}] 评分：score={score} （iptm={iptm:.3f}，ranking={ranking_score:.3f}，"
+                  f"AB-iptm={scores_dict['chain_pair_iptm_AB']:.3f}，"
+                  f"disorder={scores_dict['fraction_disordered']:.3f}，clash={scores_dict['has_clash']}）")
             return score, iptm, result_zip
         else:
             print(f"  ⚠️  [{target_name}] 结果 zip 解析失败，将重新生成 JSON")
@@ -138,14 +138,14 @@ def predict_and_score(peptide_seq, target_seq, target_name, out_dir, auto_submit
     job = create_af3_json(peptide_seq, target_seq, job_name)
     with open(json_file, "w") as f:
         json.dump(job, f, indent=2)
-    print(f"  📝 [{target_name}] JSON 已生成: {json_file}")
+    print(f"  📝 [{target_name}] JSON 已生成：{json_file}")
 
     # ---- 第3步：尝试自动提交 ----
     if auto_submit and HAS_AUTOMATOR and AUTO_MODE:
         if check_auth_exists():
             remaining = get_remaining_quota()
             if remaining <= 0:
-                print(f"  ⚠️  [{target_name}] 今日配额已用完 ({DAILY_LIMIT}/{DAILY_LIMIT})，等待手动处理")
+                print(f"  ⚠️  [{target_name}] 今日配额已用完（{DAILY_LIMIT}/{DAILY_LIMIT}），等待手动处理")
                 print(f"  ⚠️  明天重新运行脚本可自动继续")
                 return None, None, None
 
@@ -164,7 +164,7 @@ def predict_and_score(peptide_seq, target_seq, target_name, out_dir, auto_submit
                     if scores_dict:
                         iptm = scores_dict["iptm"]
                         score = round(1.0 - iptm, 4)
-                        print(f"  📊 [{target_name}] 自动评分: score={score} (iptm={iptm:.3f})")
+                        print(f"  📊 [{target_name}] 自动评分：score={score} （iptm={iptm:.3f}）")
                         return score, iptm, result_zip
                 else:
                     # 尝试从下载中匹配
@@ -175,7 +175,7 @@ def predict_and_score(peptide_seq, target_seq, target_name, out_dir, auto_submit
                             if scores_dict:
                                 iptm = scores_dict["iptm"]
                                 score = round(1.0 - iptm, 4)
-                                print(f"  📊 [{target_name}] 自动评分: score={score} (iptm={iptm:.3f})")
+                                print(f"  📊 [{target_name}] 自动评分：score={score} （iptm={iptm:.3f}）")
                                 return score, iptm, result_zip
             else:
                 print(f"  ⚠️  [{target_name}] 自动提交未获取到结果，可能需要手动处理")
@@ -211,7 +211,7 @@ def generate_all_json_files(peptide_seq, step_label=""):
         with open(json_file, "w") as f:
             json.dump(job, f, indent=2)
         jobs.append(job)
-        print(f"  📝 JSON 已生成: {json_file} (小肽 vs {target_name})")
+        print(f"  📝 JSON 已生成：{json_file} （小肽 vs {target_name}）")
 
     return jobs
 
@@ -259,7 +259,7 @@ def batch_generate_all_json():
     total_jobs = len(mutant_set) * 3  # 每个序列3个靶标
     print(f"🔬 共 {len(mutant_set)} 个唯一肽序列需要预测")
     print(f"📊 每个序列需要3个靶标(HTR1A, UNC13C, BIN1) = 共 {total_jobs} 个预测任务")
-    print(f"⚠️  每日免费配额: {DAILY_LIMIT} 个任务")
+    print(f"⚠️  每日免费配额：{DAILY_LIMIT} 个任务")
     print(f"📅 预计需要 {total_jobs / DAILY_LIMIT:.1f} 天完成\n")
 
     # 收集所有 job
@@ -286,7 +286,7 @@ def batch_generate_all_json():
         batch_file = os.path.join(JSON_OUTPUT_DIR, f"batch_{batch_num:03d}.json")
         with open(batch_file, "w") as f:
             json.dump(batch, f, indent=2)
-        print(f"✅ 批次 {batch_num}: {len(batch)} 个任务 → {batch_file}")
+        print(f"✅ 批次 {batch_num}：{len(batch)} 个任务 → {batch_file}")
 
     # 保存序列索引文件
     index = {}
@@ -303,7 +303,7 @@ def batch_generate_all_json():
         print(f"\n🤖 自动提交模式已启用")
         remaining = get_remaining_quota()
         if remaining > 0:
-            print(f"🚀 开始自动提交第1批 (今日剩余配额: {remaining})...")
+            print(f"🚀 开始自动提交第1批（今日剩余配额：{remaining}）……")
             batch_file = os.path.join(JSON_OUTPUT_DIR, "batch_001.json")
             if os.path.exists(batch_file):
                 submit_batch_and_collect(batch_file, wait=True, max_wait_minutes=180)
@@ -338,16 +338,16 @@ def check_results_status():
     pending_jobs = json_jobs - zip_jobs
 
     print(f"\n📊 任务状态报告")
-    print(f"   JSON 任务总数: {len(json_jobs)}")
-    print(f"   已完成 (有结果): {len(completed)}")
-    print(f"   待处理: {len(pending_jobs)}")
+    print(f"   JSON 任务总数：{len(json_jobs)}")
+    print(f"   已完成（有结果）：{len(completed)}")
+    print(f"   待处理：{len(pending_jobs)}")
 
     if pending_jobs:
-        print(f"\n   待处理任务 (前20):")
+        print(f"\n   待处理任务（前20）：")
         for j in sorted(pending_jobs)[:20]:
             print(f"     - {j}")
         if len(pending_jobs) > 20:
-            print(f"     ... 还有 {len(pending_jobs) - 20} 个")
+            print(f"     ……还有 {len(pending_jobs) - 20} 个")
 
     return len(completed), len(pending_jobs)
 
@@ -362,11 +362,11 @@ def optimize_with_server(mc_steps=MC_STEPS, temperature=TEMPERATURE):
     # 检查自动化可用性
     auto_available = HAS_AUTOMATOR and AUTO_MODE and check_auth_exists()
     if AUTO_MODE and not auto_available:
-        print("\n⚠️  自动模式已启用但不可用:")
+        print("\n⚠️  自动模式已启用但不可用：")
         if not HAS_AUTOMATOR:
             print("   - af3_automator 模块未找到")
         elif not check_auth_exists():
-            print("   - 未完成认证 (请运行 setup_auth.py)")
+            print("   - 未完成认证（请运行 setup_auth.py）")
         print("   - 将降级为手动模式\n")
 
     # 检查待处理任务
@@ -374,17 +374,17 @@ def optimize_with_server(mc_steps=MC_STEPS, temperature=TEMPERATURE):
     if pending:
         print(f"\n⚠️  发现 {len(pending)} 个待处理任务（已生成 JSON 但无结果 zip）")
         if auto_available:
-            print(f"   🤖 将自动提交这些任务...")
+            print(f"   🤖 将自动提交这些任务……")
             for name, jf in pending:
-                print(f"   📤 提交: {name}")
+                print(f"   📤 提交：{name}")
                 submit_batch_and_collect(jf, wait=True, max_wait_minutes=120)
         else:
             print("   请先在 AlphaFold Server 提交这些任务并下载结果。")
-            print("   待处理任务列表:")
+            print("   待处理任务列表：")
             for name, jf in pending[:10]:
                 print(f"     - {name}")
             if len(pending) > 10:
-                print(f"     ... 还有 {len(pending) - 10} 个")
+                print(f"     ……还有 {len(pending) - 10} 个")
         print()
 
     return run_monte_carlo(predict_and_score, ROOT_DIR,

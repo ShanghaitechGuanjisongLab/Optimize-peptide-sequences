@@ -53,7 +53,8 @@ MASTER_FIELDS = ["tag", "peptide", "var_region",
                  # 充分统计量 (obj_n,obj_sum,obj_sum2) → 方法矩拟合，
                  # 追加拟合 == 全数据批式拟合，无需存全数据（见 小肽统计.py）
                  "obj_n", "obj_sum", "obj_sum2",
-                 "obj_max", "obj_alpha", "obj_beta", "obj_extra", "obj_pool"]
+                 "obj_max", "obj_alpha", "obj_beta", "obj_extra", "obj_pool",
+                 "obj_climb"]
 
 SEQREG_FIELDS = ["tag", "var_region", "peptide", "first_seen"]
 
@@ -280,9 +281,9 @@ def register_sequence(tag, var_region, peptide):
         if reg[tag]["var"] == var_region:
             return False
         raise RuntimeError(
-            f"标签冲突: {tag} 已对应 {reg[tag]['var']!r}, 新序列 {var_region!r}。"
-            "（make_tag 已用 crc32 全 32bit, 实测全空间 0 碰撞; 若真出现说明"
-            " 有旧目录被人工改名, 需核对 sequences.csv）")
+            f"标签冲突：{tag} 已对应 {reg[tag]['var']!r}，新序列 {var_region!r}。"
+            "（make_tag 已用 crc32 全 32bit，实测全空间 0 碰撞；若真出现说明"
+            " 有旧目录被人工改名，需核对 sequences.csv）")
     existed = os.path.isfile(p["seqreg_csv"]) and os.path.getsize(p["seqreg_csv"]) > 0
     with open(p["seqreg_csv"], "a", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=SEQREG_FIELDS)
@@ -351,7 +352,7 @@ def upsert_result(tag, target, iptm, ranking=None, peptide=None, var=None,
     col = f"iptm_{target.lower()}"
     rk_col = f"ranking_{target.lower()}"
     if col not in MASTER_FIELDS:
-        raise ValueError(f"主表无列 {col}, 请先扩展 MASTER_FIELDS")
+        raise ValueError(f"主表无列 {col}，请先扩展 MASTER_FIELDS")
     rows = _read_csv(paths()["master_csv"], MASTER_FIELDS)
     idx = next((i for i, r in enumerate(rows) if r["tag"] == tag), None)
     if idx is None:
@@ -472,7 +473,7 @@ def extract_sample_iptms(result_dir, target=None):
 # ---------------------------------------------------------------------
 
 _OBJ_COLS = ["obj_n", "obj_sum", "obj_sum2", "obj_max",
-             "obj_alpha", "obj_beta", "obj_extra", "obj_pool"]
+             "obj_alpha", "obj_beta", "obj_extra", "obj_pool", "obj_climb"]
 
 
 def save_obj_stats(tag, fit, source="seq"):

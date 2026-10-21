@@ -3,8 +3,8 @@
 =============================================================
 用户定稿设计（2026-10-14 第二版；修正第一版“灵活上界”的缺陷）：
 
-1. **序贯停止规则**（替代固定 num_diffusion_samples=5）：先算 2 个样本；第 2 个 > 第 1 个则再算，每次比上一次大就再算……直到出现一次比上一次小即停。取已算样本的最大值为“最优结果”。注：“算一次”= **真跑一次 AlphaFold**（新 diffusion 样本），不是从拟合的分布里抽随机数（拟合只用于估计 P）。
-   实现注：AF3 一次运行批量产出多个 diffusion 样本（MSA 共享，边际成本低），故先批量生成，再按生成序消费到首次下降；未消费的进 pool 供整理阶段补采（pool 是“未消费”样本，非全历史，不违反“不存全数据”）。
+1. **首次采样 = 无上限爬山**（2026-10-21 用户定稿，替代旧“先算 2 个、首次下降即停”）：新记录一律反复补采新 seed（真跑 AF3），只要还在破纪录就继续，直到**整批补采样本都未破纪录**才停；次数无上限，由破纪录判定终止。取已算样本的最大值为“最优结果”。注：“算一次”= **真跑一次 AlphaFold**（新 diffusion 样本），不是从拟合的分布里抽随机数（拟合只用于估计 P）。
+   实现注：AF3 一次运行批量产出多个 diffusion 样本（MSA 共享，边际成本低），初次批量样本全部计入拟合（consume_sequential 不再提前停）；爬山循环在 小肽优化_无限.climb_new_records 实现。
 
 2. **β 分布采用标准 [0,1]**（不设灵活上界 U）：ipTM ∈ [0,1]、乘积 ∈ [0,1]，故 [0,1] 就是理论支撑。⚠️ 第一版曾用 MLE 估上界 U≈样本max，但早期采样运气差会把 U 压低 →P=0 → 该记录**永无翻身之日**（上界估计量必然早期低估）。故改固定 [0,1]：P 永不精确为 0，任何记录只要真实分布能破纪录就迟早被采到。
 
@@ -12,6 +12,7 @@
 
 4. **循环条件 P·N > M**（M = 该记录已采样次数）：
    终止性证明：每采一次 M←M+1；P≤1 ⇒ P·N≤N ⇒ M>N 时条件必失效。每记录补采 ≤N 次 ⇒ **必定有限步终止**，不依赖分布假设。（值-of-information 形式：P·N ≈ 期望收益（破纪录概率×一举超越的记录数），M = 已投入成本；收益递减+成本递增 ⇒ 必停。）
+   ⚠️ 例外——**单点/退化记录**（n=1、或样本全同/全 0 全 1，β 拟合无解 → P 恒按 max 判定为 0 → 上述循环永远不给它补采）：2026-10-21 起整理时**改走与首次同规格的爬山**——只要还在破纪录就一直补采，一旦整批未破纪录即爬山结束（置 obj_climb 终止标记，之后不再重复烧算力）；终止性由“破纪录判定 + MAX_EXTRA_SAMPLES 工程上限”保证。
 
 5. **增量充分统计** (n, Σx, Σx²) + 方法矩拟合：追加拟合 == 全数据批式拟合，不保存全数据。μ=Σx/n，σ²=Σx²/n-μ²，κ=μ(1-μ)/σ²-1，α=μκ，β=(1-μ)κ。
 """
@@ -40,7 +41,8 @@ class BetaFit:
     add() 追加一个样本；fit() 由统计量方法矩拟合，与全数据批式拟合结果相同。
     """
 
-    __slots__ = ("n", "sum_x", "sum_x2", "max_x", "pool", "extra_used")
+    __slots__ = ("n", "sum_x", "sum_x2", "max_x", "pool", "extra_used",
+                 "climb_done")
 
     def __init__(self):
         self.n = 0
@@ -49,6 +51,7 @@ class BetaFit:
         self.max_x = None            # 最优结果（排名/阈值用它）
         self.pool = []               # 未消费样本（整理阶段补采用）
         self.extra_used = 0          # 整理阶段已补采次数（硬上限用）
+        self.climb_done = 0          # 1 = 爬山已以“不再破纪录”收束（首次爬山或整理单点爬山写入；未置位则整理还会给退化记录重新爬山）
 
     # ---- 增量更新（充分统计量）----
     def add(self, x):
@@ -109,26 +112,16 @@ class BetaFit:
                              math.sqrt(a * b / ((a + b) ** 2 * (a + b + 1))))
         return max(0.0, min(1.0, p))
 
-    # ---- 序贯规则消费样本 ----
+    # ---- 消费样本 ----
     def consume_sequential(self, xs):
-        """按序贯规则消费 xs：前 2 个必用，之后“比上一次大”才继续，首次出现下降即停（含触发下降的那个样本）。返回（已用个数）。
-        未用的尾部进 pool。"""
+        """消费 xs 的全部样本并返回个数。
+
+        此处曾按序贯规则“首次下降即停、尾部留在 pool”，但 max_x 只在 add() 里更新→停在池中的更优样本永远进不了排名，iptm 回写用的 argmax 也一并偏移（实测206/698 条被低估，最重的一条真实 0.5313 记成 0.5159，第 3 名掉到第 8 名）。样本既已落盘，全用不额外耗算力，β 拟合拿到更多数据只会更准，故不再提前停止；pool 留为空字段以兼容 from_stats 反序列化旧行。"""
         if not xs:
             return 0
-        xs = [float(x) for x in xs]
-        used = 0
-        prev = None
-        for i, x in enumerate(xs):
-            if i == 0:
-                self.add(x); used += 1; prev = x; continue
-            if i == 1:                          # 第 2 个必算
-                self.add(x); used += 1; prev = x; continue
-            if x > prev:                        # 创新高 → 继续
-                self.add(x); used += 1; prev = x; continue
-            self.add(x); used += 1              # 下降 → 算完这个就停
-            self.pool.extend(xs[i + 1:])        # 剩余进池
-            return used
-        return used
+        for x in xs:
+            self.add(x)
+        return len(xs)
 
     def draw_from_pool(self):
         """整理阶段补采：优先取池中免费样本；池空返回 None（需外部生成）。"""
@@ -156,6 +149,7 @@ class BetaFit:
             "obj_beta": "" if ab is None else f"{ab[1]:.6f}",
             "obj_extra": self.extra_used,
             "obj_pool": json.dumps([round(x, 6) for x in self.pool]),
+            "obj_climb": "" if not self.climb_done else "1",
         }
 
     @classmethod
@@ -168,6 +162,7 @@ class BetaFit:
         mx = d.get("obj_max") or ""
         f.max_x = float(mx) if mx != "" else None
         f.extra_used = int(float(d.get("obj_extra") or 0))
+        f.climb_done = 1 if str(d.get("obj_climb") or "").strip() else 0
         try:
             f.pool = [float(x) for x in json.loads(d.get("obj_pool") or "[]")]
         except (ValueError, TypeError):
@@ -204,6 +199,7 @@ def consolidation_pass(records, sampler, max_extra_per_record=MAX_EXTRA_SAMPLES)
          P = β 拟合的 P（下一次 AF3 采样 > 阈值）；
       3）循环条件 **P·N > M**，M = 该记录已采样次数（含序贯初值）。
          终止性：每采一次 M<-M+1；P<=1 => P·N<=N => M>N 必失效 => **有限步终止**，不依赖分布假设。补采后更新拟合与 M，因榜首可能变而重排，直到无人满足。
+      4）**单点/退化记录爬山**（2026-10-21 规格）：fit() 无解（n=1、样本全同、全 0/全 1）⇒ 尾概率恒 0 ⇒ 规则 3 永远不给它补采，等于判了“永无翻身”。此类记录改走与首次爬山同规格的循环：先整批消费 pool 里已补到的样本，只要还在破纪录就继续经 sampler 补采（批量需求模式下登记需求、等阶段2 填池后下一轮消费）；一旦整批未破纪录即置 climb_done 收束。终止性：破纪录判定 + extra_used ≤ max_extra_per_record 工程上限。
 
     返回 {"added"：补采总数，"rounds"：迭代轮数，"capped"：因硬上限停止的次数}
     """
@@ -234,6 +230,39 @@ def consolidation_pass(records, sampler, max_extra_per_record=MAX_EXTRA_SAMPLES)
 
             if fit.max_x is not None and threshold <= fit.max_x:
                 continue                        # 已达阈值，无需补采
+
+            # ---- 单点/退化记录（β 无解 → P 恒 0 → 规则 3 永不补采）：改走爬山 ----
+            if fit.n >= 1 and fit.fit() is None and not fit.climb_done:
+                before = fit.max_x
+                took = 0
+                while fit.pool:                 # 整批消费池内已补到的样本（同一批产物全计入拟合）
+                    fit.draw_from_pool()
+                    took += 1
+                if took:
+                    added += took
+                    progressed = True
+                    if fit.max_x <= before + 1e-12:
+                        fit.climb_done = 1      # 整批都没破纪录 → 爬山收束
+                        continue
+                best = fit.max_x
+                while True:                     # 池空：经 sampler 真补采，破纪录就继续
+                    if fit.extra_used >= max_extra_per_record:
+                        capped += 1
+                        fit.climb_done = 1      # 工程保险（正常不触发）
+                        break
+                    x = sampler(rec["tag"])
+                    if x is None:
+                        break                   # 批量需求模式：需求已登记，等阶段2 填池后下一轮消费
+                    fit.add(x)
+                    fit.extra_used += 1
+                    added += 1
+                    progressed = True
+                    if x > best + 1e-12:
+                        best = x
+                        continue
+                    fit.climb_done = 1          # 不再破纪录 → 爬山收束
+                    break
+                continue
 
             P = fit.prob_gt(threshold)
             M = fit.n                           # 已采样次数

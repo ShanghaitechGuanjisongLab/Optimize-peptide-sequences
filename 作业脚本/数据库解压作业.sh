@@ -23,7 +23,7 @@ PEPOPT_CONDA_ENV="${PEPOPT_CONDA_ENV:-base}"
 PEPOPT_CONDA_SH="${PEPOPT_CONDA_SH:-}"
 PEPOPT_ENTRY="${PEPOPT_ENTRY:-小肽优化_本地集群.py}"
 
-echo "数据库解压作业开始: $(date) | 节点: $(hostname)"
+echo "数据库解压作业开始：$(date) | 节点：$(hostname)"
 
 # ---- 激活环境 ----
 if [ -z "$PEPOPT_CONDA_SH" ]; then
@@ -47,17 +47,17 @@ fi
 cd "$PEPOPT_WORK_DIR" || { echo "❌ 无法进入 $PEPOPT_WORK_DIR" >&2; exit 2; }
 
 if [ ! -f "$PEPOPT_ENTRY" ]; then
-    echo "❌ 找不到入口脚本: $PEPOPT_ENTRY" >&2
+    echo "❌ 找不到入口脚本：$PEPOPT_ENTRY" >&2
     exit 2
 fi
 
 if ! command -v zstd >/dev/null 2>&1; then
-    echo "✅ 提示: 当前 PATH 无 zstd, prepare_database() 会自行处理并报错中止" >&2
+    echo "✅ 提示：当前 PATH 无 zstd，prepare_database() 会自行处理并报错中止" >&2
 fi
 
 # -u：关闭缓冲，让解压进度能被 tail -f 实时看到
 python -u "$PEPOPT_ENTRY" --prepare-db
 rc=$?
 
-echo "数据库解压作业结束: $(date) | 退出码: $rc"
+echo "数据库解压作业结束：$(date) | 退出码：$rc"
 exit "$rc"

@@ -55,10 +55,10 @@ AF3_GPUS_PER_JOB="${AF3_GPUS_PER_JOB:-1}"
 
 RUN_AF3="${AF3_CODE_DIR%/}/run_alphafold.py"
 
-echo "AF3 打包推理开始: $(date) | 节点: $(hostname)"
+echo "AF3 打包推理开始：$(date) | 节点：$(hostname)"
 
 if [ ! -f "$RUN_AF3" ]; then
-    echo "❌ 找不到 AF3 入口: $RUN_AF3" >&2
+    echo "❌ 找不到 AF3 入口：$RUN_AF3" >&2
     exit 2
 fi
 
@@ -172,13 +172,13 @@ stage1_parallel() {
             base="$(basename "$jf" .json)"; suffix="${base##*_}"
             cp "$jf" "$split_root/g${smap[$suffix]}/"
         done
-        echo "  分组: ${#suffixes[@]} 种靶标同靶同流 → $ngpu 条 GPU 流"
+        echo "  分组：${#suffixes[@]} 种靶标同靶同流 → $ngpu 条 GPU 流"
     else
         i=0
         for jf in "${files[@]}"; do
             cp "$jf" "$split_root/g$((i % ngpu))/"; i=$((i + 1))
         done
-        echo "  分组: 单一靶标 ${#files[@]} 任务轮转均分 → $ngpu 条 GPU 流"
+        echo "  分组：单一靶标 ${#files[@]} 任务轮转均分 → $ngpu 条 GPU 流"
     fi
 
     local -a gpu_ids=()
@@ -192,7 +192,7 @@ stage1_parallel() {
     local -a pids=() used=()
     for ((i = 0; i < ngpu; i++)); do
         [ -z "$(ls -A "$split_root/g$i" 2>/dev/null)" ] && continue
-        echo "  ▶ 流[i=${gpu_ids[$i]}]: $(cd "$split_root/g$i" && printf '%s ' *.json)"
+        echo "  ▶ 流[i=${gpu_ids[$i]}]：$(cd "$split_root/g$i" && printf '%s ' *.json)"
         CUDA_VISIBLE_DEVICES="${gpu_ids[$i]}" \
             python "$RUN_AF3" "--input_dir=$split_root/g$i" \
             --output_dir="$AF3_OUT_DIR" \
@@ -223,47 +223,47 @@ mkdir -p "$done_dir"
 for jf in "$AF3_BUNDLE_DIR"/*.json; do
     base="$(basename "$jf" .json)"
     if has_result "$base"; then
-        echo "已有结果, 移出待跑集: $base"
+        echo "已有结果，移出待跑集：$base"
         mv "$jf" "$done_dir/"
     fi
 done
 
 remaining=("$AF3_BUNDLE_DIR"/*.json)
 if [ ${#remaining[@]} -eq 0 ]; then
-    echo "AF3 打包推理结束: $(date) | 本包任务均已有结果, 无需运行"
+    echo "AF3 打包推理结束：$(date) | 本包任务均已有结果，无需运行"
     consolidate_outputs        # 折叠可能残留的时间戳兄弟目录，令规范目录成为唯一位置
     exit 0
 fi
 echo "本包待跑任务 ${#remaining[@]} 个: $(printf '%s ' "${remaining[@]##*/}" | tr ' ' '\n' | sed 's/\.json$//' | tr '\n' ' ')"
 
 if [ "$AF3_GPUS_PER_JOB" -gt 1 ] && [ ${#remaining[@]} -gt 1 ]; then
-    echo "=== 阶段1: 多卡并行（$AF3_GPUS_PER_JOB 张卡, 任务按靶标分组）==="
+    echo "=== 阶段1：多卡并行（$AF3_GPUS_PER_JOB 张卡，任务按靶标分组）==="
     if stage1_parallel "$AF3_GPUS_PER_JOB"; then rc1=0; else rc1=1; fi
 else
-    echo "=== 阶段1: 整包运行（共享同靶标 MSA 缓存）==="
+    echo "=== 阶段1：整包运行（共享同靶标 MSA 缓存）==="
     if run_once "--input_dir=$AF3_BUNDLE_DIR"; then rc1=0; else rc1=1; fi
 fi
 
 rc="$rc1"
 if [ "$rc1" -ne 0 ]; then
-    echo "=== 阶段2: 阶段1 中断（退出码 $rc1）, 逐任务容错补跑 ==="
+    echo "=== 阶段2：阶段1 中断（退出码 $rc1），逐任务容错补跑 ==="
     nfail=0
     for jf in "$AF3_BUNDLE_DIR"/*.json; do
         base="$(basename "$jf" .json)"
         if has_result "$base"; then
-            echo "  ✓ 已有结果, 跳过: $base"
+            echo "  ✓ 已有结果，跳过：$base"
             continue
         fi
-        echo "  ▶ 补跑: $base"
+        echo "  ▶ 补跑：$base"
         if ! run_once "--json_path=$jf"; then
-            echo "  ✗ 失败（已隔离, 不影响同包其它任务）: $base"
+            echo "  ✗ 失败（已隔离，不影响同包其它任务）：$base"
             nfail=$((nfail + 1))
         fi
     done
     rc="$nfail"
 fi
 
-echo "AF3 打包推理结束: $(date) | 阶段1退出码: $rc1 | 最终失败任务数: $rc"
+echo "AF3 打包推理结束：$(date) | 阶段1退出码：$rc1 | 最终失败任务数：$rc"
 
 # 把本次产生的 <名>_<时间戳>/ 输出折叠进规范目录，供登录节点统一收割与去重
 consolidate_outputs

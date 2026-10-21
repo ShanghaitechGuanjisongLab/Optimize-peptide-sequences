@@ -76,7 +76,7 @@ def extract(paths) -> int:
             with open(p) as f:
                 d = json.load(f)
         except (OSError, ValueError) as e:
-            print(f"  ⚠️ 跳过 {p}: {e}")
+            print(f"  ⚠️ 跳过 {p}：{e}")
             continue
         for entry in d.get("sequences", []):
             prot = entry.get("protein")
@@ -137,10 +137,10 @@ def main():
 
     if op in ("extract", "harvest"):
         n = extract(paths)
-        print(f"✅ {op}: 提取 {len(paths)} 个文件, 新入库 {n} 条链 MSA")
+        print(f"✅ {op}：提取 {len(paths)} 个文件，新入库 {n} 条链 MSA")
     elif op == "embed":
         hit, miss = embed(paths)
-        print(f"✅ embed: 内嵌 {hit} 条链, 缺缓存 {miss} 条（将现场搜索并自愈）")
+        print(f"✅ embed：内嵌 {hit} 条链，缺缓存 {miss} 条（将现场搜索并自愈）")
     elif op == "stat":
         files = glob.glob(os.path.join(CACHE_ROOT, "*.json"))
         tgt = pep = 0
@@ -154,9 +154,9 @@ def main():
                 pep += 1
             else:
                 tgt += 1
-        print(f"缓存根: {CACHE_ROOT}\n链条目: {len(files)}（靶标 {tgt} / 肽链 {pep}）")
+        print(f"缓存根：{CACHE_ROOT}\n链条目：{len(files)}（靶标 {tgt} / 肽链 {pep}）")
     else:
-        print(f"未知操作: {op}")
+        print(f"未知操作：{op}")
         return 2
     return 0
 

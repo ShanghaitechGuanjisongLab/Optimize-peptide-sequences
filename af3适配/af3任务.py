@@ -84,6 +84,34 @@ def gen_task(json_path: str, env: dict, task_root: str) -> str:
     return tdir
 
 
+def pending_jobs():
+    """HQ 中尚未终态的任务：{name: job_id}。
+
+    为什么必须有它：提交前只看磁盘有无 summary（drain_backlog / prepare_cycle）是不够的。
+    编排进程被 restart-service 杀掉时，它已提交的任务**仍在 HQ 队列里继续跑**，
+    新进程扫磁盘会发现它们“未完成”而重新提交 → 同一个预测算两遍（单卡下翻倍工时）。
+    故提交前先拿这份名单，命中的直接接管其 job id 去等，而非重提。
+
+    终态判据：task_stats 的 running+waiting 为零（HQ 0.27 的 json 输出**无 state 字段**，
+    实测字段为 id/name/is_open/task_count/task_stats；is_open 恒为 False，不得用作判据）。
+    任何异常都返回空集：宁可退化为重提（不丢计算），也不能让作业裸崩。"""
+    try:
+        r = subprocess.run(["bash", TASKCTL, "list", "--json"],
+                           capture_output=True, text=True, timeout=60)
+        jobs = json.loads(r.stdout or "[]")
+    except Exception as e:                   # noqa: BLE001
+        print(f"  ⚠️  无法读取任务中间层队列({e}), 本次不做接管查重", flush=True)
+        return {}
+    out = {}
+    for j in jobs:
+        ts = j.get("task_stats") or {}
+        if (ts.get("running") or 0) + (ts.get("waiting") or 0) > 0:
+            name = j.get("name")
+            if name:
+                out[name] = j.get("id")
+    return out
+
+
 def submit(json_path: str, env: dict, task_root: str, priority: int = 0,
            gpus: int = 1, cpus: int = 6, name: str = None) -> int:
     """生成并提交单个 AF3 任务；返回 HQ job id。"""
@@ -97,7 +125,7 @@ def submit(json_path: str, env: dict, task_root: str, priority: int = 0,
         capture_output=True, text=True)
     m = re.search(r"ID=(\d+)", r.stdout)
     if not m:
-        raise RuntimeError(f"提交失败: {r.stdout}{r.stderr}")
+        raise RuntimeError(f"提交失败：{r.stdout}{r.stderr}")
     return int(m.group(1))
 
 
@@ -152,7 +180,7 @@ def main():
             else:
                 rest.append(a)
         if not env_json or not rest:
-            print("用法: af3任务.py submit --env-json <env.json> [--priority N] "
+            print("用法：af3任务.py submit --env-json <env.json> [--priority N] "
                   "[--task-root DIR] <任务.json...>")
             return 2
         with open(env_json) as f:
@@ -160,12 +188,12 @@ def main():
         task_root = task_root or os.path.join(
             os.path.dirname(os.path.abspath(rest[0])), "_hq_tasks")
         ids = submit_all(rest, env, task_root, priority=priority)
-        print("✅ 已提交任务: " + " ".join(str(i) for i in ids))
+        print("✅ 已提交任务：" + " ".join(str(i) for i in ids))
     elif op == "wait":
         wait(sys.argv[2:])
         print("✅ 全部任务已到终态")
     else:
-        print(f"未知操作: {op}")
+        print(f"未知操作：{op}")
         return 2
     return 0
 

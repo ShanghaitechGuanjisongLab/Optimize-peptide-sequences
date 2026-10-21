@@ -19,7 +19,7 @@
 #   sbatch 云端贝叶斯.sbatch
 # =====================================================
 
-echo "作业开始: $(date) | 节点: $(hostname)"
+echo "作业开始：$(date) | 节点：$(hostname)"
 
 source ~/miniconda3/etc/profile.d/conda.sh
 conda activate base    # 依赖已齐，计算节点无外网，不能联网 pip 安装
@@ -31,4 +31,4 @@ cd "$SLURM_SUBMIT_DIR" || exit 1
 # -u 关闭缓冲，使日志可实时跟踪 (tail -f pepopt_bo_%j.out)
 python -u 小肽优化_BO.py --server
 
-echo "作业结束: $(date)"
+echo "作业结束：$(date)"

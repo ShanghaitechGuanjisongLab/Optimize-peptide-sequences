@@ -53,7 +53,7 @@ for _m in ("sklearn", "scipy"):
     except ImportError:
         _missing.append(_m)
 if _missing:
-    sys.exit(f"❌ 缺少依赖: {_missing}\n   请先执行: pip install scikit-learn scipy")
+    sys.exit(f"❌ 缺少依赖：{_missing}\n   请先执行：pip install scikit-learn scipy")
 
 from scipy.stats import norm
 from sklearn.gaussian_process import GaussianProcessRegressor
@@ -134,7 +134,7 @@ def build_candidate_pool(n_candidates, seed=42):
         new_tail = generate_mutant(ORIG_TAIL)
         pool.add(FIXED_A + new_tail)
     pool = sorted(pool)
-    print(f"📦 候选库: {len(pool)} 个唯一序列（含初始序列）")
+    print(f"📦 候选库：{len(pool)} 个唯一序列（含初始序列）")
     return pool
 
 
@@ -236,7 +236,7 @@ def load_evaluations():
         df = pd.DataFrame(rows, columns=cols)
         for c in cols[1:]:
             df[c] = pd.to_numeric(df[c], errors="coerce")
-        print(f"⏩ 发现 {len(df)} 条已评估记录: {EVAL_CSV}（断点续跑）")
+        print(f"⏩ 发现 {len(df)} 条已评估记录：{EVAL_CSV}（断点续跑）")
         return df
     return pd.DataFrame(columns=cols)
 
@@ -330,15 +330,15 @@ def run_bo(predict_fn, pool_size=DEFAULT_POOL, batch_size=DEFAULT_BATCH,
     # ---- 冷启动评估 ----
     if init_needed:
         round_no += 1
-        print(f"\n== 轮次 {round_no}: 冷启动评估 {len(init_needed)} 个候选 ==")
+        print(f"\n== 轮次 {round_no}：冷启动评估 {len(init_needed)} 个候选 ==")
         evaluate_batch(init_needed, round_no, "init")
 
     # ---- 贝叶斯优化主循环 ----
     while len(df_eval) < budget and round_no < 500:
         n_eval = len(df_eval)
         round_no += 1
-        print(f"\n== 轮次 {round_no}: 拟合代理模型并挑选候选 "
-              f"(已评估 {n_eval}/{budget}) ==")
+        print(f"\n== 轮次 {round_no}：拟合代理模型并挑选候选 "
+              f"（已评估 {n_eval}/{budget}）==")
 
         rows = df_eval
         if len(rows) == 0:
@@ -367,7 +367,7 @@ def run_bo(predict_fn, pool_size=DEFAULT_POOL, batch_size=DEFAULT_BATCH,
                 acq = np.ones(len(X_cand_s))
                 picked = select_batch(acq, X_cand_s, uneval, batch_size)
 
-            print(f"  🎯 采集函数选出 {len(picked)} 个候选: "
+            print(f"  🎯 采集函数选出 {len(picked)} 个候选："
                   f"{[f'seq_{i:04d}' for i in picked]}")
             evaluate_batch(picked, round_no, f"round_{round_no:02d}")
         else:
@@ -387,8 +387,8 @@ def run_bo(predict_fn, pool_size=DEFAULT_POOL, batch_size=DEFAULT_BATCH,
     if best_feasible_row is not None:
         best_seq = best_feasible_row["peptide"]
         best_score = best_feasible_row["score_htr1a"]
-        print(f"🏆 最佳序列: {best_seq}")
-        print(f"📊 最佳 score: {best_score}  (ipTM = {1 - best_score:.3f})")
+        print(f"🏆 最佳序列：{best_seq}")
+        print(f"📊 最佳 score：{best_score}  （ipTM = {1 - best_score:.3f}）")
         for t in OFF_TARGETS:
             v = best_feasible_row[_OFF_COL[t]]
             desc = f"{v:.3f}" if pd.notna(v) else "未评估（本次运行已搁置, 待高端 GPU 补跑）"
@@ -399,7 +399,7 @@ def run_bo(predict_fn, pool_size=DEFAULT_POOL, batch_size=DEFAULT_BATCH,
             dest = os.path.join(dest_dir, "BEST_peptide_HTR1A.zip")
             import shutil
             shutil.copy(best_path, dest)
-            print(f"📁 最佳结果已保存: {dest}")
+            print(f"📁 最佳结果已保存：{dest}")
         pd.DataFrame([[best_seq, best_score,
                        best_feasible_row["iptm_unc13c"],
                        best_feasible_row["iptm_bin1"]]],
@@ -422,7 +422,7 @@ def run_bo(predict_fn, pool_size=DEFAULT_POOL, batch_size=DEFAULT_BATCH,
         plt.tight_layout()
         plt.savefig(os.path.join(BO_ROOT, "bo_curve.png"))
         plt.close()
-        print(f"📈 曲线: {os.path.join(BO_ROOT, 'bo_curve.png')}")
+        print(f"📈 曲线：{os.path.join(BO_ROOT, 'bo_curve.png')}")
     print("=" * 60)
     return best_feasible_row
 
@@ -440,13 +440,13 @@ if __name__ == "__main__":
     parser.add_argument("--pool", type=int, default=DEFAULT_POOL,
                         help=f"候选库大小（默认 {DEFAULT_POOL}）")
     parser.add_argument("--targets", default=",".join(TARGET_ORDER),
-                        help="逗号分隔的待评估靶标（必须含 HTR1A）。V100 分区用--targets HTR1A,BIN1: UNC13C 复合物 ~2233 tokens 超过V100上限 1280, 搁置待 A100/H100 补跑")
+                        help="逗号分隔的待评估靶标（必须含 HTR1A）。V100 分区用--targets HTR1A,BIN1：UNC13C 复合物 ~2233 tokens 超过V100上限 1280，搁置待 A100/H100 补跑")
     args = parser.parse_args()
 
     want = {t.strip().upper() for t in args.targets.split(",") if t.strip()}
     unknown = want - set(TARGET_ORDER)
     if unknown:
-        parser.error(f"--targets 含未知靶标 {sorted(unknown)}, 可选: {TARGET_ORDER}")
+        parser.error(f"--targets 含未知靶标 {sorted(unknown)}，可选：{TARGET_ORDER}")
     if "HTR1A" not in want:
         parser.error("--targets 必须包含 HTR1A（优化目标）")
     pending_targets = set_active_targets(want)
@@ -457,22 +457,22 @@ if __name__ == "__main__":
     print("=" * 60)
     off_desc = "+".join(ACTIVE_OFF) if ACTIVE_OFF else "无"
     print(f"🧬 贝叶斯优化 — 小肽序列（HTR1A 结合↑ / {off_desc} 结合↓）")
-    print(f"   本次评估靶标: {ACTIVE_TARGETS} | 结果目录: {BO_ROOT}/")
+    print(f"   本次评估靶标：{ACTIVE_TARGETS} | 结果目录：{BO_ROOT}/")
     if pending_targets:
-        print(f"   ⏸️  搁置靶标: {pending_targets}（V100 显存放不下, 待 A100/H100 以全靶标重跑补齐; 已有 HTR1A/BIN1 结果会被直接复用）")
+        print(f"   ⏸️  搁置靶标：{pending_targets}（V100 显存放不下，待 A100/H100 以全靶标重跑补齐；已有 HTR1A/BIN1 结果会被直接复用）")
     print("=" * 60)
 
     if args.server:
         import 小肽云端后端 as server
         server.AUTO_MODE = False
         predict_fn = server.predict_and_score
-        print("运行模式: AlphaFold Server（--server，与主脚本相同的手动/自动流程，受每日配额限制）")
+        print("运行模式：AlphaFold Server（--server，与主脚本相同的手动/自动流程，受每日配额限制）")
     else:
         import 小肽优化_本地集群 as loc
         # 预检查 + 解压作业实时进度跟随（运行中则等待，不继续后续步骤）
         loc.ensure_local_ready()
         predict_fn = loc.local_predict_and_score
-        print("运行模式: 本地集群推理（默认，自动提交 SLURM GPU 作业，无配额限制）")
+        print("运行模式：本地集群推理（默认，自动提交 SLURM GPU 作业，无配额限制）")
 
     run_bo(predict_fn, pool_size=args.pool, batch_size=args.batch,
            budget=args.budget)

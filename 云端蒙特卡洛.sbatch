@@ -18,7 +18,7 @@
 # 提交：sbatch 云端蒙特卡洛.sbatch 查看：squeue -u $USER
 # =====================================================
 
-echo "作业开始: $(date) | 节点: $(hostname)"
+echo "作业开始：$(date) | 节点：$(hostname)"
 
 # 初始化 conda 并激活 base 环境（依赖已齐：numpy/pandas/matplotlib/openpyxl）
 # 注意：计算节点无外网，不能依赖 pip 联网安装
@@ -30,4 +30,4 @@ cd "$SLURM_SUBMIT_DIR" || exit 1
 # -u 关闭缓冲，使日志可实时跟踪 (tail -f pepopt_%j.out)
 python -u 小肽优化_云端.py
 
-echo "作业结束: $(date)"
+echo "作业结束：$(date)"

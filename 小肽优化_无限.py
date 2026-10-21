@@ -26,7 +26,7 @@
     python 小肽优化_无限.py                  # 默认 --targets HTR1A,BIN1
     python 小肽优化_无限.py --migrate       # 先把家目录旧结果迁入共享库再开跑
     python 小肽优化_无限.py --batch 6 --poll 300
-    python 小肽优化_无限.py --status         # 只打印数据库统计与 BEST_TOP10, 不启动搜索
+    python 小肽优化_无限.py --status         # 只打印数据库统计与 BEST_TOP10，不启动搜索
 终止：kill <PID>（或 Ctrl+C）；已提交的 SLURM 作业不受影响，重跑即续作。
 
 共享数据库（小肽数据库，默认 /public_bme2/Share200T/管吉松/peptide_opt_db）：
@@ -89,7 +89,7 @@ _STOP = False
 def _handle_stop(signum, frame):
     global _STOP
     _STOP = True
-    print(f"\n🛑 收到信号 {signum}, 本轮结束后优雅退出（已提交的 SLURM 作业继续运行, 重跑本脚本即续作）…", flush=True)
+    print(f"\n🛑 收到信号 {signum}，本轮结束后优雅退出（已提交的 SLURM 作业继续运行，重跑本脚本即续作）…", flush=True)
 
 
 # ===================== 候选池（按需无限扩展）=====================
@@ -189,7 +189,7 @@ def heuristic_pick(stream, n, active_targets):
         try:
             picked = _gp_pick(rows, active_off, n_gp, exclude, stream)
         except Exception as e:                        # GP 数值异常不应中断无限搜索
-            print(f"  ⚠️ GP 挑选失败({e}), 本轮全部随机探索", flush=True)
+            print(f"  ⚠️ GP 挑选失败（{e}），本轮全部随机探索", flush=True)
 
     need = n - len(picked)
     if need > 0:                                      # 冷启动/GP 不足时随机补齐
@@ -306,7 +306,7 @@ class ExhaustiveQueue:
         self.center, self.max_edit = center, max_edit
         self.space = enumerate_space(center, max_edit, min_len, max_len)
         if not self.space:
-            raise RuntimeError("穷尽枚举返回空集, 无法保证覆盖")
+            raise RuntimeError("穷尽枚举返回空集，无法保证覆盖")
 
     # ---- 状态视图 ----
     def pending(self, attempted=None):
@@ -351,7 +351,7 @@ class ExhaustiveQueue:
                     picked.append(v)
                     chosen.add(v)                   # chosen 与 _gp_order 的 exclude 同一对象
             except Exception as e:                  # GP 异常绝不阻断穷尽推进
-                print(f"  ⚠️ GP 排序失败({e}), 本轮改为字典序游标推进", flush=True)
+                print(f"  ⚠️ GP 排序失败（{e}），本轮改为字典序游标推进", flush=True)
 
         for v in rot:                               # 仍不足 → 按游标补齐
             if len(picked) >= n:
@@ -503,7 +503,7 @@ def harvest_and_report(active_targets, new_sample_fn=None):
             return (0, -r["objective"])
         return (1, r["score_htr1a"])
     best3 = sorted(rows, key=_key)[:3]
-    print(f"  🗄️  数据库: 总 {s['total']} 序列 | ASIC1A {s.get('asic1a', '-')} | "
+    print(f"  🗄️  数据库：总 {s['total']} 序列 | ASIC1A {s.get('asic1a', '-')} | "
           f"HTR1A {s['htr1a']} | BIN1 {s['bin1']} | UNC13C {s['unc13c']} | "
           f"完整评估 {len(rows)} | 当前可行 {len(evaluable)}", flush=True)
     for r in best3:
@@ -513,7 +513,7 @@ def harvest_and_report(active_targets, new_sample_fn=None):
             factors = " ".join(f"{t}={r[f'iptm_{t.lower()}']:.2f}"
                                for t in PRODUCT_TARGETS
                                if r.get(f"iptm_{t.lower()}") is not None)
-            print(f"     🏅 {r['peptide']}  乘积={r['objective']:.4f}  ({factors})",
+            print(f"     🏅 {r['peptide']}  乘积={r['objective']:.4f}  （{factors}）",
                   flush=True)
         else:
             cons = " ".join(f"{t}={r['cons'].get(OFF_COL[t])}" for t in active_targets
@@ -523,32 +523,83 @@ def harvest_and_report(active_targets, new_sample_fn=None):
     return n_new, new_tags
 
 
-def climb_new_records(new_tags, active_targets, new_sample_fn, max_rounds=10):
-    """对新入库的记录做首次爬山：重复补采新 seed，直到 objective 不再打破记录。
+# 首次爬山开关与轮数上限：每轮 = 激活靶标数个真跑 AF3 任务（实测 HTR1A+BIN1 ≈13~16min/序列）。
+# 2026-10-21 用户定稿：首次采样一律反复爬山**直到不再破纪录，次数无上限** → CLIMB_ROUNDS 默认 0（无限），
+# 由破纪录判定终止；需要临时限制算力时仍可手动设 PEPOPT_CLIMB_ROUNDS 为正整数。
+CLIMB_ENABLED = os.environ.get("PEPOPT_CLIMB", "1").strip().lower() not in \
+                ("0", "false", "no", "off")
+CLIMB_ROUNDS = max(0, int(os.environ.get("PEPOPT_CLIMB_ROUNDS", "0")))   # 0 = 无上限
 
-    策略：每个 tag 初始 objective = ipTM(HTR1A) × ipTM(BIN1)，循环补采（new_sample_fn 真跑 AF3），每轮后刷新 objective，若新值 > 旧值则继续，否则停止。最多 max_rounds 轮防死循环。"""
+
+def climb_new_records(new_tags, active_targets, new_sample_fn, max_rounds=None):
+    """对新入库的记录做首次爬山：反复补采新 seed，直到新样本没能打破自身最佳。2026-10-21 规格：**默认无轮数上限**（max_rounds=0 或 None 且 CLIMB_ROUNDS=0 时无限），仅由破纪录判定终止；补采无产物（时限护栏/AF3 失败）也会停，且不置 climb_done，留给后续数据库整理续爬。
+
+    为什么必须直接用补采返回值、而不能像早期版本那样靠 ingest_new_records 刷新：
+    后者内部对 `obj_n > 0` 的行直接 `continue`，而新记录入库时 obj_n 已为初次样本数，于是补采产物永远进不了库 → get_objective 读到旧值 → 首轮必判“未破纪录”。
+    实测后果：32 个 bundle 真跑完 AF3（每个 12 份产物）而 obj_n 恒为 5，相当于把每周期一半的 GPU 时白烧。
+
+    本实现：每轮把补采的**全部**乘积样本 add_many 进 BetaFit（含未破纪录的），n/sum_x/sum_x2 增量随 save_obj_stats 落库 → 采样次数与分布估计都计入 β 拟合；
+    破纪录时用该样本的**分量** ipTM 回写 iptm_* 列（upsert 会自动重算 objective_product），因此库里的最高纪录与 β 拟合始终同源。每轮落盘：进程被 restart 打断最多丢一轮。
+
+    返回 {"climbed"：参与爬山条数，"rounds"：补采总轮次，"improved"：被刷新条数，"samples"：新增计入拟合的样本数}。"""
+    stat = {"climbed": 0, "rounds": 0, "improved": 0, "samples": 0}
+    if not CLIMB_ENABLED:
+        return stat
     if not new_tags or new_sample_fn is None:
-        return
-    print(f"  🧗 首次爬山: 对 {len(new_tags)} 个新记录重复补采直到不破纪录", flush=True)
+        return stat
+    rounds_cap = CLIMB_ROUNDS if max_rounds is None else max(0, int(max_rounds))
+    cap_txt = f"至多 {rounds_cap} 轮" if rounds_cap > 0 else "轮数无上限"
+    print(f"  🧗 首次爬山：{len(new_tags)} 条新记录，每条{cap_txt}"
+          f"（新 seed 真跑 AF3，只要一直破纪录就一直采）", flush=True)
     for tag in sorted(new_tags):
-        best_obj = db.get_objective(tag)
-        if best_obj is None:
-            continue
-        print(f"    • {tag}: 初始 {best_obj:.4f}", end="", flush=True)
-        for rnd in range(1, max_rounds + 1):
-            samples = new_sample_fn(tag, n=1)
-            if not samples:
-                print(" (补采失败)", flush=True)
+        row = db.load_database().get(tag) or {}
+        fit = db.load_obj_fit(tag)
+        if fit is None or fit.max_x is None:
+            continue                       # 尚无 β 统计量/无初次样本，无从爬山
+        best = fit.max_x
+        stat["climbed"] += 1
+        print(f"    • {tag} {row.get('var_region') or ''}：初始 {best:.4f}",
+              end="", flush=True)
+        rnd = 0
+        while True:                        # 2026-10-21 规格：无轮数上限，由破纪录判定终止
+            rec = (new_sample_fn(tag, raw=True) or {}).get(tag) or {}
+            prods = [float(x) for x in (rec.get("products") or [])]
+            if not prods:                  # 时间护栏拦下/变因子不齐/AF3 失败
+                print(" （无补采产物，停止）", flush=True)
                 break
-            n_fit = seq_sample.ingest_new_records(None)
-            new_obj = db.get_objective(tag)
-            if new_obj is None or new_obj <= best_obj:
-                print(f" → {rnd} 轮后 {new_obj or 'N/A'}（未破纪录，停止）", flush=True)
+            rnd += 1
+            t2s = rec.get("samples") or {}
+            k = max(range(len(prods)), key=lambda i: prods[i])
+            newmax = prods[k]
+            fit.add_many(prods)            # 全部计入 β 拟合（含未破纪录的）
+            stat["rounds"] += 1
+            stat["samples"] += len(prods)
+            broke = newmax > best + 1e-9
+            if broke:
+                best = newmax
+                stat["improved"] += 1
+                for t, vals in t2s.items():    # 最佳样本的分量 → iptm_* 列
+                    if t in active_targets and k < len(vals):
+                        db.upsert_result(tag, t, float(vals[k]),
+                                         peptide=row.get("peptide"),
+                                         var=row.get("var"), source="climb")
+            else:
+                # 爬山以“不再破纪录”收束：置 climb_done 后，若该记录仍是单点/退化（β 无解），
+                # 数据库整理不会再对它重复爬山（见 小肽统计.consolidation_pass 的单点爬山分支）
+                fit.climb_done = 1
+            db.save_obj_stats(tag, fit)
+            if not broke:
+                print(f" → 第 {rnd} 轮最佳 {newmax:.4f} ≤ 最佳纪录 {best:.4f}，停止"
+                      f"（已累计 {fit.n} 样本）", flush=True)
                 break
-            print(f" → {new_obj:.4f}", end="", flush=True)
-            best_obj = new_obj
-        else:
-            print(f" (达 {max_rounds} 轮上限)", flush=True)
+            print(f" → {best:.4f}*", end="", flush=True)
+            if rounds_cap > 0 and rnd >= rounds_cap:
+                print(f" （达 {rounds_cap} 轮上限，最佳 {best:.4f}）", flush=True)
+                break
+    print(f"  🧗 爬山结束：{stat['climbed']} 条参与 / {stat['rounds']} 轮补采 / "
+          f"{stat['improved']} 条刷新纪录 / {stat['samples']} 样本计入拟合",
+          flush=True)
+    return stat
 
 
 # ===================== 主循环 =====================
@@ -566,11 +617,11 @@ def run_infinite(active_targets, batch, poll, backlog_limit):
         for t in active_targets)
 
     round_no = 0
-    print(f"\n♾️  无限搜索启动: 靶标={active_targets} | 底线约束="
+    print(f"\n♾️  无限搜索启动：靶标={active_targets} | 底线约束="
           f"{[t for t in OFF_TARGETS if t in active_targets]} "
-          f"(ipTM<{OFF_THRESHOLD}, UNC13C 搁置时其列留空) | 每轮≤{batch} 新序列 | "
+          f"（ipTM<{OFF_THRESHOLD}，UNC13C 搁置时其列留空）| 每轮≤{batch} 新序列 | "
           f"积压上限 {backlog_limit} 任务 | 轮询 {poll}s\n"
-          f"    共享数据库: {p['root']}\n", flush=True)
+          f"    共享数据库：{p['root']}\n", flush=True)
 
     while not _STOP:
         round_no += 1
@@ -597,7 +648,7 @@ def run_infinite(active_targets, batch, poll, backlog_limit):
             n_new = min(n_new, batch)
             picks = heuristic_pick(stream, n_new, active_targets)
             if picks:
-                print(f"  🎯 挑选 {len(picks)} 个新候选提交: "
+                print(f"  🎯 挑选 {len(picks)} 个新候选提交："
                       f"{[db.resolve_tag(s[len(FIXED_A):]) for s in picks]}", flush=True)
                 submit_candidates(picks, active_targets)
         # 即便不提交新候选，也触发一次打包提交（消化攒批/失败重试）
@@ -609,7 +660,7 @@ def run_infinite(active_targets, batch, poll, backlog_limit):
             time.sleep(min(5, poll - waited))
             waited += 5
 
-    print(f"\n👋 无限搜索已停止（共 {round_no} 轮）。数据库位于: {p['root']}",
+    print(f"\n👋 无限搜索已停止（共 {round_no} 轮）。数据库位于：{p['root']}",
           flush=True)
     print("   重跑本脚本即可续作；已提交的 GPU 作业不受影响。", flush=True)
 
@@ -618,10 +669,10 @@ def run_infinite(active_targets, batch, poll, backlog_limit):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="小肽序列无限搜索（结果持续追加进共享数据库, 直到手动终止）")
+        description="小肽序列无限搜索（结果持续追加进共享数据库，直到手动终止）")
     parser.add_argument("--targets", default=DEFAULT_TARGETS,
-                        help=f"逗号分隔靶标, 必须含 HTR1A（默认 {DEFAULT_TARGETS}；"
-                             "V100 放不下 UNC13C, 解锁后加 --targets HTR1A,BIN1,UNC13C）")
+                        help=f"逗号分隔靶标，必须含 HTR1A（默认 {DEFAULT_TARGETS}；"
+                             "V100 放不下 UNC13C，解锁后加 --targets HTR1A,BIN1,UNC13C）")
     parser.add_argument("--batch", type=int, default=DEFAULT_BATCH,
                         help=f"每轮最多新提交的序列数（默认 {DEFAULT_BATCH}）")
     parser.add_argument("--poll", type=int, default=DEFAULT_POLL,
@@ -629,13 +680,13 @@ def main():
     parser.add_argument("--migrate", action="store_true",
                         help="启动前把家目录旧 af3_local_results/ 的完成结果迁入共享库（复用不重算）")
     parser.add_argument("--status", action="store_true",
-                        help="只打印数据库统计与 BEST_TOP10, 不启动搜索")
+                        help="只打印数据库统计与 BEST_TOP10，不启动搜索")
     args = parser.parse_args()
 
     want = {t.strip().upper() for t in args.targets.split(",") if t.strip()}
     unknown = want - set(TARGET_ORDER)
     if unknown:
-        parser.error(f"--targets 含未知靶标 {sorted(unknown)}, 可选 {TARGET_ORDER}")
+        parser.error(f"--targets 含未知靶标 {sorted(unknown)}，可选 {TARGET_ORDER}")
     if "HTR1A" not in want:
         parser.error("--targets 必须包含 HTR1A（优化目标）")
     active = [t for t in TARGET_ORDER if t in want]
@@ -649,7 +700,7 @@ def main():
 
     if args.status:
         s = db.stats()
-        print(f"🗄️  {s['root']}: 总 {s['total']} | HTR1A {s['htr1a']} | "
+        print(f"🗄️  {s['root']}：总 {s['total']} | HTR1A {s['htr1a']} | "
               f"BIN1 {s['bin1']} | UNC13C {s['unc13c']}")
         best_csv = os.path.join(s["root"], "BEST_TOP10", "BEST_TOP10.csv")
         if os.path.isfile(best_csv):
@@ -669,14 +720,14 @@ def main():
           + "；结果持续追加共享数据库）")
     if any(t not in active for t in OFF_TARGETS):
         pend = [t for t in OFF_TARGETS if t not in active]
-        print(f"   ⏸️  搁置约束: {pend}（超 V100 上限；A100/H100 到位后全靶标重跑,"
-              " 已入库结果自动复用, 仅补算搁置靶标并重排 BEST_TOP10）")
+        print(f"   ⏸️  搁置约束：{pend}（超 V100 上限；A100/H100 到位后全靶标重跑，"
+              " 已入库结果自动复用，仅补算搁置靶标并重排 BEST_TOP10）")
     print("=" * 62)
 
     # 就绪保障：预检查（数据库/权重/hmmer）+ 解压作业跟随（与有限入口一致）
     ok, errors = loc.ensure_local_ready()
     if not ok:
-        print("\n⚠️  预检查未通过仍将尝试运行: 旧结果可复用, 新提交会被跳过\n",
+        print("\n⚠️  预检查未通过仍将尝试运行：旧结果可复用，新提交会被跳过\n",
               flush=True)
 
     backlog_limit = loc.BUNDLE_SIZE * BACKLOG_MULTIPLIER

@@ -63,10 +63,10 @@ fi
 
 # ---- 驱动已死：清理陈旧 PID 文件并重新拉起 ----
 if [[ -f "$PID_FILE" ]]; then
-  log "驱动已死（陈旧 PID $(cat "$PID_FILE" 2>/dev/null)）, 准备重启"
+  log "驱动已死（陈旧 PID $(cat "$PID_FILE" 2>/dev/null)），准备重启"
   rm -f "$PID_FILE"
 else
-  log "无 PID 文件, 准备启动驱动"
+  log "无 PID 文件，准备启动驱动"
 fi
 
 # cron 的最小环境不含 conda；显式加载。PATH 由 crontab 的 PATH= 行提供，若缺失（手工调用）则补上 SLURM 与 conda 目录，保证 sbatch/squeue 可用。
@@ -82,13 +82,13 @@ setsid nohup python -u 小肽优化_无限.py --migrate \
       </dev/null >"$DLOG" 2>&1 &
 PID=$!
 echo "$PID" > "$PID_FILE"
-log "已重新拉起驱动 PID=$PID, 日志 $DLOG"
+log "已重新拉起驱动 PID=$PID，日志 $DLOG"
 
 # 稍等片刻确认它没立刻崩（例如 conda/依赖问题），否则记一条便于排查
 sleep 8
 if kill -0 "$PID" 2>/dev/null; then
-  log "确认存活 (8s 后仍在运行)"
+  log "确认存活（8s 后仍在运行）"
 else
-  log "警告: 拉起后 8s 内退出, 请查看 $DLOG"
+  log "警告：拉起后 8s 内退出，请查看 $DLOG"
 fi
 exit 0

@@ -5,9 +5,11 @@
 # 用法：
 #   ./运行.sh            # 默认：提交**单个长驻循环作业**（当前形态，推荐）
 #   ./运行.sh loop       # 同上（显式写法）；计算节点作业内部无限循环搜索
-#   ./运行.sh stop       # 停止（scancel 循环作业 + 阻止看门狗续交）
+#   ./运行.sh stop       # 停止（scancel 循环作业 + 阻止看门狗续交）→ 会释放节点
 #   ./运行.sh status     # 作业/看门狗状态 + 穷尽覆盖进度 + 数据库统计与 BEST_TOP10
-#   ./运行.sh restart-loop # 改完代码后**在周期边界**优雅重启（新代码生效，不废已完成周期）
+#   ./运行.sh reload     # 改完代码后**立即**换编排进程（守护重启它，作业与节点都不释放）
+#   ./运行.sh restart-loop # 同上，但等**当前周期算完**再换（收尾更干净，代价是多等数小时）
+#   #  ↑ 两者都不 scancel，因此不必重新排队；分区满载时重排可能等数小时（2026-10-21 实测踩过）
 #   ./运行.sh watchdog   # 单独安装 cron 看门狗（loop 会自动装）
 #   ./运行.sh no-watchdog# 卸载看门狗
 #   ./运行.sh infinite   # 【legacy】登录节点常驻驱动形态（脆弱，仅保留兼容）
@@ -45,6 +47,12 @@ LOOP_CYCLE_SEQS="${PEPOPT_CYCLE_SEQS:-24}"
 LOOP_DISABLED="$RUNS_DIR/loop.disabled"       # stop 写入 → 看门狗不再续交
 LOOP_WLOG="$RUNS_DIR/循环看门狗.log"
 LOOP_WATCHDOG="$REPO_DIR/作业脚本/循环看门狗.sh"
+TASKCTL_DIR="${TASKCTL_HOME:-$REPO_DIR/../任务中间层}"
+# 规范化掉 ../，否则提示语里会出现 .../Optimize-peptide-sequences/../任务中间层 这种难读路径
+[[ -d "$TASKCTL_DIR" ]] && TASKCTL_DIR="$(cd "$TASKCTL_DIR" && pwd)"
+TASKCTL="$TASKCTL_DIR/任务控制.sh"             # 中间层客户端
+# service.info 存在 = 当前作业是「守护托管」形态（重载码退出会被守护接住，节点不释放）
+SVC_INFO="${TASKCTL_STATE:-$TASKCTL_DIR/运行状态}/service.info"
 
 # ---- 【legacy】登录节点常驻驱动 ----
 PID_FILE="$RUNS_DIR/infinite.pid"
@@ -62,7 +70,7 @@ driver_alive() {
 
 install_watchdog() {
   local wd="${1:-$LOOP_WATCHDOG}"          # 默认监督循环作业；legacy 传驱动看门狗
-  command -v crontab >/dev/null 2>&1 || { echo "⚠️  无 crontab, 无法装看门狗"; return 1; }
+  command -v crontab >/dev/null 2>&1 || { echo "⚠️  无 crontab，无法装看门狗"; return 1; }
   [[ -f "$wd" ]] || { echo "⚠️  缺看门狗脚本 $wd"; return 1; }
   chmod +x "$wd" 2>/dev/null
   local tmp; tmp="$(mktemp)"
@@ -85,10 +93,10 @@ install_watchdog() {
   } >> "$tmp"
   if crontab "$tmp"; then
     [[ "$wd" == "$LOOP_WATCHDOG" ]] \
-      && echo "🩺 cron 看门狗已装: 每 ${WATCHDOG_INTERVAL} 分钟检查（循环作业不在队列就续交）" \
-      || echo "🩺 cron 看门狗已装(legacy 驱动形态): 每 ${WATCHDOG_INTERVAL} 分钟自愈一次"
-    echo "   📌 烙入的战役参数: DB_ROOT=${PEPOPT_DB_ROOT:-默认} | TARGETS=$LOOP_TARGETS | CYCLE_SEQS=$LOOP_CYCLE_SEQS"
-    echo "   卸载: ./运行.sh no-watchdog"
+      && echo "🩺 cron 看门狗已装：每 ${WATCHDOG_INTERVAL} 分钟检查（循环作业不在队列就续交）" \
+      || echo "🩺 cron 看门狗已装（legacy 驱动形态）：每 ${WATCHDOG_INTERVAL} 分钟自愈一次"
+    echo "   📌 烙入的战役参数：DB_ROOT=${PEPOPT_DB_ROOT:-默认} | TARGETS=$LOOP_TARGETS | CYCLE_SEQS=$LOOP_CYCLE_SEQS"
+    echo "   卸载：./运行.sh no-watchdog"
   else
     echo "⚠️  crontab 安装失败"
   fi
@@ -119,7 +127,7 @@ active_loop_log() {
 kill_legacy_driver() {
   driver_alive || return 1
   local pid; pid="$(cat "$PID_FILE" 2>/dev/null)"
-  echo "🧹 停掉旧形态的登录节点常驻驱动 (PID $pid), 避免两套编排抢 QoS 队列…"
+  echo "🧹 停掉旧形态的登录节点常驻驱动（PID $pid），避免两套编排抢 QoS 队列…"
   mkdir -p "$RUNS_DIR"; date '+%F %T' > "$DISABLED_FILE"
   kill -TERM "$pid" 2>/dev/null
   for _ in $(seq 1 10); do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
@@ -152,31 +160,31 @@ start_loop() {
   kill_legacy_driver
   local j; j="$(loop_jobs)"
   if [[ -n "${j// /}" ]]; then
-    echo "♾️  循环作业已在队列: $j（不重复提交）"
+    echo "♾️  循环作业已在队列：$j（不重复提交）"
   else
-    echo "🚀 提交长驻循环作业: 靶标=$LOOP_TARGETS | 每轮 $LOOP_CYCLE_SEQS 序列 …"
+    echo "🚀 提交长驻循环作业：靶标=$LOOP_TARGETS | 每轮 $LOOP_CYCLE_SEQS 序列 …"
     submit_loop
     j="$(loop_jobs)"
   fi
   install_watchdog
   echo
-  echo "♾️  无限搜索由**单个计算节点作业**承担, 登录节点不再需要常驻进程:"
-  echo "   🗄️  数据库: $DB_ROOT"
+  echo "♾️  无限搜索由**单个计算节点作业**承担，登录节点不再需要常驻进程："
+  echo "   🗄️  数据库：$DB_ROOT"
   # 日志路径按 jobid 推算（sbatch 用 --output=runs/loop_%j.out），而不是取 “最近修改的 loop_*.out”：新作业还在 PENDING 时它的日志尚未创建，后者会错误地指向上一个已结束作业的日志，把人引到死文件上。
   local lg jid
   jid="${j%% *}"; jid="${jid// /}"
   if [[ -n "$jid" ]]; then
     lg="$RUNS_DIR/loop_${jid}.out"
-    echo "   📄 作业日志: tail -f $lg"
-    [[ ! -f "$lg" ]] && echo "      （作业 ${jid} 尚在排队, 启动后该文件才出现）"
+    echo "   📄 作业日志：tail -f $lg"
+    [[ ! -f "$lg" ]] && echo "      （作业 ${jid} 尚在排队，启动后该文件才出现）"
   else
     lg="$(loop_log)"
-    [[ -n "$lg" ]] && echo "   📄 最近日志: tail -f $lg"
+    [[ -n "$lg" ]] && echo "   📄 最近日志：tail -f $lg"
   fi
-  echo "   🛑 停止: ./运行.sh stop   |   📊 状态: ./运行.sh status"
+  echo "   🛑 停止：./运行.sh stop   |   📊 状态：./运行.sh status"
   if [[ -z "${j// /}" ]]; then
-    echo "   ⏳ 本次未能提交（多为 QoS 提交窗口被旧作业占满）; 看门狗会在"
-    echo "      窗口空出后自动补交（≤${WATCHDOG_INTERVAL}min）, 无需人工重跑。"
+    echo "   ⏳ 本次未能提交（多为 QoS 提交窗口被旧作业占满）；看门狗会在"
+    echo "      窗口空出后自动补交（≤${WATCHDOG_INTERVAL}min），无需人工重跑。"
   fi
 }
 
@@ -184,7 +192,7 @@ stop_loop() {
   mkdir -p "$RUNS_DIR"; date '+%F %T' > "$LOOP_DISABLED"
   local j; j="$(loop_jobs)"
   if [[ -n "${j// /}" ]]; then
-    echo "🛑 取消循环作业: $j"
+    echo "🛑 取消循环作业：$j"
     # shellcheck disable=SC2086
     scancel $j 2>/dev/null
     for _ in $(seq 1 10); do [[ -z "$(loop_jobs)" ]] && break; sleep 1; done
@@ -193,8 +201,8 @@ stop_loop() {
     echo "循环作业不在队列。"
   fi
   kill_legacy_driver || true
-  echo "   已写停用标记 → 看门狗不再续交; 彻底移除: ./运行.sh no-watchdog"
-  echo "   重新开跑: ./运行.sh loop"
+  echo "   已写停用标记 → 看门狗不再续交；彻底移除：./运行.sh no-watchdog"
+  echo "   重新开跑：./运行.sh loop"
 }
 
 # 穷尽覆盖进度（候选全集 51091 的已派发/待评估 + 全覆盖 ETA）
@@ -209,7 +217,7 @@ import 小肽优化_节点内 as N        # cycle_seconds 在节点入口里定�
 targets = tuple(t for t in re.split(r"[,+]", "$LOOP_TARGETS") if t)
 n = max(1, $LOOP_CYCLE_SEQS)
 if not inf.SWEEP_ENABLED:
-    print("   📈 随机采样模式 (PEPOPT_SWEEP=0): 无穷尽覆盖保证")
+    print("   📈 随机采样模式 (PEPOPT_SWEEP=0)：无穷尽覆盖保证")
 else:
     print("   📈 " + inf.coverage_report(
         targets, cycle_secs=N.cycle_seconds(n), per_cycle=n))
@@ -221,50 +229,81 @@ PY
 restart_loop() {
   local j; j="$(loop_jobs)"
   if [[ -z "${j// /}" ]]; then
-    echo "循环作业不在队列 → 无需重启; 直接 ./运行.sh loop 即以新代码提交。"
+    echo "循环作业不在队列 → 无需重启；直接 ./运行.sh loop 即以新代码提交。"
     return 0
   fi
   if [[ -f "$LOOP_DISABLED" ]]; then
     echo "⚠️  存在停用标记 $LOOP_DISABLED → 重启后看门狗不会续交。"
-    echo "   先执行: ./运行.sh loop"
+    echo "   先执行：./运行.sh loop"
     return 1
   fi
+  # 护栏：只有「守护托管」形态才能在节点内重启。旧形态（python 直接是作业主体）下重载码退出会让作业结束 → 释放节点 → 重新排队（分区满载时可能等数小时）。
+  if [[ ! -f "$SVC_INFO" ]]; then
+    echo "⚠️  当前作业不是守护托管形态（无 $SVC_INFO）"
+    echo "   重启会让作业结束并**释放计算节点**，之后要重新排队（满载时可能数小时）。"
+    echo "   建议：等本作业自然结束（预算用尽 / 5 天到期），看门狗续交的新作业即托管形态。"
+    read -r -p "   仍要立即重启？[y/N] " ans
+    [[ "${ans:-n}" =~ ^[Yy]$ ]] || { echo "   已取消。"; return 1; }
+  fi
   mkdir -p "$RUNS_DIR"; date '+%F %T' > "$RUNS_DIR/restart.requested"
-  echo "🔁 已放置重启标志: $RUNS_DIR/restart.requested  (作业 $j)"
-  echo "   作业会在**当前周期算完后**正常退出, 看门狗 ≤${WATCHDOG_INTERVAL}min 内续交新作业。"
-  echo "   代价仅新作业首轮重建 chain-B MSA（实测 ≈55min）; 已完成周期的结果早已入库。"
-  echo "   撤销（不想重启了）: rm -f $RUNS_DIR/restart.requested"
+  echo "🔁 已放置重启标志：$RUNS_DIR/restart.requested  （作业 $j）"
+  echo "   作业会在**当前周期算完后**以重载码退出，任务守护立即拉起新进程加载新代码。"
+  echo "   SLURM 作业与计算节点**都不释放** → 不必重新排队；MSA 走磁盘缓存，重启后直接复用。"
+  echo "   不想等周期收尾、立即换代码：./运行.sh reload"
+  echo "   撤销（不想重启了）：rm -f $RUNS_DIR/restart.requested"
+}
+
+reload_loop() {
+  if [[ ! -f "$TASKCTL" ]]; then
+    echo "⚠️  找不到中间层客户端：$TASKCTL"
+    echo "   用 TASKCTL_HOME 环境变量指定任务中间层目录"
+    return 1
+  fi
+  local j; j="$(loop_jobs)"
+  if [[ -z "${j// /}" ]]; then
+    echo "⚠️  队列里没有循环作业，无从重启。先执行：./运行.sh loop"
+    return 1
+  fi
+  echo "⚡ 请求**立即**重启编排进程（不等周期收尾）…"
+  bash "$TASKCTL" restart-service || return 1
+  cat <<MSG
+
+   作业 ${j} 与计算节点保持不变 → 不必重新排队（分区满载时重排可能要数小时）。
+   计算跑在 HQ worker 里 → 在跑的预测不受影响，结果照常落盘；
+   未完成部分由新进程 drain_backlog 按结果目录与台账接管。
+   观察：tail -f $RUNS_DIR/loop_${j%% *}.out | grep -E '受管服务|重启'
+MSG
 }
 
 status_loop() {
   local j; j="$(loop_jobs)"
   if [[ -n "${j// /}" ]]; then
-    echo "♾️  循环作业在队列: $j"
+    echo "♾️  循环作业在队列：$j"
     squeue -u "$USER" -n "$LOOP_JOB_NAME" -o "   %.9i %.2t %10M %6D %R" 2>/dev/null
     local lim
     lim="$(scontrol show job ${j%% *} 2>/dev/null | grep -oE 'TimeLimit=[^ ]+' | head -1)"
     echo "   ${lim:-}  |  名称 $LOOP_JOB_NAME"
   elif [[ -f "$LOOP_DISABLED" ]]; then
-    echo "♾️  已停用（$(cat "$LOOP_DISABLED") 手动停止; 看门狗不续交）"
+    echo "♾️  已停用（$(cat "$LOOP_DISABLED") 手动停止；看门狗不续交）"
   else
     echo "♾️  循环作业不在队列（无停用标记 → 看门狗将在 ≤${WATCHDOG_INTERVAL}min 内补交）"
   fi
   coverage_line   # 穷尽覆盖进度（只在 PEPOPT_SWEEP 开启时有意义）
   driver_alive && {
-    echo "⚠️  legacy 登录节点驱动仍在运行 (PID $(cat "$PID_FILE")) → ./运行.sh loop 会自动接管"; }
+    echo "⚠️  legacy 登录节点驱动仍在运行（PID $(cat "$PID_FILE")）→ ./运行.sh loop 会自动接管"; }
   if crontab -l 2>/dev/null | grep -q "$BLOCK_BEGIN"; then
-    echo "🩺 看门狗: 已装 (每 ${WATCHDOG_INTERVAL}min)"
-    [[ -s "$LOOP_WLOG" ]] && { echo "   最近动作:"; tail -4 "$LOOP_WLOG" | sed 's/^/     /'; }
+    echo "🩺 看门狗：已装（每 ${WATCHDOG_INTERVAL}min）"
+    [[ -s "$LOOP_WLOG" ]] && { echo "   最近动作："; tail -4 "$LOOP_WLOG" | sed 's/^/     /'; }
   else
-    echo "🩺 看门狗: 未装 → ./运行.sh watchdog"
+    echo "🩺 看门狗：未装 → ./运行.sh watchdog"
   fi
   local lg jid
   jid="$(loop_jobs)"; jid="${jid%% *}"; jid="${jid// /}"
   lg="$(active_loop_log "$jid")"
   if [[ -n "$jid" && "$lg" != "$RUNS_DIR/loop_${jid}.out" ]]; then
-    echo "   ⏳ 作业 ${jid} 尚在排队, 日志未生成; 下方为上一个作业的日志"
+    echo "   ⏳ 作业 ${jid} 尚在排队，日志未生成；下方为上一个作业的日志"
   fi
-  [[ -n "$lg" ]] && { echo "📄 作业日志: $lg"; tail -12 "$lg"; }
+  [[ -n "$lg" ]] && { echo "📄 作业日志：$lg"; tail -12 "$lg"; }
   echo
   squeue -u "$USER" -o "%.8i %.14j %.2t %.10M %.20R" 2>/dev/null | head -8
   echo
@@ -275,11 +314,11 @@ status_loop() {
 # ============= 【legacy】登录节点常驻驱动 =============
 
 start_infinite() {
-  echo "⚠️  这是【legacy】登录节点常驻驱动形态, 已知脆弱（会话被清理即无声消失,"
-  echo "    曾导致 GPU 空转 8h22m）。除非确有必要, 请用默认形态: ./运行.sh loop"
+  echo "⚠️  这是【legacy】登录节点常驻驱动形态，已知脆弱（会话被清理即无声消失，"
+  echo "    曾导致 GPU 空转 8h22m）。除非确有必要，请用默认形态：./运行.sh loop"
   if driver_alive; then
-    echo "♾️  无限搜索已在运行 (PID $(cat "$PID_FILE"))。"
-    echo "   日志: tail -f \"$RUNS_DIR\"/infinite_*.log | ./运行.sh stop 停止"
+    echo "♾️  无限搜索已在运行（PID $(cat "$PID_FILE")）。"
+    echo "   日志：tail -f \"$RUNS_DIR\"/infinite_*.log | ./运行.sh stop 停止"
     exit 0
   fi
   rm -f "$PID_FILE" "$DISABLED_FILE" 2>/dev/null   # 清理陈旧状态，重新允许自愈
@@ -296,11 +335,11 @@ start_infinite() {
         </dev/null >"$log" 2>&1 &
   local pid=$!
   echo "$pid" > "$PID_FILE"
-  echo "♾️  无限搜索已后台启动 (PID $pid)，结果持续追加进共享数据库："
+  echo "♾️  无限搜索已后台启动（PID $pid），结果持续追加进共享数据库："
   echo "   🗄️  $DB_ROOT"
-  echo "   📄 日志: tail -f $log"
-  echo "   🛑 停止: ./运行.sh stop   （已提交的 GPU 作业不受影响）"
-  echo "   📊 状态: ./运行.sh legacy-status"
+  echo "   📄 日志：tail -f $log"
+  echo "   🛑 停止：./运行.sh stop   （已提交的 GPU 作业不受影响）"
+  echo "   📊 状态：./运行.sh legacy-status"
   install_watchdog "$REPO_DIR/作业脚本/驱动看门狗.sh"
   sleep 3
   echo "------------------------------------------------------ 启动日志前 20 行："
@@ -313,35 +352,35 @@ stop_infinite() {
   if ! driver_alive; then
     echo "无限搜索未在运行。"
     rm -f "$PID_FILE" 2>/dev/null
-    echo "已写入停用标记（看门狗不会复活）; 重新开跑: ./运行.sh infinite"
+    echo "已写入停用标记（看门狗不会复活）；重新开跑：./运行.sh infinite"
     exit 0
   fi
   local pid; pid=$(cat "$PID_FILE")
-  echo "🛑 停止无限搜索 (PID $pid) …"
+  echo "🛑 停止无限搜索（PID $pid）…"
   kill -TERM "$pid"
   for _ in $(seq 1 12); do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
-  kill -0 "$pid" 2>/dev/null && { echo "   未在 12s 内退出, 强制 kill"; kill -9 "$pid"; }
+  kill -0 "$pid" 2>/dev/null && { echo "   未在 12s 内退出，强制 kill"; kill -9 "$pid"; }
   rm -f "$PID_FILE"
-  echo "✅ 已停止。共享数据库保留在 $DB_ROOT; squeue -u $USER 可查看仍在跑的 GPU 作业。"
-  echo "   看门狗仍装于 crontab（遇停用标记会跳过）; 彻底移除: ./运行.sh no-watchdog"
+  echo "✅ 已停止。共享数据库保留在 $DB_ROOT；squeue -u $USER 可查看仍在跑的 GPU 作业。"
+  echo "   看门狗仍装于 crontab（遇停用标记会跳过）；彻底移除：./运行.sh no-watchdog"
 }
 
 status_infinite() {
   if driver_alive; then
-    echo "♾️  无限搜索运行中 (PID $(cat "$PID_FILE"))"
+    echo "♾️  无限搜索运行中（PID $(cat "$PID_FILE")）"
   elif [[ -f "$DISABLED_FILE" ]]; then
-    echo "♾️  无限搜索已停用（$(cat "$DISABLED_FILE") 手动停止, 看门狗不会复活）"
+    echo "♾️  无限搜索已停用（$(cat "$DISABLED_FILE") 手动停止，看门狗不会复活）"
   else
     echo "♾️  无限搜索未在运行（且无停用标记 → 看门狗会在 ${WATCHDOG_INTERVAL}min 内拉起）"
   fi
   if crontab -l 2>/dev/null | grep -q "$BLOCK_BEGIN"; then
-    echo "🩺 看门狗: 已装 (每 ${WATCHDOG_INTERVAL}min)"
-    [[ -s "$WLOG" ]] && { echo "   最近自愈记录:"; tail -4 "$WLOG" | sed 's/^/     /'; }
+    echo "🩺 看门狗：已装（每 ${WATCHDOG_INTERVAL}min）"
+    [[ -s "$WLOG" ]] && { echo "   最近自愈记录："; tail -4 "$WLOG" | sed 's/^/     /'; }
   else
-    echo "🩺 看门狗: 未装 → ./运行.sh watchdog"
+    echo "🩺 看门狗：未装 → ./运行.sh watchdog"
   fi
   local last; last=$(ls -t "$RUNS_DIR"/infinite_*.log 2>/dev/null | head -1)
-  [[ -n "$last" ]] && { echo "📄 最近日志尾部: $last"; tail -15 "$last"; }
+  [[ -n "$last" ]] && { echo "📄 最近日志尾部：$last"; tail -15 "$last"; }
   echo
   squeue -u "$USER" -o "%.8i %.14j %.2t %.10M %.20R" 2>/dev/null | head -8
   echo
@@ -354,12 +393,12 @@ run_local() {
   local entry="$1"; shift
   source ~/miniconda3/etc/profile.d/conda.sh
   conda activate base
-  echo "🧬 启动本地集群推理（进度实时输出, Ctrl+C 退出编排; 已提交的 GPU 作业不受影响）"
+  echo "🧬 启动本地集群推理（进度实时输出，Ctrl+C 退出编排；已提交的 GPU 作业不受影响）"
   echo "------------------------------------------------------"
   python -u "$entry" "$@"
   local rc=$?
   echo "------------------------------------------------------"
-  [[ $rc -eq 0 ]] && echo "✅ 本轮编排结束（计算作业若仍在队列, 完成后重跑本命令即可续作）" \
+  [[ $rc -eq 0 ]] && echo "✅ 本轮编排结束（计算作业若仍在队列，完成后重跑本命令即可续作）" \
                   || echo "❌ 编排退出（退出码 $rc）"
   exit $rc
 }
@@ -369,6 +408,7 @@ case "$mode" in
   stop)     stop_loop; exit $? ;;
   status)   status_loop; exit $? ;;
   restart-loop|restart) restart_loop; exit $? ;;
+  reload)  reload_loop; exit $? ;;
   watchdog)    rm -f "$LOOP_DISABLED" "$DISABLED_FILE"; mkdir -p "$RUNS_DIR"; install_watchdog; exit $? ;;
   no-watchdog) uninstall_watchdog; exit $? ;;
   infinite) shift; start_infinite "$@"; exit $? ;;
@@ -379,7 +419,7 @@ case "$mode" in
   mc)   run_local 小肽优化_本地集群.py ;;
   bo-server) SBATCH=云端贝叶斯.sbatch; NAME="贝叶斯优化（云端后端）" ;;
   mc-server) SBATCH=云端蒙特卡洛.sbatch;    NAME="蒙特卡洛（云端后端）" ;;
-  *) echo "未知模式 '$mode'，可选: 默认(长驻循环作业) | loop | stop | status | watchdog | no-watchdog | infinite(legacy) | bo | v100 | mc | bo-server | mc-server"; exit 1 ;;
+  *) echo "未知模式 '$mode'，可选：默认（长驻循环作业）| loop | stop | status | watchdog | no-watchdog | infinite(legacy) | bo | v100 | mc | bo-server | mc-server"; exit 1 ;;
 esac
 
 if [[ ! -f "$SBATCH" ]]; then
@@ -448,10 +488,10 @@ else
   done
   echo "------------------------------------------------------"
   if [[ -s "$out" ]]; then
-    echo "（作业执行较快, 以下为完整日志）"
+    echo "（作业执行较快，以下为完整日志）"
     cat "$out"
   else
-    echo "（作业无标准输出, 请检查 $err）"
+    echo "（作业无标准输出，请检查 $err）"
   fi
   echo "------------------------------------------------------"
 fi
@@ -461,5 +501,5 @@ case "$fs" in
   COMPLETED)  echo "✅ 任务已完成" ;;
   CANCELLED*) echo "⛔ 任务已被取消" ;;
   "")         echo "⚠️ 未获取到作业状态，可用 sacct -j $jobid 查询" ;;
-  *)          echo "❌ 任务异常（状态: $fs），请查看: $err" ;;
+  *)          echo "❌ 任务异常（状态：$fs），请查看：$err" ;;
 esac

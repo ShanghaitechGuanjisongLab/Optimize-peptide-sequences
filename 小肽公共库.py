@@ -169,7 +169,7 @@ def create_af3_json(peptide_seq, target_seq, job_name, model_seeds=[1],
     返回：dict （AF3 JSON 格式）
     """
     if target_copies < 1:
-        raise ValueError(f"target_copies 必须 >=1, 得到 {target_copies}")
+        raise ValueError(f"target_copies 必须 >=1，得到 {target_copies}")
     # 靶标链 ID：B 起连续分配（B、C、D……）
     target_ids = [chr(ord("B") + i) for i in range(target_copies)]
     job = {
@@ -257,7 +257,7 @@ def extract_scores_from_zip(zip_path):
             }
 
     except Exception as e:
-        print(f"  ❌ 解析 {zip_path} 失败: {e}")
+        print(f"  ❌ 解析 {zip_path} 失败：{e}")
         return None
 
 
@@ -287,7 +287,7 @@ def run_monte_carlo(predict_fn, opt_root, mc_steps=100, temperature=0.7,
 
     best_A, best_E = current_A, current_E
     best_result_path = None
-    print(f"\n===== 优化 Htr1a 与小肽 202 | 初始分数: {current_E} =====")
+    print(f"\n===== 优化 Htr1a 与小肽 202 | 初始分数：{current_E} =====")
 
     for step in range(mc_steps):
         new_tail = generate_mutant(ORIG_TAIL)
@@ -314,8 +314,8 @@ def run_monte_carlo(predict_fn, opt_root, mc_steps=100, temperature=0.7,
 
         if iptm_unc13c >= off_threshold and iptm_bin1 >= off_threshold:
             reject_count += 1
-            print(f"Step {step+1:2d} | ❌ 拒绝 (UNC13C ipTM={iptm_unc13c:.3f}, "
-                  f"BIN1 ipTM={iptm_bin1:.3f} 均≥{off_threshold}, 双双越过结合红线)")
+            print(f"Step {step+1:2d} | ❌ 拒绝（UNC13C ipTM={iptm_unc13c:.3f}，"
+                  f"BIN1 ipTM={iptm_bin1:.3f} 均≥{off_threshold}，双双越过结合红线）")
             energy_history.append(None)
             continue
 
@@ -331,9 +331,9 @@ def run_monte_carlo(predict_fn, opt_root, mc_steps=100, temperature=0.7,
                     best_result_path = dest
 
         status = "接受" if current_A == new_A else "放弃"
-        print(f"Step {step+1:2d} | {status} | HTR1A: {new_E:.4f} | "
+        print(f"Step {step+1:2d} | {status} | HTR1A：{new_E:.4f} | "
               f"UNC13C iptm={iptm_unc13c:.3f} | BIN1 iptm={iptm_bin1:.3f} | "
-              f"当前分数: {current_E:.4f} | 最佳: {best_E:.4f}")
+              f"当前分数：{current_E:.4f} | 最佳：{best_E:.4f}")
 
     # 绘制能量曲线与保存结果表
     valid_indices = [i+1 for i, e in enumerate(energy_history) if e is not None]
@@ -356,10 +356,10 @@ def run_monte_carlo(predict_fn, opt_root, mc_steps=100, temperature=0.7,
 
     print("\n" + "=" * 60)
     print("✅ 蒙特卡洛优化完成")
-    print(f"🏆 最佳序列: {best_A}")
-    print(f"📊 最佳分数: {best_E}  (ipTM = {1-best_E:.3f})")
-    print(f"🚫 因底线蛋白(ipTM≥{off_threshold})被拒绝: {reject_count} 次")
-    print(f"📁 最佳结果: {best_result_path}")
+    print(f"🏆 最佳序列：{best_A}")
+    print(f"📊 最佳分数：{best_E}  （ipTM = {1-best_E:.3f}）")
+    print(f"🚫 因底线蛋白（ipTM≥{off_threshold}）被拒绝：{reject_count} 次")
+    print(f"📁 最佳结果：{best_result_path}")
     print("=" * 60)
     return best_A, best_E
 

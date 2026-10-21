@@ -136,6 +136,60 @@ def ingest_new_records(new_sample_fn=None):
     return n
 
 
+def rebuild_obj_stats(verbose=True, protect_extra=True):
+    """按磁盘上的全部样本重算每条记录的 β 统计量与 iptm 回写（红正历史低估）。
+
+    与 ingest_new_records 的分工：后者跳过已有 obj_n 的行（增量入库），本函数**无条件**重算，因此能把“更优样本被困在池里”的旧记录拉回真实排名。主表是无锁整表重写，调用前必须先停作业。返回 {"rebuilt"：重算条数，"improved"：obj_max 被上调条数，"protected"：因含额外样本而跳过条数，"details"：[（可变区，旧max，新max）]}。
+
+    protect_extra=True 的必要性：磁盘规范目录只存**初次评估**的样本，而首次爬山与 2^k 整理的补采样本是 add_many 直接计入 n/sum_x/sum_x2 的（产物已消费即删）。
+    无条件重算会把这些增量抹回初次样本数 → 爬山白做。故 obj_n > 磁盘样本数时跳过。"""
+    D = db.load_database()
+    rebuilt = improved = protected = 0
+    details = []
+    for tag in sorted(D):
+        row = D[tag]
+        if not row.get("peptide"):
+            continue
+        try:
+            old = float(row["obj_max"]) if row.get("obj_max") else None
+        except (TypeError, ValueError):
+            old = None
+        fac = collect_product_factors(tag, row)
+        if fac is None:
+            continue
+        target_samples, fixed_factors = fac
+        if not target_samples:
+            continue
+        if protect_extra:
+            lens = [len(v) for v in target_samples.values() if v]
+            disk_n = min(lens) if lens else 0
+            try:
+                have_n = int(row.get("obj_n") or 0)
+            except (TypeError, ValueError):
+                have_n = 0
+            if have_n > disk_n:
+                protected += 1
+                continue
+        r = ingest_record(tag, target_samples, fixed_factors,
+                          peptide=row.get("peptide"), var=row.get("var"))
+        if r is None:
+            continue
+        rebuilt += 1
+        if old is None or r["max"] > old + 1e-9:
+            improved += 1
+            details.append((row.get("var_region") or tag, old, r["max"]))
+    details.sort(key=lambda x: -(x[2] - (x[1] or 0.0)))
+    if verbose:
+        print(f"  🔧 重算 {rebuilt} 条记录统计量；其中 {improved} 条 obj_max 被上调"
+              + (f"；跳过 {protected} 条（含爬山/补采增量）" if protected else ""),
+              flush=True)
+        for var, old, new in details[:10]:
+            print(f"     {var}：{'无' if old is None else f'{old:.4f}'} → {new:.4f}",
+                  flush=True)
+    return {"rebuilt": rebuilt, "improved": improved, "protected": protected,
+            "details": details}
+
+
 def run_consolidation(new_sample_fn, max_rounds=24):
     """数据库整理主流程（用户规格，补采批量化）：
       1）按最优乘积 obj_max 降序；
@@ -144,6 +198,7 @@ def run_consolidation(new_sample_fn, max_rounds=24):
     补采以“批量真跑 AF3”实现，两阶段循环（AF3 一次可打包多任务，chain-B MSA 每靶标只建一次，逐条单跑太浪费）：
       阶段1  consolidation_pass 配“只登记需求”的 sampler 跑到收敛：免费消费各记录 pool 里的样本，并收集所有“池空但 P̃·N>M 仍成立”的记录；
       阶段2  对登记需求批量真跑 AF3 生成新乘积样本，全部挂进对应记录的 pool，交下一轮 pass 按设计逐个消费、重排、再判；直到无人达标、补采无果或补采批数用尽。
+    **单点/退化记录也全部补采爬山**（2026-10-21 规格）：β 拟合无解（n=1、样本全同、全 0/全 1）时尾概率恒 0，P̃·N>M 永不成立 → 按该规则永无补采机会；consolidation_pass 对此类记录改走与首次同规格的爬山（只要还在破纪录就持续登记补采需求，整批未破纪录即置 obj_climb 收束），同样经上述两阶段批量机制供样。
     new_sample_fn：fn(tags) -> {tag：[新乘积样本]}（批量接口，无法生成的 tag 不出现在结果里）；None 时只消费池内免费样本。
     返回 consolidation_pass 各轮统计之和 {"added", "rounds", "capped"}。"""
     max_batches = max(1, int(os.environ.get("PEPOPT_RESAMPLE_BATCHES", "2")))

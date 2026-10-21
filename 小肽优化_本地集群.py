@@ -60,7 +60,7 @@ for _m in ("pandas", "matplotlib", "openpyxl"):
     except ImportError:
         _missing.append(_m)
 if _missing:
-    sys.exit(f"驱动环境缺少依赖: {_missing}，请先执行: pip install {' '.join(_missing)}")
+    sys.exit(f"驱动环境缺少依赖：{_missing}，请先执行：pip install {' '.join(_missing)}")
 
 # 导入公共库（导入零副作用，不含任何预测后端逻辑）
 from 小肽公共库 import create_af3_json, run_monte_carlo, ROOT_DIR
@@ -162,7 +162,7 @@ def _env_int(name, default):
     try:
         return int(v)
     except ValueError:
-        print(f"⚠️ 环境变量 {name}={v!r} 不是整数, 改用默认值 {default}")
+        print(f"⚠️ 环境变量 {name}={v!r} 不是整数，改用默认值 {default}")
         return default
 
 
@@ -174,7 +174,7 @@ _GPU_SHARE = max(1, QOS_LIMITS["gpu"] // max(1, QOS_LIMITS["running"]))
 _want_gpu = max(0, _env_int("PEPOPT_GPUS_PER_JOB", 0))
 if _want_gpu > QOS_LIMITS["gpu"]:
     print(f"⚠️  PEPOPT_GPUS_PER_JOB={_want_gpu} 超过分区 QoS 上限 "
-          f"gres/gpu={QOS_LIMITS['gpu']}（超限作业会永远 PENDING）, 已钳到 "
+          f"gres/gpu={QOS_LIMITS['gpu']}（超限作业会永远 PENDING），已钳到 "
           f"{QOS_LIMITS['gpu']}。")
 LOCAL_GPUS_PER_JOB = max(1, min(_want_gpu, QOS_LIMITS["gpu"])) if _want_gpu else _GPU_SHARE
 
@@ -317,7 +317,7 @@ def prepare_database():
     os.makedirs(LOCAL_DB_DIR, exist_ok=True)
 
     if not shutil.which("zstd"):
-        print("❌ 未找到 zstd 命令行工具, 无法解压数据库")
+        print("❌ 未找到 zstd 命令行工具，无法解压数据库")
         return database_ready()[0]
 
     # ---- 收集缺失项及解压后体积 ----
@@ -328,7 +328,7 @@ def prepare_database():
             continue
         src = os.path.join(SHARED_DB_SRC, name + ".zst")
         if not os.path.isfile(src):
-            print(f"⚠️  共享目录缺少源文件: {src}")
+            print(f"⚠️  共享目录缺少源文件：{src}")
             continue
         todo.append(("fasta", src, dst, zstd_content_size(src)))
 
@@ -342,7 +342,7 @@ def prepare_database():
                 size = int(size * 1.10)   # 文件系统额外开销余量（小文件多）
             todo.append(("mmcif", mmcif_src, mmcif_dir, size))
         else:
-            print(f"⚠️  共享目录缺少 mmCIF 归档: {mmcif_src}")
+            print(f"⚠️  共享目录缺少 mmCIF 归档：{mmcif_src}")
 
     if not todo:
         return database_ready()[0]
@@ -350,19 +350,19 @@ def prepare_database():
     # ---- 磁盘空间检查（解压前必须通过）----
     unknown = [os.path.basename(t[1]) for t in todo if t[3] is None]
     if unknown:
-        print(f"⚠️  无法从帧头读取体积, 未计入空间核算: {unknown}")
+        print(f"⚠️  无法从帧头读取体积，未计入空间核算：{unknown}")
     required = sum(t[3] for t in todo if t[3] is not None)
     st = os.statvfs(LOCAL_DB_DIR)
     avail = st.f_bavail * st.f_frsize
-    print(f"📦 数据库准备: 需解压 {len(todo)} 项, 预计占用 {required / 2**30:.0f} GB；"
-          f"目标盘当前可用 {avail / 2**30:.0f} GB ({LOCAL_DB_DIR})")
+    print(f"📦 数据库准备：需解压 {len(todo)} 项，预计占用 {required / 2**30:.0f} GB；"
+          f"目标盘当前可用 {avail / 2**30:.0f} GB （{LOCAL_DB_DIR}）")
     if avail < int(required * 1.05):
-        print(f"❌ 磁盘空间不足: 需要 ≥ {int(required * 1.05) / 2**30:.0f} GB, 中止解压。"
+        print(f"❌ 磁盘空间不足：需要 ≥ {int(required * 1.05) / 2**30:.0f} GB，中止解压。"
               f"请把 LOCAL_DB_DIR 改到容量更大的目录后重试。")
         return False
 
     # ---- 逐项解压 ----
-    print("⏳ 开始解压（总体积较大, 可能耗时数小时）", flush=True)
+    print("⏳ 开始解压（总体积较大，可能耗时数小时）", flush=True)
     for kind, src, dst, size in todo:
         size_gb = f" ({size / 2**30:.1f} GB)" if size else ""
         if kind == "fasta":
@@ -370,7 +370,7 @@ def prepare_database():
             print(f"   解压 {os.path.basename(src)}{size_gb} → {dst}", flush=True)
             rc = subprocess.run(["zstd", "-d", "-f", "-T4", src, "-o", tmp]).returncode
             if rc != 0 or not os.path.isfile(tmp):
-                print(f"   ❌ 解压失败: {os.path.basename(src)}")
+                print(f"   ❌ 解压失败：{os.path.basename(src)}")
                 if os.path.exists(tmp):
                     os.remove(tmp)
                 continue
@@ -388,14 +388,14 @@ def prepare_database():
                     rc = p2.wait()
                     p1.wait()
             except Exception as e:
-                print(f"   ❌ mmCIF 解压异常: {e}")
+                print(f"   ❌ mmCIF 解压异常：{e}")
                 continue
             if rc != 0 or p1.returncode != 0:
                 print(f"   ❌ mmCIF 解压失败（见 {log_path}）")
                 continue
             with open(mmcif_marker, "w") as f:
                 f.write("done\n")
-        print(f"   ✅ 完成: {os.path.basename(src)}", flush=True)
+        print(f"   ✅ 完成：{os.path.basename(src)}", flush=True)
     return database_ready()[0]
 
 
@@ -443,9 +443,9 @@ def follow_db_prep_job(jobid):
     """实时跟踪解压作业进度直到结束（Ctrl+C 退出跟踪不影响作业运行）。
     检测到解压作业在运行时应转入本函数的进度回报，而不是继续后续步骤。"""
     out_file = os.path.join(LOCAL_DB_DIR, f"db_prep_{jobid}.out")
-    print(f"\n⏳ 检测到解压作业正在运行 (jobid={jobid})，转入实时进度跟踪…")
-    print(f"   日志: {out_file}")
-    print("   （Ctrl+C 仅退出跟踪, 解压作业继续运行；完成后重跑本脚本继续）")
+    print(f"\n⏳ 检测到解压作业正在运行（jobid={jobid}），转入实时进度跟踪…")
+    print(f"   日志：{out_file}")
+    print("   （Ctrl+C 仅退出跟踪，解压作业继续运行；完成后重跑本脚本继续）")
     tail_proc = None
     if os.path.isfile(out_file):
         tail_proc = subprocess.Popen(["tail", "-f", "-n", "+1", out_file])
@@ -458,7 +458,7 @@ def follow_db_prep_job(jobid):
     except KeyboardInterrupt:
         if tail_proc:
             tail_proc.terminate()
-        print("\n👀 已停止进度跟踪, 解压作业仍在运行；完成后重跑本脚本继续。")
+        print("\n👀 已停止进度跟踪，解压作业仍在运行；完成后重跑本脚本继续。")
         return
     if tail_proc:
         time.sleep(1)
@@ -467,7 +467,7 @@ def follow_db_prep_job(jobid):
     ready, missing = database_ready()
     print(f"\n{'✅ 解压作业完成' if state == 'done' and ready else '⚠️ 解压作业结束: ' + state}")
     if not ready:
-        print(f"   仍缺: {missing}；排查日志: {out_file}")
+        print(f"   仍缺：{missing}；排查日志：{out_file}")
 
 
 def submit_db_prep_job():
@@ -480,7 +480,7 @@ def submit_db_prep_job():
     if state in ("pending", "running"):
         return jobid                      # 已在跑，由调用方转入进度跟踪
     if state in ("done", "failed", "unknown") and os.path.isfile(marker):
-        print(f"📦 上次解压作业已结束 ({state}, jobid={jobid})，清理陈旧标记后重新提交。")
+        print(f"📦 上次解压作业已结束（{state}，jobid={jobid}），清理陈旧标记后重新提交。")
         os.remove(marker)
 
     # 作业脚本外置于 作业脚本/数据库解压作业.sh；SLURM 资源走参数，配置走 --export，
@@ -511,12 +511,12 @@ def submit_db_prep_job():
         jobid = out.stdout.strip().split()[-1]
         with open(marker, "w") as f:
             f.write(jobid + "\n")
-        print(f"🚀 数据库解压作业已提交到计算节点 (jobid={jobid})，提交后无需保持 SSH 连接。")
-        print(f"   进度查看: tail -f {LOCAL_DB_DIR}/db_prep_{jobid}.out")
-        print(f"   体积约 330+ GB, 预计数小时, 磁盘不足会自动中止。")
+        print(f"🚀 数据库解压作业已提交到计算节点（jobid={jobid}），提交后无需保持 SSH 连接。")
+        print(f"   进度查看：tail -f {LOCAL_DB_DIR}/db_prep_{jobid}.out")
+        print(f"   体积约 330+ GB，预计数小时，磁盘不足会自动中止。")
         return jobid
     except (subprocess.CalledProcessError, FileNotFoundError) as e:
-        print(f"❌ 提交数据库解压作业失败: {e}")
+        print(f"❌ 提交数据库解压作业失败：{e}")
         return None
 
 
@@ -608,7 +608,7 @@ def extract_scores_from_summary(summary_path):
             "has_clash": conf.get("has_clash", False),
         }
     except Exception as e:
-        print(f"  ❌ 解析 {summary_path} 失败: {e}")
+        print(f"  ❌ 解析 {summary_path} 失败：{e}")
         return None
 
 
@@ -798,8 +798,8 @@ def _check_export_pairs(env_pairs):
     for kv in env_pairs:
         if "," in kv:
             raise ValueError(
-                f"--export 的值不得含逗号（SLURM 以逗号分隔该列表, 会静默截断）: "
-                f"{kv!r}\n    其余: {env_pairs}")
+                f"--export 的值不得含逗号（SLURM 以逗号分隔该列表，会静默截断）："
+                f"{kv!r}\n    其余：{env_pairs}")
     return env_pairs
 
 
@@ -857,23 +857,23 @@ def build_loop_job_cmd(targets, cycle_seqs, max_hours=None):
 def submit_loop_job(targets, cycle_seqs, max_hours=None):
     """提交长驻循环作业；已在队列中则不重复提交。返回 jobid 或 None。"""
     if not PREFLIGHT_OK:
-        print("  ⏸️  预检查未通过, 跳过提交（请先补齐数据库/权重/工具条件）")
+        print("  ⏸️  预检查未通过，跳过提交（请先补齐数据库/权重/工具条件）")
         return None
     active = loop_job_active()
     if active:
-        print(f"  ⏭️  无限循环作业已在队列: {active}（不重复提交）")
+        print(f"  ⏭️  无限循环作业已在队列：{active}（不重复提交）")
         return None
     cmd, budget_h = build_loop_job_cmd(targets, cycle_seqs, max_hours)
     try:
         out = subprocess.run(cmd, capture_output=True, text=True, check=True)
         jobid = out.stdout.strip().split()[-1]
     except subprocess.CalledProcessError as e:
-        print(f"  ❌ sbatch 提交失败: {(e.stderr or '').strip() or e}")
+        print(f"  ❌ sbatch 提交失败：{(e.stderr or '').strip() or e}")
         return None
     except FileNotFoundError as e:
-        print(f"  ❌ sbatch 提交失败: {e}")
+        print(f"  ❌ sbatch 提交失败：{e}")
         return None
-    print(f"  🚀 已提交长驻循环作业 jobid={jobid}: "
+    print(f"  🚀 已提交长驻循环作业 jobid={jobid}："
           f"靶标={targets} | 每轮 {cycle_seqs} 序列 | 时间预算 {budget_h}h")
     return jobid
 
@@ -908,7 +908,7 @@ def submit_pending_bundle():
     token 数超过 GPU_MAX_TOKENS 的任务注定 OOM，直接拦截不提交，避免白烧机时。
     返回新提交的作业号，无提交则 None。"""
     if not PREFLIGHT_OK:
-        print("  ⏸️  预检查未通过, 跳过提交, 请先补齐数据库/工具条件")
+        print("  ⏸️  预检查未通过，跳过提交，请先补齐数据库/工具条件")
         return None
 
     pending = []
@@ -926,10 +926,10 @@ def submit_pending_bundle():
                 if not os.path.isfile(oom_marker):
                     with open(oom_marker, "w") as f:
                         f.write(f"{tk}\n")
-                    print(f"  ⛔ {name}: {tk} tokens > 当前 GPU 上限 {GPU_MAX_TOKENS}"
-                          "（V100 官方仅支持 ≤1280 tokens）, 必然显存溢出, 已跳过未提交。")
-                    print("     对策: 换 A100/H100-80G 并调高 GPU_MAX_TOKENS;"
-                          " 或把该靶标截断到与小肽相关的结构域（会改变约束语义, 需组内确认）。")
+                    print(f"  ⛔ {name}：{tk} tokens > 当前 GPU 上限 {GPU_MAX_TOKENS}"
+                          "（V100 官方仅支持 ≤1280 tokens），必然显存溢出，已跳过未提交。")
+                    print("     对策：换 A100/H100-80G 并调高 GPU_MAX_TOKENS；"
+                          " 或把该靶标截断到与小肽相关的结构域（会改变约束语义，需组内确认）。")
                 continue
             marker = os.path.join(d, ".submitted")
             if os.path.isfile(marker):
@@ -946,13 +946,13 @@ def submit_pending_bundle():
     if not pending:
         return None
     if queue_depth() >= MAX_INFLIGHT:
-        print(f"  ⏸️  在途作业已达上限 {MAX_INFLIGHT}, 暂不提交（已有作业完成后重跑即续作）")
+        print(f"  ⏸️  在途作业已达上限 {MAX_INFLIGHT}，暂不提交（已有作业完成后重跑即续作）")
         return None
 
     bundle = pending[:BUNDLE_SIZE]
     # 攒批：未满一包且队列仍有作业在跑时，继续积压以提高单作业吞吐
     if len(bundle) < BUNDLE_SIZE and queue_depth() > 0:
-        print(f"  📦 攒批中: 已积压 {len(pending)}/{BUNDLE_SIZE} 个任务"
+        print(f"  📦 攒批中：已积压 {len(pending)}/{BUNDLE_SIZE} 个任务"
               "（满包或队列空闲时提交）")
         return None
     bundle_id = f"bundle_{int(time.time())}"
@@ -966,16 +966,16 @@ def submit_pending_bundle():
         out = subprocess.run(cmd, capture_output=True, text=True, check=True)
         jobid = out.stdout.strip().split()[-1]
     except subprocess.CalledProcessError as e:
-        print(f"  ❌ sbatch 提交失败: {(e.stderr or '').strip() or e}")
+        print(f"  ❌ sbatch 提交失败：{(e.stderr or '').strip() or e}")
         return None
     except FileNotFoundError as e:
-        print(f"  ❌ sbatch 提交失败: {e}")
+        print(f"  ❌ sbatch 提交失败：{e}")
         return None
 
     for name, d in bundle:
         with open(os.path.join(d, ".submitted"), "w") as f:
             f.write(jobid)
-    print(f"  🚀 打包提交 {len(bundle)} 个任务 → jobid={jobid}: "
+    print(f"  🚀 打包提交 {len(bundle)} 个任务 → jobid={jobid}："
           f"{[n for n, _ in bundle]}")
     return jobid
 
@@ -1014,8 +1014,8 @@ def local_predict_and_score(peptide_seq, target_seq, target_name, out_dir,
             score = round(1.0 - iptm, 4)
             if verbose:
                 print(f"  📊 [{target_name}] 该靶标界面 ipTM={iptm:.3f} | "
-                      f"score={score} (=1-ipTM, 优化目标, 越小越好) | "
-                      f"ranking={scores['ranking_score']:.3f} (AF3综合分, 仅供参考)")
+                      f"score={score} （=1-ipTM，优化目标，越小越好）| "
+                      f"ranking={scores['ranking_score']:.3f} （AF3综合分，仅供参考）")
             # 结果可能在 AF3 的时间戳兄弟目录：以含 summary 的顶层目录为打包源，
             # 保证 zip 非空（规范目录仅 input.json 时尤其重要）。
             src_root = result_dir
@@ -1038,7 +1038,7 @@ def local_predict_and_score(peptide_seq, target_seq, target_name, out_dir,
         except OSError:
             jid = ""
         if job_state(jid) in ("pending", "running"):
-            print(f"  ⏳ [{target_name}] {job_name} 在集群上计算中, 等待结果…")
+            print(f"  ⏳ [{target_name}] {job_name} 在集群上计算中，等待结果…")
             return None, None, None
     submit_pending_bundle()      # 本任务连同其他积压任务一起打包提交
     return None, None, None
@@ -1076,7 +1076,7 @@ def check_local_status():
             running.append(name)
 
     print("\n📊 本地任务状态报告")
-    print(f"   已完成: {len(completed)} | 运行中/排队中: {len(running)}")
+    print(f"   已完成：{len(completed)} | 运行中/排队中：{len(running)}")
     shown = set()
     for n in running[:20]:
         try:
@@ -1118,6 +1118,6 @@ if __name__ == "__main__":
     check_local_status()
     if best_seq is None:
         print("\n⏳ 尚无可用结果。等集群作业完成后重新运行本脚本即可继续。")
-        print("   查看作业: squeue -u $USER")
+        print("   查看作业：squeue -u $USER")
     else:
         print("\n🏆 优化完成，详见 output_af3/202_htr1a/")
