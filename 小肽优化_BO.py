@@ -115,6 +115,12 @@ AA_LIST = list("ACDEFGHIKLMNPQRSTVWY")
 _HYDROPHOBIC = set("AILMFWVP")
 _AROMATIC = set("FWY")
 _POLAR = set("STNQ")
+_AA_INDEX = {a: i for i, a in enumerate(AA_LIST)}    # 位置 one-hot 反查用（AA_LIST 是 list，无 str.find）
+# 位置 one-hot 的通道数：可变区枚举空间长 6~10（见 小肽优化_无限.PEPOPT_SPACE_LEN_MIN/MAX），按上限开通道、短序列尾部补零；更长的可变区被截断到前 POS_MAX_LEN 位（长度信息另由基础特征的 len 通道承载）。
+POS_MAX_LEN = int(os.environ.get("PEPOPT_POS_MAX_LEN", "10") or 10)
+# 特征构造器开关：positional = 逐位 one-hot + 全局组成（默认），composition = 26 维纯全局组成。所有 GP 调用点统一走 feat_of() 读这个开关，避免同一批数据被两种维度不同的特征混用（那会直接抛矩阵维不匹配的错）。
+# 默认取 positional 的依据：共享库 745 条真实评估数据、计算节点上跑的 5-fold 交叉验证（划分各组合共用）把 Spearman 从 0.371 提到 0.542、TopK 命中率从 0.322 提到 0.411（K=18 = 每周期 24 序列中 GP 的配额），全空间 50322 条待办的预测乘积上限从 0.3884 提到 0.4886（库内真实榜首 0.5580）；定性上 composition 挑出的 18 条散落在 *VDVV*S 的各种替换位上，positional 则聚拢到 SIVD_V_CS 骨架的邻域（库里第 3、4 名 SIVDEVCS=0.5456、SIVDDVVCS=0.5368 都在这骨架上），即它才具备在已知高分骨架附近做局部精调的能力。代价是全空间打分端到端 4.4s→10.2s，占周期预算（n=24 时约 7.7h）的 0.04%。已知局限：时序留出（按 created_at 前 80% 训、后 20% 测）下 positional 并无优势（Spearman 0.505→0.487），因 226 维对 596 个样本更易过拟合位置模式，但随机 CV 样本量更大且提升显著。退回纯组成特征：PEPOPT_FEATURE_MODE=composition。
+FEATURE_MODE = os.environ.get("PEPOPT_FEATURE_MODE", "positional").strip().lower()
 
 
 def featurize(seq):
@@ -127,6 +133,32 @@ def featurize(seq):
     pol = sum(seq.count(a) for a in _POLAR) / n
     disorder = sum(seq.count(a) for a in "PG") / n
     return np.array(comp + [len(seq), charge, hydro, aro, pol, disorder], dtype=float)
+
+
+def featurize_positional(seq):
+    """序列 → 位置分辨特征（POS_MAX_LEN×20 + 26 维）：可变区逐位 one-hot（左对齐、尾部补零）拼上 featurize 的全局组成/物性特征。
+
+    为何需要：featurize 只有**全局**组成比例，对“编辑距离 ≤2、可变区仅 8 位”的近邻几乎无区分力——同一组氨基酸打乱位置得到的序列 26 维特征完全相同，而组成只差一两个残基的序列特征也只差几个百分点，于是 GP 无从知道“哪一位换成什么”才有用。升维前的病征（共享库 745 条真实评估数据、全空间 50322 条待办，计算节点实测）：预测乘积上限仅 0.3884 而库内真实榜首已达 0.5580，5-fold 的 Spearman 只有 0.371、TopK 命中率 0.322；升维后依次变为 0.4886 / 0.542 / 0.411。
+
+    一个容易误判的点：EI 的改进项 imp = best_y − μ − ξ 在这份数据上恒为负（四个特征×标签组合下 imp>0 的候选都是 0 条），这**不是**特征或标签缺陷的证据而是 GP 回归的固有性质：μ 是训练标签的凸组合，除非靠核外推几乎不可能低于历史最优值，EI 的探索价值本来就主要由不确定性项 σ·φ(z) 承担。所以衡量特征好坏要看留出集上的预测精度（Spearman / TopK 命中率），不要看 imp 是否转正。
+
+    左对齐的理由：固定区（TAT）在 N 端且长度恒定，所有候选完全相同，剔出去后逐位比对可变区才不会让前 11 个位置通道全是常数偏置。非标准氨基酸（如 X）所在位保持全零，等价于一个 gap 通道。
+    """
+    tail = seq[len(FIXED_A):] if seq.startswith(FIXED_A) else seq
+    k = len(AA_LIST)
+    onehot = [0.0] * (POS_MAX_LEN * k)
+    for i, aa in enumerate(tail[:POS_MAX_LEN]):
+        j = _AA_INDEX.get(aa)
+        if j is not None:                            # 非标准氨基酸（如 X）→ 该位保持全零
+            onehot[i * k + j] = 1.0
+    return np.concatenate((np.asarray(onehot, dtype=float), featurize(seq)))
+
+
+def feat_of(seq):
+    """按 FEATURE_MODE 选特征构造器（唯一入口），本模块的 run_bo 与 小肽优化_无限 的两条挑选路径均经此。
+
+    维度对照：composition = 26；positional = POS_MAX_LEN×20 + 26 = 226（默认上限 10）。GP 建核为 O(n²·d)、Cholesky 分解为 O(n³)，故升维只影响建核那一项（d 放大 8.7 倍，n 不变）；穷尽队列每周期要对**整个待办集**（枚举全集 51091 条减去已派发台账，当前约 5 万条）打分，这笔开销须在周期预算（n=24 时约 7.7h）内：升维前实测全空间打分仅 1.0s（26 维、n_train=34，见 PEPOPT_SCORE_POOL 注释），升维后（226 维、n_train=745）实测拟合 2.8s + 预测 5.9s、端到端 10.2s，仍是预算的 0.04%。POS_MAX_LEN 必须不小于枚举空间的长度上限（PEPOPT_SPACE_LEN_MAX，默认 10），否则可变区尾部会被静默截断而丢掉信息。"""
+    return featurize_positional(seq) if FEATURE_MODE == "positional" else featurize(seq)
 
 
 # ---------------- 候选库 ----------------
@@ -270,7 +302,7 @@ def run_bo(predict_fn, pool_size=DEFAULT_POOL, batch_size=DEFAULT_BATCH,
            budget=DEFAULT_BUDGET):
     os.makedirs(BO_ROOT, exist_ok=True)
     pool = build_candidate_pool(pool_size)
-    X_pool = np.array([featurize(s) for s in pool])
+    X_pool = np.array([feat_of(s) for s in pool])
     scaler = StandardScaler()
     X_pool_s = scaler.fit_transform(X_pool)
 
@@ -351,7 +383,7 @@ def run_bo(predict_fn, pool_size=DEFAULT_POOL, batch_size=DEFAULT_BATCH,
         if len(rows) == 0:
             print("  ⚠️ 尚无已评估候选（预测任务均未就绪），等待结果完成后重跑本脚本。")
             break
-        X_obs = np.array([featurize(s) for s in rows["peptide"]])
+        X_obs = np.array([feat_of(s) for s in rows["peptide"]])
         X_obs_s = scaler.transform(X_obs)
         y_obs = rows["score_htr1a"].to_numpy(dtype=float)
 

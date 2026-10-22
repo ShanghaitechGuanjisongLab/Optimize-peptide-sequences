@@ -76,6 +76,8 @@ TARGET_COPIES = {"ASIC1A": 3}
 PRODUCT_TARGETS = list(db.PRODUCT_TARGETS)
 
 DEFAULT_TARGETS      = "HTR1A,BIN1"              # 当前默认（V100 搁置 UNC13C）
+# GP 训练标签口径（见 `_gp_objective_rows`）：max = 1 − objective（库里 iptm_* 分量对应的那次最佳样本乘积，与 best_y / BEST_TOP10 排名同源，也是交叉验证选出的口径）；mean = 1 − obj_mean（= obj_sum/obj_n，单次评估的期望乘积，已被实测证伪，仅供复现对照）。
+GP_LABEL             = os.environ.get("PEPOPT_GP_LABEL", "max").strip().lower()
 MIN_GP_SAMPLES       = 12                        # 冷启动评估数（不足时纯随机探索）
 EXPLORE_FRAC         = 0.25                      # 每轮随机探索比例（攒数据库多样性）
 # 每轮 GP 挑选的序列数。**与 loc.BUNDLE_SIZE 解耦**：包容量大是为了摊薄55min固定 MSA 开销（见 小肽优化_本地集群），但每轮 GP 只应挑少量高信息量候选——样本还不多（几十条）时一次挑几十个会让采集函数退化、重复采样低价值区域。差额由 submit_pending_bundle 的“攒批”机制补齐：多轮各挑几个，攒满一包才提交，期间每轮先收割新结果 → GP 持续变强，既不空转 GPU 也不牺牲引导质量。（复用 loc._env_int：未设/空串取默认，非法值告警后取默认，切勿用 int(x or d) 写法）
@@ -129,6 +131,7 @@ def db_evaluated_rows(active_targets):
     """已评估行（含目标乘积与各因子）：[dict]。
 
     row["objective"] = Π ipTM(t)，t ∈ db.PRODUCT_TARGETS（现为 HTR1A×BIN1，**越大越好**，因子齐备才非 None）；
+    row["obj_mean"] = obj_sum/obj_n，即历次序贯补采的**单次评估期望乘积**（row["objective"] 则是同一批采样的极值，实测二者的最大差达 0.197）；GP_LABEL=mean 时用它做训练标签。
     row["score_htr1a"] = 1 − ipTM(HTR1A)，仅供乘积因子不齐时的冷启动回退与旧结果兼容显示；
     row["cons"] = {列名：ipTM}，旧阶段约束语义已废，现**仅用作明细列名映射**（不参与任何判定）。"""
     by_tag = db.load_database()
@@ -138,9 +141,12 @@ def db_evaluated_rows(active_targets):
             continue
         cons = {OFF_COL[t]: r.get(OFF_COL[t]) for t in active_targets if t in OFF_COL}
         obj = db.objective_product(r)
+        n_obj, s_obj = r.get("obj_n"), r.get("obj_sum")
         rows.append({"tag": tag, "peptide": r["peptide"],
                      "score_htr1a": r["score_htr1a"], "cons": cons,
                      "objective": obj,
+                     "obj_n": n_obj,
+                     "obj_mean": (s_obj / n_obj) if (n_obj and s_obj is not None) else None,
                      "iptm_asic1a": r.get("iptm_asic1a"),
                      "iptm_htr1a": r.get("iptm_htr1a"),
                      "iptm_bin1": r.get("iptm_bin1")})
@@ -204,14 +210,14 @@ def _gp_pick(rows, n, exclude, stream):
 
     采集函数 = 纯 EI（无约束因子），与 `ExhaustiveQueue._gp_order` 保持一致。"""
     rows, y_of = _gp_objective_rows(rows)        # 目标 = 乘积，不足时回退旧目标
-    X_obs = np.array([bo.featurize(r["peptide"]) for r in rows])
+    X_obs = np.array([bo.feat_of(r["peptide"]) for r in rows])
     y_obs = np.array([y_of(r) for r in rows], dtype=float)
 
     # 临时候选集：随机撒 40×n 个新序列（无限流的天然探索）
     cand_seqs = stream.next_batch(max(40 * n, 200), exclude)
     if len(cand_seqs) < 2:
         return []
-    X_cand = np.array([bo.featurize(s) for s in cand_seqs])
+    X_cand = np.array([bo.feat_of(s) for s in cand_seqs])
 
     from sklearn.preprocessing import StandardScaler
     scaler = StandardScaler().fit(np.vstack([X_obs, X_cand]))
@@ -252,11 +258,17 @@ SWEEP_ENABLED = os.environ.get("PEPOPT_SWEEP", "1").strip().lower() not in \
 
 
 def _gp_objective_rows(rows):
-    """GP 训练目标选择：目标 = 乘积 objective（越大越好）→ 取 y = 1-objective（越小越好，与采集函数的最小化约定一致）；乘积齐备的行不足 MIN_GP_SAMPLES 时回退旧目标 score_htr1a（冷启动兼容，避免 GP 无米下锅）。返回（可用行，y 取值函数）。"""
+    """GP 训练目标选择：目标 = 乘积 objective（越大越好）→ 取 y = 1-objective（越小越好，与采集函数的最小化约定一致）；乘积齐备的行不足 MIN_GP_SAMPLES 时回退旧目标 score_htr1a（冷启动兼容，避免 GP 无米下锅）。返回（可用行，y 取值函数）。
+
+    GP_LABEL=mean 时标签换成 obj_mean（= obj_sum/obj_n，单次采样的期望乘积）。**该口径已被实测证伪，故默认 max**：当初的设想是“未评估候选只能被预测单次评估的期望，而 objective 是采样后的极值统计量（实测 obj_n 有 5/10/15/20 四档，n 越大越偏乐观），用它当标签等于拟合一个随样本数漂移的量”；但拿共享库 745 条真实数据在计算节点上做的对照显示 mean 标签偏差——时序留出的 Spearman 在 composition 特征下从 0.505 跌到 0.268、positional 特征下从 0.487 跌到 0.429，全空间预测乘积上限从 0.4886 跌到 0.4562，5-fold 命中率只在 0.322→0.311 与 0.411→0.433 之间微摆；更关键的是即便把评估真值也换成 obj_mean 做同口径比较，max 标签仍然更准（composition 下 Spearman 0.542 vs 0.300）→ 说明 obj_max 本身就是更纯净的信号（它筛掉了未收敛到最优折叠的那些采样噪声），与排名取 max 的设计依据同源。开关保留仅为可复现该对照实验。含 obj_mean 的行同样不足 MIN_GP_SAMPLES 时退回 max 标签。"""
     full = [r for r in rows if r.get("objective") is not None]
-    if len(full) >= MIN_GP_SAMPLES:
-        return full, lambda r: 1.0 - r["objective"]
-    return rows, lambda r: r["score_htr1a"]
+    if len(full) < MIN_GP_SAMPLES:
+        return rows, lambda r: r["score_htr1a"]
+    if GP_LABEL == "mean":
+        means = [r for r in full if r.get("obj_mean") is not None]
+        if len(means) >= MIN_GP_SAMPLES:
+            return means, lambda r: 1.0 - r["obj_mean"]
+    return full, lambda r: 1.0 - r["objective"]
 
 
 def _subsample_train(rows, y_of, cap=TRAIN_CAP):
@@ -321,7 +333,8 @@ class ExhaustiveQueue:
 
     @staticmethod
     def _feat(seqs):
-        return np.array([bo.featurize(s) for s in seqs], dtype=float)
+        """批量特征化：经 bo.feat_of 分发（维度由 PEPOPT_FEATURE_MODE 决定，全进程必须一致）。"""
+        return np.array([bo.feat_of(s) for s in seqs], dtype=float)
 
     # ---- 取批 ----
     def next_batch(self, n, rows=None):
