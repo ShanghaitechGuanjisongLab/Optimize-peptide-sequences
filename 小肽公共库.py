@@ -270,6 +270,8 @@ def run_monte_carlo(predict_fn, opt_root, mc_steps=100, temperature=0.7,
 
     predict_fn(peptide_seq, target_seq, target_name, out_dir, auto_submit=True) → (score, iptm, result_path)；结果未就绪时返回 (None, None, None)。
     opt_root：输出根目录（最佳结构与结果表写入其中）。
+
+    ⚠️ **目标口径（legacy，与当前主推链路不一致）**：本函数仍是最初的双目标口径——最小化 score = 1 − ipTM(HTR1A)，且当 ipTM(UNC13C) 与 ipTM(BIN1) **双双 ≥ off_threshold** 时直接拒绝该步（所谓“结合红线”）；而当前主推链路（`小肽优化_节点内.py` / `小肽优化_无限.py`，即长驻循环作业 + 共享数据库）已于 2026-10-20 改为 **目标乘积 ipTM(HTR1A) × ipTM(BIN1) 最大化、无任何上限约束**（2026-10-22 用户定稿，真源 = `小肽数据库.PRODUCT_TARGETS`）。两者不可混读，本函数产出的“最优序列”仅代表旧口径；保留它只为兼容 MC 入口（`小肽优化_本地集群.py` / `小肽优化_云端.py`），不参与生产运行，off_threshold 也只在此 legacy 口径下有意义。
     """
     opt_dir = os.path.join(opt_root, "HTR1A_best")
     best_dir = os.path.join(opt_dir, "BEST_STRUCTURE")

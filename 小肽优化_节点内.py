@@ -21,7 +21,7 @@
   旧形态用 `CandidateStream` 随机采样 + “重试并排除已评估”取候选。它有两个结构性缺陷，都在实测中被量化过：
     1）**候选池是抽样的，不是全集**：每周期只撒 ~720 个随机点做 GP 排序，argmax是在这个子集上取的，不是在整个搜索空间上取的；
     2）**随机采样有 665 条序列永远采不到**（`generate_mutant` 的模式B 只做单次插入或删除，故“净长度不变的插入+删除”两步编辑生成不出来）。
-  现改为 `ExhaustiveQueue`：候选全集 = `小肽公共库.enumerate_space()`精确枚举的 51091 条（编辑距离 ≤2、长 6~10、20 种标准氨基酸），每周期从「全集 − 已派发台账」里按 GP 的 cEI 次序取 24 条。由此得到三条**可证明**的性质（详见该类文档）：不重复、每周期待办精确定量递减、至多 2129 个周期≈680 天必然全覆盖。GP 只决定“先跑谁”，对覆盖保证零贡献 —— 即便 GP 完全失效，次序退化为字典序游标，上述性质依然成立。
+  现改为 `ExhaustiveQueue`：候选全集 = `小肽公共库.enumerate_space()`精确枚举的 51091 条（编辑距离 ≤2、长 6~10、20 种标准氨基酸），每周期从「全集 − 已派发台账」里按 GP 的 EI(y = 1 − 目标乘积) 次序取 24 条。由此得到三条**可证明**的性质（详见该类文档）：不重复、每周期待办精确定量递减、至多 2129 个周期≈680 天必然全覆盖。GP 只决定“先跑谁”，对覆盖保证零贡献 —— 即便 GP 完全失效，次序退化为字典序游标，上述性质依然成立。
   代价护栏：全空间打分实测仅 ≈1s（故 SCORE_POOL_CAP 默认 0 = 不限制）；真正的瓶颈是 GP 拟合的 O(n_train^3)（4000 条已 52s，外推 5 万条 ≈9.6h > 周期预算），故 TRAIN_CAP=2000 做确定性分层子采样，best_y 仍取全量最优。
 
 优雅重启（换代码用，两条路径都不释放计算节点）：
@@ -380,7 +380,7 @@ def drain_backlog(active_targets, cycle_dir, seq_budget):
     """把**历史遗留的未完成任务**排入本轮（防孤儿化）。返回（序列数，任务数）。
 
     为何必需：旧形态（登录节点驱动 + 反复 sbatch 小包）被取消或驱动被杀时，会留下“已有 input.json、但永远不会有 summary”的任务目录。而新入口的候选来自 `inf.known_sequences()`（= sequences.csv 全量）的排除集 → 这些序列
-    **再也不会被选中**，于是永久缺半边结果：既拖累“完整评估”计数，也让 GP 的 BIN1 约束少一批样本。本函数直接复用它们已生成的 input.json 把缺的补上。
+    **再也不会被选中**，于是永久缺半边结果：既拖累“完整评估”计数，也让目标乘积缺因子（objective 为 None → 不进排名、GP 训练集也少一条）。本函数直接复用它们已生成的 input.json 把缺的补上。
 
     按 tag 分组计数，每轮最多补 seq_budget 个序列，以免一次塞爆时间预算。"""
     rd = db.results_dir()
@@ -633,7 +633,7 @@ def run_loop(active_targets, cycle_seqs, max_hours):
 def parse_targets(raw):
     """靶标字符串 → 集合。**同时**用 ',' 与 '+' 作为分隔符。
 
-    为何要支持 '+'：SLURM 的 `--export=a,b,c` 列表本身以**逗号**分隔，而 `PEPOPT_TARGETS=HTR1A,BIN1` 的值内部含逗号 → 会被 SLURM 截断成 `PEPOPT_TARGETS=HTR1A` 加一个孤立的 `BIN1`，靶标静默退化为单靶标（2026-10-04 实测踩到：已跑起的 5 天作业只算 HTR1A，BIN1 约束全丢）。
+    为何要支持 '+'：SLURM 的 `--export=a,b,c` 列表本身以**逗号**分隔，而 `PEPOPT_TARGETS=HTR1A,BIN1` 的值内部含逗号 → 会被 SLURM 截断成 `PEPOPT_TARGETS=HTR1A` 加一个孤立的 `BIN1`，靶标静默退化为单靶标（2026-10-04 实测踩到：已跑起的 5 天作业只算 HTR1A，BIN1 因子全丢→乘积恒为 None）。
     故下发时用 '+' 作分隔符；人手输入（CLI/README）两种都接受。"""
     return {t.strip().upper() for t in re.split(r"[,+]", str(raw)) if t.strip()}
 
@@ -663,13 +663,11 @@ def main():
         ap.error("--targets 必须包含 HTR1A（优化目标）")
     active = [t for t in TARGET_ORDER if t in want]
 
-    # 硬守卫：只跑 HTR1A 而没有 BIN1，等于**丢掉底线约束**（本项目目标是
-    # HTR1A↑ 且 BIN1<0.8），产出的序列无法筛选 → 白烧几天机时。
-    # 历史上这个退化是由 PEPOPT_TARGETS 逗号截断造成的，故在此拦住。
+    # 硬守卫：只跑 HTR1A 而没有 BIN1，等于丢掉目标乘积的一半因子（本项目目标 = ipTM(HTR1A) × ipTM(BIN1) 最大化）：乘积恒为 None → BEST_TOP10 只能退回单看 HTR1A、GP 也拿不到真正的训练目标，产出的序列无法排名 → 白烧几天机时；历史上这个退化是由 PEPOPT_TARGETS 逗号截断造成的，故在此拦住。
     # 确实只想跑单靶标（如调试）时，显式 PEPOPT_ALLOW_SINGLE_TARGET=1。
     if len(active) == 1 and os.environ.get("PEPOPT_ALLOW_SINGLE_TARGET") != "1":
         ap.error(
-            f"靶标只有 {active}：BIN1 约束丢失，产出无法用于筛选，已拒绝启动以免"
+            f"靶标只有 {active}：目标乘积缺半边因子，产出无法排名，已拒绝启动以免"
             "白烧机时。\n"
             f"  原始参数：{args.targets!r}\n"
             "  常见原因：经 SLURM `--export` 下发时用了逗号 → 被 SLURM 按逗号截断"

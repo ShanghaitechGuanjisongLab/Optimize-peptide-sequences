@@ -1,6 +1,8 @@
 """
-小肽序列优化 — 贝叶斯优化（Bayesian Optimization）入口
+小肽序列优化 — 贝叶斯优化（有限预算）入口
 =============================================================
+⚠️ 目标口径声明（2026-10-22 校正）：本入口仍在旧口径上跑——采集函数 = 纯 EI，y = score_htr1a = 1 − ipTM(HTR1A)（单目标最大化 HTR1A），**未接入目标乘积**；而当前主推链路（`小肽优化_节点内.py` + `小肽优化_无限.py`，即共享数据库上的长驻循环作业）已改为 y = 1 − ipTM(HTR1A) × ipTM(BIN1) 的乘积最大化。两者不可混读，本入口的 BEST_STRUCTURE / result_bo.xlsx 排序不代表全库最佳。若要统一到乘积目标需改 5 处：y_obs（run_bo 主循环）、best_y、best_feasible_row 判定、history_y、收尾报表；改完必须在离线假分数上实测（本入口会真提交 AF3 任务，不能拿集群作业当测试台）。下面的“搜索策略”描述的是历史设计（含已取消的双底线约束），保留仅供考古对比。
+
 为什么换掉蒙特卡洛：
   AF3 单次评估昂贵（每候选 ×3 次预测），本项目真正的瓶颈是“评估预算”（服务器版每日约 30 个任务 ≈ 每天 10 个候选）。贝叶斯优化用代理模型（高斯过程）从已评估样本中学习“序列特征 → 分数”的映射，每轮只把评估机会花在最有希望的候选上，样本效率远高于随机抽样式的蒙特卡洛/遗传算法。
 
@@ -14,6 +16,9 @@
         - GP_bin：ipTM(BIN1)                        （约束 < 0.8）
      b）采集函数 = 约束期望改进（constrained Expected Improvement）：
         cEI(x) = EI(x) × P(ipTM_unc < 0.8 | x) × P(ipTM_bin < 0.8 | x) 即“改进潜力 × 对每个底线蛋白的可行概率”，比原版硬阈值（双 ≥0.8 即丢弃）更平滑，避免阈值附近的浪费。
+        ❗ **现状（与上式不符）**：run_bo 主循环已改为传空约束表（`constrained_acquisition(gp_t, [], …)`），
+        即约束因子已删除、GP_unc/GP_bin 不再拟合；下面的 fit_active_gp / feasible_prob / OFF_THRESHOLD
+        因此处于**休眠状态**（无调用方），仅为“日后要恢复底线约束时不必重写”而保留。
      c）按 cEI 贪心选出 batch 个候选（带特征空间多样性约束），提交评估；完成后写入 CSV，进入下一轮。
 
 复用的部分（从 小肽优化_云端 导入）：
@@ -69,7 +74,7 @@ from 小肽公共库 import (SEQ_202, FIXED_A, ORIG_TAIL,
 # 三个靶标各自独立预测。UNC13C 复合物约 2233 tokens，超过 bme_gpupub 分区 V100 的官方上限 1280 tokens （见 小肽优化_本地集群.GPU_MAX_TOKENS），在 V100 上必然显存溢出，因此支持 --targets HTR1A,BIN1 只跑 V100 放得下的两个靶标（结果独立存放）；待申请到 A100/H100 再以全靶标运行补齐 UNC13C 约束。
 TARGET_SEQS    = {"HTR1A": HTR1A_SEQ, "UNC13C": UNC13C_SEQ, "BIN1": BIN1_SEQ}
 TARGET_ORDER   = ["HTR1A", "UNC13C", "BIN1"]   # 固定评估顺序
-OFF_TARGETS    = ["UNC13C", "BIN1"]            # 底线蛋白（结合越低越好）
+OFF_TARGETS    = ["UNC13C", "BIN1"]            # 旧阶段“底线蛋白”语义（ipTM 越低越好）；本入口仅用作报表明细列名，不作判定
 _OFF_COL       = {"UNC13C": "iptm_unc13c", "BIN1": "iptm_bin1"}   # 评估 CSV 列名
 
 # ===================== 贝叶斯优化配置 =====================
@@ -78,7 +83,7 @@ BO_ROOT        = "output_bo"                 # 本方法输出根目录（靶标
 EVAL_CSV       = os.path.join(BO_ROOT, "bo_evaluations.csv")
 ACTIVE_TARGETS = list(TARGET_ORDER)            # 本次实际评估的靶标（--targets 可缩减）
 ACTIVE_OFF     = [t for t in OFF_TARGETS if t in ACTIVE_TARGETS]
-OFF_THRESHOLD  = 0.8                          # 底线蛋白约束阈值（ipTM < 0.8 视为可行）
+OFF_THRESHOLD  = 0.8                          # ❗休眠：仅被 feasible_prob 引用，而后者已无调用方（约束已从采集函数中删除）
 N_INIT         = 8                            # 冷启动随机评估数（不含初始序列）
 DEFAULT_POOL   = 1500                         # 候选库大小
 DEFAULT_BATCH  = 8                            # 每轮评估数（≈ 每日配额 / 3）
@@ -154,7 +159,9 @@ def fit_gp(X, y):
 
 
 def fit_active_gp(X_s, rows, target_name):
-    """拟合底线蛋白 target_name 的约束 GP。该靶标未启用、或有限样本不足 3 个时返回 None（不参与采集函数）。"""
+    """拟合底线蛋白 target_name 的约束 GP。该靶标未启用、或有限样本不足 3 个时返回 None（不参与采集函数）。
+
+    ❗当前无调用方（约束已从采集函数中删除），休眠保留。"""
     if target_name not in ACTIVE_TARGETS:
         return None
     y = pd.to_numeric(rows[_OFF_COL[target_name]], errors="coerce").to_numpy(dtype=float)
@@ -175,7 +182,7 @@ def expected_improvement(mu, sd, best_y, xi=XI):
 
 
 def feasible_prob(gp_off, X):
-    """P（ipTM_off < 阈值 | x）"""
+    """P（ipTM_off < 阈值 | x）。❗当前无调用方（run_bo 传空约束表）；保留备日后恢复底线语义时使用。"""
     mu, sd = gp_off.predict(X, return_std=True)
     sd = np.maximum(sd, 1e-9)
     return norm.cdf((OFF_THRESHOLD - mu) / sd)
@@ -456,7 +463,8 @@ if __name__ == "__main__":
 
     print("=" * 60)
     off_desc = "+".join(ACTIVE_OFF) if ACTIVE_OFF else "无"
-    print(f"🧬 贝叶斯优化 — 小肽序列（HTR1A 结合↑ / {off_desc} 结合↓）")
+    print(f"🧬 贝叶斯优化 — 小肽序列（**旧口径**：最大化 ipTM(HTR1A)，已无 {off_desc} 上限约束；"
+          "未接入乘积目标，榜单不代表全库最佳）")
     print(f"   本次评估靶标：{ACTIVE_TARGETS} | 结果目录：{BO_ROOT}/")
     if pending_targets:
         print(f"   ⏸️  搁置靶标：{pending_targets}（V100 显存放不下，待 A100/H100 以全靶标重跑补齐；已有 HTR1A/BIN1 结果会被直接复用）")

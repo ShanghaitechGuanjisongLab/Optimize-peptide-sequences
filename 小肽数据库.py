@@ -694,10 +694,10 @@ def import_archived(archive_csv, source="archived", dry_run=False):
 # 最佳结果维护：复制 top-N HTR1A 结构包
 # ---------------------------------------------------------------------
 
-def refresh_best(off_threshold=0.8, top_n=10, targets=("HTR1A", "BIN1")):
+def refresh_best(top_n=10):
     """按目标乘积降序（缺乘积回退 iptm_htr1a 降序）维护 BEST_TOP10/。
 
-    约束已全部取消：优化目标是 HTR1A 和 BIN1 都尽可能大，不再限制底线蛋白上限。"""
+    约束已全部取消：优化目标是 PRODUCT_TARGETS 各因子的乘积尽可能大，不存在上限与可行域。榜单因子集**不由函数参数决定**（旧版的 off_threshold / targets 形参从未被函数体引用，已于 2026-10-22 删除以免误导），唯一真源 = 模块顶部的 `PRODUCT_TARGETS` 开关：将来补算 UNC13C 后把它加进该元组再跑本函数，榜单自动按三因子乘积重排。"""
     by_tag = load_database()
     p = paths(ensure=True)
     rows = []

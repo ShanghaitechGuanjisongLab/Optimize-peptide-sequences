@@ -3,7 +3,7 @@
 =============================================================
 背景（2026-10 决策）：
   - bme_gpupub 分区全是 V100-32GB（官方上限 ~1280 tokens）：肽×HTR1A ≈ 441、肽×BIN1 ≈ 612 可算；肽×UNC13C ≈ 2233 超限，暂时搁置。
-  - 因此现阶段搜索目标调整为：**HTR1A ipTM 尽量大，BIN1 ipTM < 0.8**（UNC13C 约束去掉；由此得到的“最佳”未来可能部分因 UNC13C 越线被筛除，所以策略是**多算多存**——结果持续追加进共享数据库，等 A100/H100 到位后直接从数据库里补算 UNC13C 并筛选，已完成结果不重算）。
+  - **优化目标（2026-10-20 起，2026-10-22 用户定稿）= 目标乘积 ipTM(HTR1A) × ipTM(BIN1) 最大化**，两个因子**都越大越好**，不再有任何“底线上限/红线/可行域”概念（旧阶段的 BIN1 ipTM < 0.8 约束已彻底取消，UNC13C 同样不是约束而是待补算的因子）。真源开关 = `小肽数据库.PRODUCT_TARGETS`。策略仍是**多算多存**——结果持续追加进共享数据库，等 A100/H100 到位后补算 UNC13C、把三元组加进 PRODUCT_TARGETS 即可重排 BEST_TOP10（已完成结果不重算）。
 
 与 小肽优化_BO.py（有限预算）的关系：
   本入口是 BO 的“无限 + 数据库化”变体：复用其序列特征化/高斯过程/约束期望改进采集函数，但
@@ -13,13 +13,13 @@
 
 候选调度（2026-10-04 第二次定案：穷尽队列取代随机采样）：
   现在的主调度器是 `ExhaustiveQueue` —— 全集为 `小肽公共库.enumerate_space()`精确构造的 51091 条（编辑距离 ≤2、长 6~10、20 种标准氨基酸），每轮从「全集 − 已派发台账（sequences.csv）」中取 n 条。由此得到三条可证明的性质：
-  **不重复**、待办集合每轮精确定量递减、至多 ⌈51091/24⌉=2129 轮 ≈680 天必然全覆盖（取空后 next_batch 返回 [] = 明确的完成信号）。GP只决定“先跑谁”（cEI 把预测 HTR1A 分高、BIN1 可行的排前面），对上述性质零贡献；GP 失效则退化为字典序游标推进，覆盖与不重复依然成立。
+  **不重复**、待办集合每轮精确定量递减、至多 ⌈51091/24⌉=2129 轮 ≈680 天必然全覆盖（取空后 next_batch 返回 [] = 明确的完成信号）。GP只决定“先跑谁”（把预测**目标乘积**高者排前面），对上述性质零贡献；GP 失效则退化为字典序游标推进，覆盖与不重复依然成立。
   取代随机采样的理由（均实测）：旧 `CandidateStream` 每周期只撒 ~720 个随机点供 GP 排序（argmax 在子集上取，不在整个空间上），且 `generate_mutant` 有**665 条序列永远采不到**（模式B 的 delta=±1 只做单次插入或删除）。退回旧行为：`PEPOPT_SWEEP=0`。
 
 仍保留的启发式先后顺序（只影响次序，不影响覆盖保证）：
   1）先评估初始序列 SEQ_202（基线锚点）；
   2）评估数 < MIN_GP_SAMPLES（默认 12）时，整批走字典序游标（冷启动）；
-  3）之后每轮 batch 中 ~EXPLORE_FRAC（默认 25%）配额仍按字典序游标推进（游标 = 已派发数，跨作业重启自动接续），其余按约束期望改进cEI = EI(score=1-ipTM_HTR1A) × P(ipTM_BIN1 < 0.8) 挑选；
+  3）之后每轮 batch 中 ~EXPLORE_FRAC（默认 25%）配额仍按字典序游标推进（游标 = 已派发数，跨作业重启自动接续），其余按期望改进 EI(y = 1 − 目标乘积) 挑选（**无约束因子**：约束已于 2026-10-22 随目标改为乘积而取消，详见 `_gp_order` 注释）；
   4）GP 训练集超 TRAIN_CAP（默认 2000）时做确定性分层子采样 —— 因为拟合是O(n³)（实测 4000 条已 52s，外推 5 万条 ≈9.6h > 周期预算），而全空间打分实测仅 ≈1s，故瓶颈在训练侧不在候选侧。
 
 用法（登录节点，建议经 运行.sh infinite 后台运行）：
@@ -37,7 +37,8 @@
 
 将来 UNC13C 解锁（申请到 A100/H100-80G）：
     PEPOPT_GPU_MAX_TOKENS=5120 PEPOPT_FLASH_ATTN=triton PEPOPT_XLA_7X=0 \
-    PEPOPT_PARTITION=<新分区> python 小肽优化_无限.py --targets HTR1A,BIN1,UNC13C 已入库序列只补算 UNC13C（HTR1A/BIN1 直接复用），refresh_best 自动按全约束重排。
+    PEPOPT_PARTITION=<新分区> python 小肽优化_无限.py --targets HTR1A,BIN1,UNC13C 已入库序列只补算 UNC13C（HTR1A/BIN1 直接复用），
+    再把 db.PRODUCT_TARGETS 加回 "UNC13C" → refresh_best 自动按三因子乘积重排 BEST_TOP10。
 """
 
 import os
@@ -53,7 +54,7 @@ import 小肽数据库 as db
 os.environ.setdefault("PEPOPT_RESULTS_DIR", db.results_dir())
 
 import 小肽优化_本地集群 as loc          # 本地集群提交后端（复用打包/节流/OOM拦截）
-import 小肽优化_BO as bo              # 特征化 + GP + cEI 采集函数（复用）
+import 小肽优化_BO as bo              # 特征化 + GP + EI 采集函数（复用；其 gp_con_list 传空表）
 import 小肽序贯采样 as seq_sample        # 序贯采样×目标乘积×β拟合入库与数据库整理
 
 # 防御：无论 loc 以何种顺序被导入，都把其结果目录强制对齐到共享库，保证推理任务的 input.json 与结果一定落在共享盘（而非家目录 af3_local_results）。
@@ -66,15 +67,15 @@ from 小肽公共库 import (SEQ_202, FIXED_A, ORIG_TAIL,HTR1A_SEQ, UNC13C_SEQ, 
 TARGET_SEQS   = {"ASIC1A": ASIC1A_SEQ, "HTR1A": HTR1A_SEQ,
                  "UNC13C": UNC13C_SEQ, "BIN1": BIN1_SEQ}
 TARGET_ORDER  = ["ASIC1A", "HTR1A", "BIN1", "UNC13C"]  # 固定评估顺序
-OFF_TARGETS   = ["UNC13C", "BIN1"]               # 旧阶段底线蛋白（越低越好）
+# 旧阶段把 UNC13C/BIN1 当“底线蛋白（ipTM 越低越好）”；2026-10-20 起目标改为乘积最大化后 BIN1 已是正向因子（越高越好）、UNC13C 是待补算因子，二者都不再有上限语义，故下面两个常量如今只剩“明细列名映射”用途（cons 字典、启动与 --status 回显），不参与任何判定。
+OFF_TARGETS   = ["UNC13C", "BIN1"]               # 历史名：目标乘积的非 HTR1A 因子
 OFF_COL       = {"UNC13C": "iptm_unc13c", "BIN1": "iptm_bin1"}
-# 同源多聚体靶标的拷贝数（AF3 输入挂几个链 ID）；新阶段目标乘积的三因子
+# 同源多聚体靶标的拷贝数（AF3 输入挂几个链 ID）；也是目标乘积的候选因子之一
 TARGET_COPIES = {"ASIC1A": 3}
 # 目标乘积因子：真源在 小肽数据库.PRODUCT_TARGETS（**总开关**；2026-10-20 停算ASIC1A，目标 = ipTM(HTR1A)×ipTM(BIN1)），此处只转发不重复定义。
 PRODUCT_TARGETS = list(db.PRODUCT_TARGETS)
 
-DEFAULT_TARGETS      = "HTR1A,BIN1"              # 旧阶段默认（V100 搁置 UNC13C）
-OFF_THRESHOLD        = 0.8                       # 底线蛋白可行阈值
+DEFAULT_TARGETS      = "HTR1A,BIN1"              # 当前默认（V100 搁置 UNC13C）
 MIN_GP_SAMPLES       = 12                        # 冷启动评估数（不足时纯随机探索）
 EXPLORE_FRAC         = 0.25                      # 每轮随机探索比例（攒数据库多样性）
 # 每轮 GP 挑选的序列数。**与 loc.BUNDLE_SIZE 解耦**：包容量大是为了摊薄55min固定 MSA 开销（见 小肽优化_本地集群），但每轮 GP 只应挑少量高信息量候选——样本还不多（几十条）时一次挑几十个会让采集函数退化、重复采样低价值区域。差额由 submit_pending_bundle 的“攒批”机制补齐：多轮各挑几个，攒满一包才提交，期间每轮先收割新结果 → GP 持续变强，既不空转 GPU 也不牺牲引导质量。（复用 loc._env_int：未设/空串取默认，非法值告警后取默认，切勿用 int(x or d) 写法）
@@ -127,7 +128,9 @@ class CandidateStream:
 def db_evaluated_rows(active_targets):
     """已评估行（含目标乘积与各因子）：[dict]。
 
-    row["objective"] = ipTM(ASIC1A)×ipTM(HTR1A)×ipTM(BIN1)（越大越好，三因子齐备才算）；row["score_htr1a"] 保留供旧阶段兼容。"""
+    row["objective"] = Π ipTM(t)，t ∈ db.PRODUCT_TARGETS（现为 HTR1A×BIN1，**越大越好**，因子齐备才非 None）；
+    row["score_htr1a"] = 1 − ipTM(HTR1A)，仅供乘积因子不齐时的冷启动回退与旧结果兼容显示；
+    row["cons"] = {列名：ipTM}，旧阶段约束语义已废，现**仅用作明细列名映射**（不参与任何判定）。"""
     by_tag = db.load_database()
     rows = []
     for tag, r in by_tag.items():
@@ -175,10 +178,9 @@ def known_sequences():
 # ===================== 启发式挑选 =====================
 
 def heuristic_pick(stream, n, active_targets):
-    """按启发式先后顺序挑 n 个新候选：评估样本 < MIN_GP_SAMPLES → 全部随机探索；否则 ~EXPLORE_FRAC 随机探索 + 其余按 cEI（HTR1A 目标 × BIN1 可行概率）。"""
+    """按启发式先后顺序挑 n 个新候选：评估样本 < MIN_GP_SAMPLES → 全部随机探索；否则 ~EXPLORE_FRAC 随机探索 + 其余按 EI（目标 = 目标乘积）。"""
     rows = db_evaluated_rows(active_targets)
     exclude = known_sequences()
-    active_off = [t for t in OFF_TARGETS if t in active_targets]
 
     n_explore = n if len(rows) < MIN_GP_SAMPLES \
         else max(1, int(round(n * EXPLORE_FRAC)))
@@ -187,7 +189,7 @@ def heuristic_pick(stream, n, active_targets):
 
     if n_gp > 0 and len(rows) >= 3:
         try:
-            picked = _gp_pick(rows, active_off, n_gp, exclude, stream)
+            picked = _gp_pick(rows, n_gp, exclude, stream)
         except Exception as e:                        # GP 数值异常不应中断无限搜索
             print(f"  ⚠️ GP 挑选失败（{e}），本轮全部随机探索", flush=True)
 
@@ -197,9 +199,11 @@ def heuristic_pick(stream, n, active_targets):
     return picked[:n]
 
 
-def _gp_pick(rows, active_off, n, exclude, stream):
-    """cEI 挑选：拟合 GP → 在“新随机候选 + 已有样本邻域”组成的临时候选集上取 TOP。"""
-    rows, y_of = _gp_objective_rows(rows)        # 新阶段目标 = 三乘积，不足时回退旧目标
+def _gp_pick(rows, n, exclude, stream):
+    """EI 挑选（旧随机候选流路径）：拟合 GP → 在“新随机候选 + 已有样本邻域”组成的临时候选集上取 TOP。
+
+    采集函数 = 纯 EI（无约束因子），与 `ExhaustiveQueue._gp_order` 保持一致。"""
+    rows, y_of = _gp_objective_rows(rows)        # 目标 = 乘积，不足时回退旧目标
     X_obs = np.array([bo.featurize(r["peptide"]) for r in rows])
     y_obs = np.array([y_of(r) for r in rows], dtype=float)
 
@@ -215,19 +219,14 @@ def _gp_pick(rows, active_off, n, exclude, stream):
 
     gp_t = bo.fit_gp(X_obs_s, y_obs)
     best_y = float(np.min(y_obs))
-    gp_cons = []
-    for t in active_off:
-        yv = np.array([r["cons"].get(OFF_COL[t], np.nan) for r in rows], dtype=float)
-        m = np.isfinite(yv)
-        if int(m.sum()) >= 3:
-            gp_cons.append(bo.fit_gp(X_obs_s[m], yv[m]))
 
-    acq = bo.constrained_acquisition(gp_t, gp_cons, X_cand_s, best_y)
+    # 约束 GP 传空表 = 纯 EI（2026-10-22 定稿）：旧版在此拟合 P(ipTM_BIN1 < 0.8) 并乘进采集值，而目标改为乘积后 BIN1 已是正向因子，该因子会与 y 直接相互抵消——实测后果是榜单前 5 中 4 条 BIN1 ≥ 0.88、GP 却把它们所在的高分区当不可行而回避，那些序列只能靠 25% 字典序探索配额偶然撞中。将来若要恢复任何底线语义，改 db.PRODUCT_TARGETS 或重新传入 gp_con_list 即可，bo.constrained_acquisition 本身保留了多约束能力。
+    acq = bo.constrained_acquisition(gp_t, [], X_cand_s, best_y)
     if not np.all(np.isclose(acq, 0)) and bool(np.isfinite(acq).all()):
         idx = bo.select_batch(acq, X_cand_s, list(range(len(cand_seqs))), n)
         picked = [cand_seqs[i] for i in idx]
     else:
-        # 采集值全零/异常 → 退化为按 GP 均值（预测分低者优先）排序
+        # 采集值全零/异常 → 退化为按 GP 均值（预测 y 小者优先 = 预测乘积高者）排序
         mu, _ = gp_t.predict(X_cand_s, return_std=True)
         order = np.argsort(mu)[:n]
         picked = [cand_seqs[i] for i in order]
@@ -253,7 +252,7 @@ SWEEP_ENABLED = os.environ.get("PEPOPT_SWEEP", "1").strip().lower() not in \
 
 
 def _gp_objective_rows(rows):
-    """GP 训练目标选择：新阶段目标 = 三乘积 objective（越大越好）→ 取 y = 1-objective（越小越好，与采集函数的最小化约定一致）；乘积齐备的行不足 MIN_GP_SAMPLES 时回退旧目标 score_htr1a（冷启动兼容，避免 GP 无米下锅）。返回（可用行，y 取值函数）。"""
+    """GP 训练目标选择：目标 = 乘积 objective（越大越好）→ 取 y = 1-objective（越小越好，与采集函数的最小化约定一致）；乘积齐备的行不足 MIN_GP_SAMPLES 时回退旧目标 score_htr1a（冷启动兼容，避免 GP 无米下锅）。返回（可用行，y 取值函数）。"""
     full = [r for r in rows if r.get("objective") is not None]
     if len(full) >= MIN_GP_SAMPLES:
         return full, lambda r: 1.0 - r["objective"]
@@ -261,7 +260,7 @@ def _gp_objective_rows(rows):
 
 
 def _subsample_train(rows, y_of, cap=TRAIN_CAP):
-    """训练集超限时做**确定性分层子采样**：一半取当前最优（保住高分区分辨率，cEI 排序最关心这里），另一半按 y 排序等距抽样（保住全分布的形状信息）。两条规则都不含随机数 → 同样的库状态必得同样的子集，跨作业重启可复现。返回（子集，未截断的 best_y）；best_y 始终基于全量 rows，不因截断而偏移。"""
+    """训练集超限时做**确定性分层子采样**：一半取当前最优（保住高分区分辨率，EI 排序最关心这里），另一半按 y 排序等距抽样（保住全分布的形状信息）。两条规则都不含随机数 → 同样的库状态必得同样的子集，跨作业重启可复现。返回（子集，未截断的 best_y）；best_y 始终基于全量 rows，不因截断而偏移。"""
     srt = sorted(rows, key=lambda r: (y_of(r), r.get("tag", "")))
     best_y = float(min(y_of(r) for r in rows))
     if cap <= 0 or len(rows) <= cap:
@@ -325,7 +324,7 @@ class ExhaustiveQueue:
         return np.array([bo.featurize(s) for s in seqs], dtype=float)
 
     # ---- 取批 ----
-    def next_batch(self, n, rows=None, active_off=None):
+    def next_batch(self, n, rows=None):
         """取 n 条未派发序列（返回**全序列**形式，与 prepare_cycle 约定一致），保证批内互不重复且不与台账重复；剩余不足 n 时返回剩余全部（不伪造）。返回空列表 = 空间已穷尽。"""
         P = self.pending()
         if n <= 0 or not P:
@@ -334,8 +333,6 @@ class ExhaustiveQueue:
             return [FIXED_A + v for v in P]         # 末批：全取，顺序即字典序
 
         rows = db_evaluated_rows(self.active) if rows is None else rows
-        if active_off is None:
-            active_off = [t for t in OFF_TARGETS if t in self.active]
 
         # 冷启动（GP 不可拟合）时整批走探索；否则保留 EXPLORE_FRAC 配额。探索用**字典序旋转游标**而非随机采样：游标 = 已派发数（由台账派生，跨作业重启自动接续），因此既有系统性覆盖推进，又完全可复现。
         n_exp = n if len(rows) < MIN_GP_SAMPLES else max(1, int(round(n * EXPLORE_FRAC)))
@@ -347,7 +344,7 @@ class ExhaustiveQueue:
         n_gp = n - len(picked)
         if n_gp > 0 and len(rows) >= 3:
             try:
-                for v in self._gp_order(P, chosen, rows, active_off, n_gp):
+                for v in self._gp_order(P, chosen, rows, n_gp):
                     picked.append(v)
                     chosen.add(v)                   # chosen 与 _gp_order 的 exclude 同一对象
             except Exception as e:                  # GP 异常绝不阻断穷尽推进
@@ -361,8 +358,8 @@ class ExhaustiveQueue:
                 chosen.add(v)
         return [FIXED_A + v for v in picked[:n]]
 
-    def _gp_order(self, P, exclude, rows, active_off, n_gp):
-        """按 cEI 降序产出可变区（稳定排序 → 同分按字典序，可复现）。exclude 就地累积，便于调用方复用同一集合去重。"""
+    def _gp_order(self, P, exclude, rows, n_gp):
+        """按 EI 降序产出可变区（稳定排序 → 同分按字典序，可复现）。exclude 就地累积，便于调用方复用同一集合去重。"""
         if n_gp <= 0:
             return []
         if SCORE_POOL_CAP > 0 and len(P) > SCORE_POOL_CAP:
@@ -374,7 +371,7 @@ class ExhaustiveQueue:
         if len(pool) < 2:
             return []
 
-        rows, y_of = _gp_objective_rows(rows)   # 新阶段目标 = 三乘积，不足时回退旧目标
+        rows, y_of = _gp_objective_rows(rows)   # 新阶段目标 = 乘积，不足时回退旧目标
         train, best_y = _subsample_train(rows, y_of)   # best_y 基于全量，不受截断影响
         X_obs = self._feat([r["peptide"] for r in train])
         y_obs = np.array([y_of(r) for r in train], dtype=float)
@@ -384,17 +381,11 @@ class ExhaustiveQueue:
         X_obs_s, X_cand_s = sc.transform(X_obs), sc.transform(X_cand)
 
         gp_t = bo.fit_gp(X_obs_s, y_obs)
-        gp_cons = []
-        for t in active_off:
-            yv = np.array([r["cons"].get(OFF_COL[t], np.nan) for r in train], dtype=float)
-            m = np.isfinite(yv)
-            if int(m.sum()) >= 3:                   # 约束 GP 至少 3 个有限样本
-                gp_cons.append(bo.fit_gp(X_obs_s[m], yv[m]))
-
-        acq = bo.constrained_acquisition(gp_t, gp_cons, X_cand_s, best_y)
+        # 约束 GP 传空表 = 纯 EI，与 y = 1 − 乘积 同口径；旧版叠乘的 P(ipTM_BIN1 < 0.8) 与乘积目标直接矛盾（把当前最优区当不可行而回避），2026-10-22 删除，前因后果详见 _gp_pick 里的同名注释。
+        acq = bo.constrained_acquisition(gp_t, [], X_cand_s, best_y)
         if bool(np.isfinite(acq).all()) and not np.all(np.isclose(acq, 0)):
             order = np.argsort(-np.asarray(acq, dtype=float), kind="stable")
-        else:                    # 采集退化 → 用 GP 均值（score=1-ipTM，小者优先）
+        else:                    # 采集退化 → 用 GP 均值（y 小者优先 = 预测乘积高者）
             mu, _ = gp_t.predict(X_cand_s, return_std=True)
             order = np.argsort(mu, kind="stable")
 
@@ -488,15 +479,15 @@ def harvest_and_report(active_targets, new_sample_fn=None):
     if n_new:
         print(f"  📥 收割入库 {n_new} 条新结果"
               + (f"（跳过 {len(skipped)}）" if skipped else ""), flush=True)
-    db.refresh_best(off_threshold=OFF_THRESHOLD, top_n=TOP_N_BEST,
-                    targets=tuple(active_targets))
+    db.refresh_best(top_n=TOP_N_BEST)
     s = db.stats()
     rows = db_evaluated_rows(active_targets)
-    evaluable = []
-    for r in rows:
-        cons = [r["cons"].get(OFF_COL[t]) for t in active_targets if t in OFF_COL]
-        if all(v is not None and v < OFF_THRESHOLD for v in cons):
-            evaluable.append(r)
+    # 可排名集 = 目标乘积齐备的行（无“可行/不可行”之分），再以原肽 202 自身乘积为基线报“多少条已击败起点”——比起旧的 BIN1<0.8 红线计数，这个口径才对当前目标有用。
+    ranked = [r for r in rows if r.get("objective") is not None]
+    baseline = next((r["objective"] for r in ranked
+                     if r.get("peptide") == SEQ_202), None)
+    n_beat = sum(1 for r in ranked
+                 if baseline is not None and r["objective"] > baseline)
     # 排名：新阶段看目标乘积（降序）；乘积未齐（缺因子）的排后面按 score 兼容
     def _key(r):
         if r.get("objective") is not None:
@@ -505,7 +496,9 @@ def harvest_and_report(active_targets, new_sample_fn=None):
     best3 = sorted(rows, key=_key)[:3]
     print(f"  🗄️  数据库：总 {s['total']} 序列 | ASIC1A {s.get('asic1a', '-')} | "
           f"HTR1A {s['htr1a']} | BIN1 {s['bin1']} | UNC13C {s['unc13c']} | "
-          f"完整评估 {len(rows)} | 当前可行 {len(evaluable)}", flush=True)
+          f"完整评估 {len(rows)} | 乘积齐备可排名 {len(ranked)}"
+          + (f" | 击败原肽202（{baseline:.4f}） {n_beat}" if baseline is not None else ""),
+          flush=True)
     for r in best3:
         if r.get("objective") is not None:
             # 明细因子跟随 PRODUCT_TARGETS 开关：已停算的靶标值为 None，
@@ -617,9 +610,9 @@ def run_infinite(active_targets, batch, poll, backlog_limit):
         for t in active_targets)
 
     round_no = 0
-    print(f"\n♾️  无限搜索启动：靶标={active_targets} | 底线约束="
-          f"{[t for t in OFF_TARGETS if t in active_targets]} "
-          f"（ipTM<{OFF_THRESHOLD}，UNC13C 搁置时其列留空）| 每轮≤{batch} 新序列 | "
+    print(f"\n♾️  无限搜索启动：靶标={active_targets} | 目标=乘积最大化"
+          f" {'×'.join(PRODUCT_TARGETS)}（无上限约束）"
+          f" | 每轮≤{batch} 新序列 | "
           f"积压上限 {backlog_limit} 任务 | 轮询 {poll}s\n"
           f"    共享数据库：{p['root']}\n", flush=True)
 
@@ -714,13 +707,13 @@ def main():
     np.random.seed(42)
 
     print("=" * 62)
-    print("🧬 无限搜索 — 小肽序列（HTR1A ipTM↑"
-          + (" / " + "+".join(t for t in OFF_TARGETS if t in active) + " ipTM↓"
-             if any(t in active for t in OFF_TARGETS) else "")
-          + "；结果持续追加共享数据库）")
-    if any(t not in active for t in OFF_TARGETS):
-        pend = [t for t in OFF_TARGETS if t not in active]
-        print(f"   ⏸️  搁置约束：{pend}（超 V100 上限；A100/H100 到位后全靶标重跑，"
+    print("🧬 无限搜索 — 小肽序列（目标 = 乘积 "
+          + " × ".join(f"ipTM({t})↑"
+                      for t in PRODUCT_TARGETS if t in active)
+          + "；无上限约束；结果持续追加共享数据库）")
+    pend = [t for t in OFF_TARGETS if t not in active]
+    if pend:
+        print(f"   ⏸️  搁置因子：{pend}（超 V100 上限；A100/H100 到位后加进 PRODUCT_TARGETS 并补算，"
               " 已入库结果自动复用，仅补算搁置靶标并重排 BEST_TOP10）")
     print("=" * 62)
 
