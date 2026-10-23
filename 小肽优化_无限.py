@@ -13,13 +13,13 @@
 
 候选调度（2026-10-04 第二次定案：穷尽队列取代随机采样）：
   现在的主调度器是 `ExhaustiveQueue` —— 全集为 `小肽公共库.enumerate_space()`精确构造的 51091 条（编辑距离 ≤2、长 6~10、20 种标准氨基酸），每轮从「全集 − 已派发台账（sequences.csv）」中取 n 条。由此得到三条可证明的性质：
-  **不重复**、待办集合每轮精确定量递减、至多 ⌈51091/24⌉=2129 轮 ≈680 天必然全覆盖（取空后 next_batch 返回 [] = 明确的完成信号）。GP只决定“先跑谁”（把预测**目标乘积**高者排前面），对上述性质零贡献；GP 失效则退化为字典序游标推进，覆盖与不重复依然成立。
+  **不重复**、待办集合每轮精确定量递减、至多 ⌈51091/24⌉=2129 轮 ≈680 天必然全覆盖（取空后 next_batch 返回 [] = 明确的完成信号）。GP只决定“先跑谁”（把预测**目标乘积**高者排前面），对上述性质零贡献；GP 失效时探索配额照样从待办集推进，覆盖与不重复依然成立。
   取代随机采样的理由（均实测）：旧 `CandidateStream` 每周期只撒 ~720 个随机点供 GP 排序（argmax 在子集上取，不在整个空间上），且 `generate_mutant` 有**665 条序列永远采不到**（模式B 的 delta=±1 只做单次插入或删除）。退回旧行为：`PEPOPT_SWEEP=0`。
 
 仍保留的启发式先后顺序（只影响次序，不影响覆盖保证）：
   1）先评估初始序列 SEQ_202（基线锚点）；
-  2）评估数 < MIN_GP_SAMPLES（默认 12）时，整批走字典序游标（冷启动）；
-  3）之后每轮 batch 中 ~EXPLORE_FRAC（默认 25%）配额仍按字典序游标推进（游标 = 已派发数，跨作业重启自动接续），其余按期望改进 EI(y = 1 − 目标乘积) 挑选（**无约束因子**：约束已于 2026-10-22 随目标改为乘积而取消，详见 `_gp_order` 注释）；
+  2）评估数 < MIN_GP_SAMPLES（默认 12）时，整批走探索抽样（冷启动）；
+  3）之后每轮 batch 中 ~EXPLORE_FRAC（默认 25%，`PEPOPT_EXPLORE_FRAC` 可调）配额从待办集 **无放回随机抽样**（探索），其余按期望改进 EI(y = 1 − 目标乘积) 挑选（**无约束因子**：约束已于 2026-10-22 随目标改为乘积而取消，详见 `_gp_order` 注释）；探索批只影响“先跑谁”，不影响上述三条不变量（它们由枚举 + 台账保证，与取批次序无关）；
   4）GP 训练集超 TRAIN_CAP（默认 2000）时做确定性分层子采样 —— 因为拟合是O(n³)（实测 4000 条已 52s，外推 5 万条 ≈9.6h > 周期预算），而全空间打分实测仅 ≈1s，故瓶颈在训练侧不在候选侧。
 
 用法（登录节点，建议经 运行.sh infinite 后台运行）：
@@ -78,8 +78,25 @@ PRODUCT_TARGETS = list(db.PRODUCT_TARGETS)
 DEFAULT_TARGETS      = "HTR1A,BIN1"              # 当前默认（V100 搁置 UNC13C）
 # GP 训练标签口径（见 `_gp_objective_rows`）：max = 1 − objective（库里 iptm_* 分量对应的那次最佳样本乘积，与 best_y / BEST_TOP10 排名同源，也是交叉验证选出的口径）；mean = 1 − obj_mean（= obj_sum/obj_n，单次评估的期望乘积，已被实测证伪，仅供复现对照）。
 GP_LABEL             = os.environ.get("PEPOPT_GP_LABEL", "max").strip().lower()
-MIN_GP_SAMPLES       = 12                        # 冷启动评估数（不足时纯随机探索）
-EXPLORE_FRAC         = 0.25                      # 每轮随机探索比例（攒数据库多样性）
+MIN_GP_SAMPLES       = 12                        # 冷启动评估数（不足时整批走探索）
+
+
+def _env_float(name, default):
+    """读浮点环境变量：未设/空串取默认，非法值告警后取默认（与 loc._env_int 同风格）。
+
+    切勿写成 `float(os.environ.get(name) or default)`：那会让合法的显式 0（完全不探索）被当成假值而惄惄变成默认值。"""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return float(raw.strip())
+    except ValueError:
+        print(f"⚠️  {name}={raw!r} 不是合法浮点数，改用默认 {default}", flush=True)
+        return default
+
+
+# 每周期探索配额占比（其余配额给 GP 的 EI 次序）：探索批从待办集 **无放回随机抽样**，作用是在 GP 的模型盲区之外持续给数据库攒新数据（低分区锚点也喂 GP）。PEPOPT_EXPLORE_FRAC 可覆盖，取值先夹到 [0,1] 再算 n_exp = max(1, round(n × frac))——**下界恒为 1 条**（实测：n=24 时 frac=0/0.1/0.25/0.5/1 分别得 1/2/6/12/24 条），所以 frac=0 只是把探索降到最低而**无法完全关闭**；真想全听 GP 得同时置 MIN_GP_SAMPLES 让 GP 一直可用并把该值当 0 看待，而保留最低 1 条探索实际上是有意的安全底。冷启动（评估行 < MIN_GP_SAMPLES）则不看本变量，整批 n 条全走探索。
+EXPLORE_FRAC         = max(0.0, min(1.0, _env_float("PEPOPT_EXPLORE_FRAC", 0.25)))
 # 每轮 GP 挑选的序列数。**与 loc.BUNDLE_SIZE 解耦**：包容量大是为了摊薄55min固定 MSA 开销（见 小肽优化_本地集群），但每轮 GP 只应挑少量高信息量候选——样本还不多（几十条）时一次挑几十个会让采集函数退化、重复采样低价值区域。差额由 submit_pending_bundle 的“攒批”机制补齐：多轮各挑几个，攒满一包才提交，期间每轮先收割新结果 → GP 持续变强，既不空转 GPU 也不牺牲引导质量。（复用 loc._env_int：未设/空串取默认，非法值告警后取默认，切勿用 int(x or d) 写法）
 DEFAULT_BATCH        = max(1, loc._env_int("PEPOPT_BATCH", 6))
 DEFAULT_POLL         = 300                       # 无进展时的轮询间隔（秒）
@@ -226,7 +243,7 @@ def _gp_pick(rows, n, exclude, stream):
     gp_t = bo.fit_gp(X_obs_s, y_obs)
     best_y = float(np.min(y_obs))
 
-    # 约束 GP 传空表 = 纯 EI（2026-10-22 定稿）：旧版在此拟合 P(ipTM_BIN1 < 0.8) 并乘进采集值，而目标改为乘积后 BIN1 已是正向因子，该因子会与 y 直接相互抵消——实测后果是榜单前 5 中 4 条 BIN1 ≥ 0.88、GP 却把它们所在的高分区当不可行而回避，那些序列只能靠 25% 字典序探索配额偶然撞中。将来若要恢复任何底线语义，改 db.PRODUCT_TARGETS 或重新传入 gp_con_list 即可，bo.constrained_acquisition 本身保留了多约束能力。
+    # 约束 GP 传空表 = 纯 EI（2026-10-22 定稿）：旧版在此拟合 P(ipTM_BIN1 < 0.8) 并乘进采集值，而目标改为乘积后 BIN1 已是正向因子，该因子会与 y 直接相互抵消——实测后果是榜单前 5 中 4 条 BIN1 ≥ 0.88、GP 却把它们所在的高分区当不可行而回避，那些序列只能靠 25% 探索配额偶然撞中。将来若要恢复任何底线语义，改 db.PRODUCT_TARGETS 或重新传入 gp_con_list 即可，bo.constrained_acquisition 本身保留了多约束能力。
     acq = bo.constrained_acquisition(gp_t, [], X_cand_s, best_y)
     if not np.all(np.isclose(acq, 0)) and bool(np.isfinite(acq).all()):
         idx = bo.select_batch(acq, X_cand_s, list(range(len(cand_seqs))), n)
@@ -298,15 +315,45 @@ def attempted_vars():
     return out
 
 
+def _sample_pool(P, n, exclude=None):
+    """从待办集 P 无放回随机抽≤n 条（可排除 exclude 里的元素），**全程零复制**。
+
+    P = 全集 减 台账，是一个随时可精确算出的已知集合，抽谁都对；探索配额只影响“先跑谁”，不影响不重复与全覆盖（那两条由枚举 + 台账保证）。为何不用旧的字典序旋转游标：① 相邻字典序 = 结构上最相似，实测同一 |P|=50298 上抽 6 条的两两编辑距离均值只有 1.50 位（而随机抽样 3.71 位，差 2.5×），且两个周期的探索批 12 条全属同一结构家族（N 端插 Cys 的 9/10 位肽）、长度只覆盖 9、10 两档；② 游标每周期只前进 n 位，在 5 万条的待办表上要爬几千个周期才能扫完；③ 构造 `rot = P[cur:] + P[:cur]` 要分配并复制**两个 5 万元素的列表**（每周期 ≈800KB、实测 0.618 ms），而下面的抽样实测只 0.005 ms（116× 更快）——所以换随机不仅多样性更高，**性能也是净赚**。
+
+    零复制的两条路径：exclude 为空（即每周期的探索批，主路径）直接 `random.sample(P, n)`——CPython 在 n 小于其 setsize 阈值（n=6 时为 85）时走 set 分支，只做 O(n) 次 randrange + 下标取元素，**不拷贝 population**；带 exclude（GP 异常后的补齐路径，罕见）改用拒绝抽样，同样 O(n) 次下标、零分配，exclude 至多 n 条而 |P|≈5万 → 碰撞概率 <0.05%，期望尝试次数 ≈ n。
+
+    兜底：池被 exclude 挤得更小（len(exclude)×4 ≥ |P|）或拒绝抽样撞太多次时，做一次全量过滤凑满剩余——探索配额**绝不得因凑不满而缩水**（凑不满意味着 |P| 未严格递减、伤到全覆盖的终止性），而这条路径上的 O(|P|) 开销比那点分配重要得多，只在罕见分支上发生。"""
+    if n <= 0 or not P:
+        return []
+    if not exclude:
+        return random.sample(P, min(n, len(P)))
+    m = len(P)
+    if len(exclude) * 4 >= m:
+        pool = [v for v in P if v not in exclude]
+        return random.sample(pool, min(n, len(pool)))
+    out, dup = [], 0
+    while len(out) < n and dup < 8 * n:
+        v = P[random.randrange(m)]
+        if v in exclude or v in out:     # `in out` 是 O(n) 线性查，总代价 O(n²)=百次比较，比开 set 分配更便宜
+            dup += 1
+            continue
+        out.append(v)
+    if len(out) < n:                     # 兜底：一次全量过滤凑满剩余
+        got = set(out)
+        pool = [v for v in P if v not in exclude and v not in got]
+        out.extend(random.sample(pool, min(n - len(out), len(pool))))
+    return out
+
+
 class ExhaustiveQueue:
     """确定性穷尽调度器 —— 同时保证【不重复】与【有限步内全覆盖】。
 
     三条不变量（合起来构成覆盖证明）：
-      A. 全集 S = 小肽公共库.enumerate_space()：**精确构造**而非随机采样，因此包含随机采样不可达的 665 条；|S| = 51091，枚举顺序固定（字典序），与随机种子和调用次数无关。
-      B. 待办 P_k = S \\ A_k，其中 A_k = sequences.csv 已登记台账。prepare_cycle先登记再写输入 → 凡被派发必入 A；于是每周期 |P| 至少减少本批大小，且**同一序列不可能被二次派发**。
-      C. S 有限 → 至多 ceil(|S|/n) = ceil(51091/24) = 2129 个周期后 P = ∅，即全覆盖。届时 next_batch 返回空列表，调用方把它当**完成**而非失败（与旧的 EMPTY_CYCLE_LIMIT“采不到新样本”语义明确区分）。
+      A. 全集 S = 小肽公共库.enumerate_space()：**精确构造**而非随机采样，因此包含随机采样不可达的 665 条；|S| = 51091，枚举顺序固定（字典序，与随机种子和调用次数无关）。注：这里固定的是**全集的内容与顺序**，而不是“取批的次序”（探索批是从 P 里随机抽的）——不变量并不依赖取批次序。
+      B. 待办 P_k = S \\ A_k，其中 A_k = sequences.csv 已登记台账。prepare_cycle先登记再写输入 → 凡被派发必入 A；于是每周期 |P| 至少减少本批大小（随机无放回抽样同理成立：抽中的 n 条必不同且全在 P 中），且**同一序列不可能被二次派发**。
+      C. S 有限 → 至多 ceil(|S|/n) = ceil(51091/24) = 2129 个周期后 P = ∅，即全覆盖。由 B 的递减性得到，**是确定性上界而非概率保证**（随机抽样不会让它变成“几乎必然”）。届时 next_batch 返回空列表，调用方把它当**完成**而非失败（与旧的 EMPTY_CYCLE_LIMIT“采不到新样本”语义明确区分）。
 
-    GP/贝叶斯在其中的角色：**只决定 P 里先跑谁**（把“预测 HTR1A 分高且BIN1可行”的排在前面，让好结果尽早入库），对 A/B/C 三条不变量毫无贡献。即使 GP 完全失效（样本不足、数值异常、特征退化），次序也只是退化为字典序游标推进，不重复与全覆盖依然成立。这就是“调整调度算法保证不重复并最终全覆盖”的准确含义：**覆盖由枚举 + 台账保证，不由启发式保证**。
+    GP/贝叶斯在其中的角色：**只决定 P 里先跑谁**（把预测目标乘积高的排前面，让好结果尽早入库），对 A/B/C 三条不变量毫无贡献。即使 GP 完全失效（样本不足、数值异常、特征退化），探索配额照样从 P 里推进，不重复与全覆盖依然成立。这就是“调度算法保证不重复并最终全覆盖”的准确含义：**覆盖由枚举 + 台账保证，不由启发式保证**。
     """
 
     CENTER = ORIG_TAIL
@@ -321,7 +368,7 @@ class ExhaustiveQueue:
 
     # ---- 状态视图 ----
     def pending(self, attempted=None):
-        """待评估的可变区（保持字典序 → 确定性游标）。"""
+        """待评估的可变区列表（= 全集 减 台账，作为探索抽样的池与 GP 打分的候选集；元素顺序沿用 space 的字典序，但取批已从其中随机抽，不再依赖顺序）。"""
         A = attempted_vars() if attempted is None else attempted
         return [v for v in self.space if v not in A]
 
@@ -347,12 +394,11 @@ class ExhaustiveQueue:
 
         rows = db_evaluated_rows(self.active) if rows is None else rows
 
-        # 冷启动（GP 不可拟合）时整批走探索；否则保留 EXPLORE_FRAC 配额。探索用**字典序旋转游标**而非随机采样：游标 = 已派发数（由台账派生，跨作业重启自动接续），因此既有系统性覆盖推进，又完全可复现。
+        # 冷启动（GP 不可拟合）时整批走探索；否则保留 EXPLORE_FRAC 配额。探索批 = 从待办集 P **无放回随机抽样**（见 _sample_pool：零复制，相比旧的字典序旋转游标多样性高 2.5×、单次取样快 116×，省掉每周期两次 5 万元素列表的分配与拷贝）。
         n_exp = n if len(rows) < MIN_GP_SAMPLES else max(1, int(round(n * EXPLORE_FRAC)))
         n_exp = max(0, min(n_exp, n))
-        cur = (len(self.space) - len(P)) % len(P)
-        rot = P[cur:] + P[:cur]
-        picked, chosen = rot[:n_exp], set(rot[:n_exp])
+        picked = _sample_pool(P, n_exp)             # 探索批：待办集上零复制随机抽样
+        chosen = set(picked)
 
         n_gp = n - len(picked)
         if n_gp > 0 and len(rows) >= 3:
@@ -361,14 +407,10 @@ class ExhaustiveQueue:
                     picked.append(v)
                     chosen.add(v)                   # chosen 与 _gp_order 的 exclude 同一对象
             except Exception as e:                  # GP 异常绝不阻断穷尽推进
-                print(f"  ⚠️ GP 排序失败（{e}），本轮改为字典序游标推进", flush=True)
+                print(f"  ⚠️ GP 排序失败（{e}），本轮改为随机探索补齐", flush=True)
 
-        for v in rot:                               # 仍不足 → 按游标补齐
-            if len(picked) >= n:
-                break
-            if v not in chosen:
-                picked.append(v)
-                chosen.add(v)
+        if len(picked) < n:                         # 仍不足 → 随机补齐到 n（配额绝不缩水）
+            picked.extend(_sample_pool(P, n - len(picked), exclude=chosen))
         return [FIXED_A + v for v in picked[:n]]
 
     def _gp_order(self, P, exclude, rows, n_gp):
