@@ -31,7 +31,11 @@ class CompileCacheOfflineTest(unittest.TestCase):
             root = Path(tmp)
             (root / "af3").mkdir()
             fake_af3 = root / "af3" / "run_alphafold.py"
-            fake_af3.write_text("print('FAKE_AF3_OK')\n")
+            fake_af3.write_text(
+                "import os\n"
+                "for key in sorted(os.environ):\n"
+                "    if key.startswith(('JAX', 'XLA', 'PEPOPT_COMPILE')):\n"
+                "        print('FAKE_AF3_ENV', key, os.environ[key])\n")
             job = root / "input.json"
             job.write_text(json.dumps({"sequences": []}))
             env = dict(os.environ,
@@ -46,10 +50,15 @@ class CompileCacheOfflineTest(unittest.TestCase):
                        AF3_FLASH_ATTN="triton",
                        AF3_NEED_XLA_7X_FLAG="0",
                        PEPOPT_COMPILE_CACHE=str(root / "cache"))
-            subprocess.run(["bash", str(ROOT / "作业脚本" / "AF3打包推理.sh")],
-                           env=env, text=True, capture_output=True, check=True,
-                           timeout=120)
+            proc = subprocess.run(["bash", str(ROOT / "作业脚本" / "AF3打包推理.sh")],
+                                  env=env, text=True, capture_output=True, check=True,
+                                  timeout=120)
             self.assertTrue(any((root / "cache").rglob("profile.json")))
+            self.assertIn("已在 AF3 父 shell 启用", proc.stdout)
+            self.assertIn("FAKE_AF3_ENV JAX_COMPILATION_CACHE_DIR", proc.stdout)
+            self.assertIn("FAKE_AF3_ENV XLA_FLAGS", proc.stdout)
+            # 回归此前缺陷：配置在子进程中设置后就丢失，父 shell 必须 source env.sh。
+            self.assertTrue(any((root / "cache").rglob("env.sh")))
 
             spec = importlib.util.spec_from_file_location("af3任务", ROOT / "af3适配" / "af3任务.py")
             mod = importlib.util.module_from_spec(spec)

@@ -1,6 +1,7 @@
 """跨进程 AF3/JAX 编译与 autotune 缓存配置（导入零副作用）。
 
 版本/显卡型号/CUDA 驱动隔离缓存命名空间，避免不同运行时复用不兼容的条目。缓存是优化而非结果真源：损坏时可删除重建，AF3 必须仍能正常运行。
+注意：Python 子进程不能回写父 shell 环境。runner 必须调用 --emit-env 后source生成的 env.sh，才能把 JAX/XLA 配置传给真正的 AF3 进程。
 """
 
 import argparse
@@ -71,8 +72,27 @@ def configure(override_root=None):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", default=None)
+    parser.add_argument("--emit-env", action="store_true",
+                        help="只写可由父 shell source 的环境文件；shell 随后必须 source")
     args = parser.parse_args()
-    print(json.dumps(configure(args.root), ensure_ascii=False, indent=2))
+    info = configure(args.root)
+    if args.emit_env:
+        env_path = pathlib.Path(info["cache"]) / "env.sh"
+        values = {
+            key: os.environ[key] for key in (
+                "JAX_COMPILATION_CACHE_DIR", "JAX_ENABLE_COMPILATION_CACHE",
+                "JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS",
+                "JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES",
+                "JAX_RAISE_PERSISTENT_CACHE_ERRORS", "JAX_EXPLAIN_CACHE_MISSES",
+                "XLA_FLAGS", "PEPOPT_COMPILE_CACHE_ACTIVE")
+        }
+        with open(env_path, "w") as f:
+            f.write("# 由父 shell source，不能作为独立 Python 子进程使用\n")
+            for key, value in values.items():
+                f.write(f"export {key}='{value}'\n")
+        print(f"CACHE_ENV_FILE={env_path}", flush=True)
+    else:
+        print(json.dumps(info, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":

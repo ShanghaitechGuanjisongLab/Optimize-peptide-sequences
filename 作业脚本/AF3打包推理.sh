@@ -105,7 +105,16 @@ export AF3_FLASH_ATTN
 export AF3_NEED_XLA_7X_FLAG
 AF3_COMPILE_CACHE_CONFIG="${AF3_COMPILE_CACHE_CONFIG:-$AF3_WORK_DIR/af3适配/编译缓存.py}"
 AF3_MSA_CACHE="${AF3_MSA_CACHE:-$AF3_WORK_DIR/af3适配/msa缓存.py}"
-"$AF3_PYTHON" "$AF3_COMPILE_CACHE_CONFIG" || exit $?
+# 子进程无法回写父 shell 环境：读取 env.sh 路径，再在父 shell 中 source。
+cache_env_output=$("$AF3_PYTHON" "$AF3_COMPILE_CACHE_CONFIG" --emit-env) || exit $?
+cache_env_file=$(printf '%s\n' "$cache_env_output" | sed -n 's/^CACHE_ENV_FILE=//p' | tail -1)
+[ -f "$cache_env_file" ] || { echo "❌ 缓存环境文件未生成：$cache_env_file" >&2; exit 2; }
+# shellcheck disable=SC1090
+source "$cache_env_file" || exit $?
+[ -n "${JAX_COMPILATION_CACHE_DIR:-}" ] && [[ "${XLA_FLAGS:-}" == *xla_gpu_per_fusion_autotune_cache_dir* ]] || {
+    echo "❌ 编译缓存变量未传入 AF3 父 shell" >&2; exit 2;
+}
+echo "♻️ 已在 AF3 父 shell 启用持久化编译/autotune 缓存：$JAX_COMPILATION_CACHE_DIR"
 
 cd "$AF3_WORK_DIR" || { echo "❌ 无法进入 $AF3_WORK_DIR" >&2; exit 2; }
 
