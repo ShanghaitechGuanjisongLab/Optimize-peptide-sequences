@@ -1,5 +1,22 @@
 **小肽序列优化**：基于 AlphaFold3 的小肽序列优化脚本仓库（蒙特卡洛 / 贝叶斯优化两种搜索策略，支持官方服务器与本地集群推理两种预测后端）。
 
+# 当前四靶标口径（2026-11-06）
+
+当前默认生产扫描为 **HTR1A、BIN1、UNC13C、ASIC1A**，优化目标为：
+
+$$\text{objective}=\text{ipTM}_{HTR1A}\times\text{ipTM}_{BIN1}\times\text{ipTM}_{UNC13C}\times\text{ipTM}_{ASIC1A}$$
+
+- `小肽数据库.PRODUCT_TARGETS = ("HTR1A", "BIN1", "UNC13C", "ASIC1A")` 是唯一因子开关；缺任一因子的序列不进入正式 `BEST_TOP10.csv`，不会回退成 HTR1A 单目标榜单。
+- ASIC1A 使用同源三聚体 B/C/D，肽—ASIC1A 分数取 A 链对三亚基界面 ipTM 的最大值；每个拷贝都使用 `Asic1a_9E4E.cif` 派生的 **A 链单链模板**。`小肽模板.py` 已生成并校验索引映射：526 个查询残基全部比对，517 个一致。
+- 模板派生文件为 `af3适配/Asic1a_9E4E_chainA.cif` 和 `af3适配/Asic1a_9E4E_template.json`。原始 CIF 保持不变。修改原始 CIF 或 `ASIC1A_SEQ` 后必须运行 `python 小肽模板.py prepare`。
+- 默认 SLURM 分区/账号为 `bme_gpu` / `liuzhen1`，显卡类型明确为 `NVIDIAA10080GBPCIe`，token 上限 5120，flash attention 为 `triton`。UNC13C 不会被提交到 40GB 卡或 V100。
+- 推理环境已迁移到 `/public_bme2/Share200T/管吉松/envs/af3`，其他用户只读可用，无需各自安装 conda 环境；项目固定使用 `/public_bme2/Share200T/管吉松/envs/af3/bin/python`。AF3/JAX/PyHMMER/HMMER 已安装，A100 实测和 9E4E 模板解析通过。离线重建缓存在 `/public_bme2/Share200T/管吉松/envs/af3-build-cache`。
+- 新数据库为 `/public_bme2/Share200T/管吉松/peptide_opt_db_four_target_9e4e`，已初始化：1404 条注册序列、1388 条带历史评分；旧主表不可读时从 AF3 summary 恢复数值。首次启动自动导入旧库的注册表和 HTR1A/BIN1/UNC13C 数值，**不导入旧 ASIC1A 结果及二因子 obj_* 统计**。旧库主表与结果目录保持只读复用；MSA 缓存继续共享。
+- 可先演练初始化：`python 小肽数据库.py init-four-target --dry-run`；正式运行仍为 `./运行.sh loop`。`./运行.sh bo` 同样使用四因子乘积，输出到 `output_bo_four_target/`。
+- 离线回归：`PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -s tests -v`。
+
+> 下文 2026-10 的“两靶标生产口径”“V100 搁置 UNC13C/ASIC1A”及旧账号说明均为历史记录，不再描述当前默认配置。legacy 蒙特卡洛/云端入口不代表四靶标生产链路；ASIC1A 的指定模板任务只能使用本地 AF3 后端。
+
 # 简介
 
 本仓库提供围绕肽 **202**（`YGRKKRRQRRRSPVDVVCS`）的序列优化脚本：仅对 C 端 8 位可变区做突变搜索。

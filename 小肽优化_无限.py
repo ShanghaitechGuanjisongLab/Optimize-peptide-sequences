@@ -72,10 +72,17 @@ OFF_TARGETS   = ["UNC13C", "BIN1"]               # 历史名：目标乘积的�
 OFF_COL       = {"UNC13C": "iptm_unc13c", "BIN1": "iptm_bin1"}
 # 同源多聚体靶标的拷贝数（AF3 输入挂几个链 ID）；也是目标乘积的候选因子之一
 TARGET_COPIES = {"ASIC1A": 3}
-# 目标乘积因子：真源在 小肽数据库.PRODUCT_TARGETS（**总开关**；2026-10-20 停算ASIC1A，目标 = ipTM(HTR1A)×ipTM(BIN1)），此处只转发不重复定义。
+# 四因子乘积的唯一真源；ASIC1A 必须使用指定 9E4E A 链模板。
 PRODUCT_TARGETS = list(db.PRODUCT_TARGETS)
+DEFAULT_TARGETS = "HTR1A,BIN1,UNC13C,ASIC1A"
 
-DEFAULT_TARGETS      = "HTR1A,BIN1"              # 当前默认（V100 搁置 UNC13C）
+
+def target_af3_options(target):
+    """三聚体与模板参数的唯一入口，主扫描、补采和补算必须一致。"""
+    from 小肽模板 import target_options
+    return target_options(target)
+
+
 # GP 训练标签口径（见 `_gp_objective_rows`）：max = 1 − objective（库里 iptm_* 分量对应的那次最佳样本乘积，与 best_y / BEST_TOP10 排名同源，也是交叉验证选出的口径）；mean = 1 − obj_mean（= obj_sum/obj_n，单次评估的期望乘积，已被实测证伪，仅供复现对照）。
 GP_LABEL             = os.environ.get("PEPOPT_GP_LABEL", "max").strip().lower()
 MIN_GP_SAMPLES       = 12                        # 冷启动评估数（不足时整批走探索）
@@ -166,7 +173,8 @@ def db_evaluated_rows(active_targets):
                      "obj_mean": (s_obj / n_obj) if (n_obj and s_obj is not None) else None,
                      "iptm_asic1a": r.get("iptm_asic1a"),
                      "iptm_htr1a": r.get("iptm_htr1a"),
-                     "iptm_bin1": r.get("iptm_bin1")})
+                     "iptm_bin1": r.get("iptm_bin1"),
+                     "iptm_unc13c": r.get("iptm_unc13c")})
     return rows
 
 
@@ -506,13 +514,16 @@ def submit_candidates(seqs, active_targets):
             job_name = f"{tag}_{t.lower()}"
             out_dir = os.path.join(db.results_dir(), job_name)
             _, iptm, _ = loc.local_predict_and_score(
-                seq, TARGET_SEQS[t], t, out_dir, auto_submit=True, verbose=False)
+                seq, TARGET_SEQS[t], t, out_dir, auto_submit=True, verbose=False,
+                af3_options=target_af3_options(t))
             if iptm is not None:                      # 已就绪 → 就地入库
                 summary = db.find_summary(out_dir)
-                sc = db.extract_scores(summary) if summary else None
+                sc = db.extract_scores(summary, t) if summary else None
+                iptm = sc["iptm"] if sc else iptm
                 db.upsert_result(tag, t, iptm,
                                  ranking=(sc or {}).get("ranking_score"),
-                                 peptide=seq, var=var, source="local")
+                                 peptide=seq, var=var, source="local",
+                                 iptm_mean=(sc or {}).get("iptm_mean"))
                 marker = os.path.join(out_dir, ".harvested")
                 if not os.path.isfile(marker):
                     try:
@@ -738,6 +749,9 @@ def main():
     if "HTR1A" not in want:
         parser.error("--targets 必须包含 HTR1A（优化目标）")
     active = [t for t in TARGET_ORDER if t in want]
+    if not args.status and set(active) != set(db.PRODUCT_TARGETS) \
+            and os.environ.get("PEPOPT_ALLOW_TARGET_SUBSET") != "1":
+        parser.error(f"生产扫描必须覆盖 {db.PRODUCT_TARGETS}，实际为 {active}")
 
     if args.migrate:
         print("📦 迁移家目录旧结果 → 共享数据库 …", flush=True)
@@ -756,6 +770,8 @@ def main():
                 print(f.read())
         return
 
+    if db.db_root() == db.DEFAULT_DB_ROOT:
+        print("战役初始化：", db.initialize_four_target_campaign(), flush=True)
     signal.signal(signal.SIGTERM, _handle_stop)
     signal.signal(signal.SIGINT, _handle_stop)
     random.seed(42)

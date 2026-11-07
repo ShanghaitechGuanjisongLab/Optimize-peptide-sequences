@@ -110,10 +110,15 @@ def embed(paths) -> tuple:
             c = load(seq) if seq else None
             if c is None:
                 n_miss += 1
+                if prot.get("templates"):
+                    raise RuntimeError(
+                        f"{p}：显式结构模板缺少序列 MSA 缓存（sha1={_key(seq)}）。请先从已有 AF3 _data.json 执行 msa缓存.py extract；不能把 templates 与未设置的 MSA 混交 AF3。")
                 continue
             prot["unpairedMsa"] = c["unpairedMsa"]
             prot["pairedMsa"] = c["pairedMsa"]
-            prot["templates"] = c.get("templates") or []
+            if not prot.get("templates"):
+                prot["templates"] = c.get("templates") or []
+            # 显式 9E4E 模板优先，缓存只提供 MSA，绝不覆盖模板。
             n_hit += 1
             changed = True
         if changed:

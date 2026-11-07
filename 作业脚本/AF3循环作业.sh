@@ -34,17 +34,19 @@ echo " 无限循环作业启动：$(date '+%F %T') | 节点 $(hostname)"
 echo "   作业号   ：${SLURM_JOB_ID:-?}"
 echo "   时限请求 ：${PEPOPT_TIME_REQUESTED:-?}（循环内部预算 ${PEPOPT_MAX_HOURS:-118}h）"
 echo "   GPU      ：${PEPOPT_GPUS_PER_JOB:-1} 张 | CPU ${SLURM_CPUS_ON_NODE:-?}"
-echo "   靶标（下发）：${PEPOPT_TARGETS:-HTR1A+BIN1}   ← 务必核对！应含 BIN1"
+echo "   靶标（下发）：${PEPOPT_TARGETS:-HTR1A+BIN1+UNC13C+ASIC1A}"
 echo "   每轮序列 ：${PEPOPT_CYCLE_SEQS:-24}"
 echo "   仓库     ：$REPO_DIR"
-echo "   数据库   ：${PEPOPT_DB_ROOT:-/public_bme2/Share200T/管吉松/peptide_opt_db}"
+echo "   数据库   ：${PEPOPT_DB_ROOT:-/public_bme2/Share200T/管吉松/peptide_opt_db_four_target_9e4e}"
 echo "=============================================================="
-# 提交时就拦住靶标被截断（SLURM --export 以逗号分隔，值内含逗号会被静默截断）
-case ",${PEPOPT_TARGETS:-HTR1A+BIN1}," in
-  *",,"*|*BIN1*|*UNC13C*) : ;;
-  *) echo "❌ 靶标下发异常：'${PEPOPT_TARGETS:-}' 未含 BIN1 → 拒绝启动以免白烧 5 天机时"
-     echo "   （请确认 build_loop_job_cmd 用 '+' 而非 ',' 拼接靶标）"; exit 4 ;;
-esac
+# shell 先做首屏守卫；Python main 再严格校验完整四因子。
+TARGET_CSV=",$(echo "${PEPOPT_TARGETS:-HTR1A+BIN1+UNC13C+ASIC1A}" | tr '+' ','),"
+for required in HTR1A BIN1 UNC13C ASIC1A; do
+    case "$TARGET_CSV" in
+        *",$required,"*) : ;;
+        *) echo "❌ 靶标下发异常：缺少 $required → 拒绝启动"; exit 4 ;;
+    esac
+done
 
 # ---- 激活编排环境（base：含 sklearn/pandas/matplotlib）----
 CONDA_SH="${PEPOPT_CONDA_SH:-}"
@@ -76,7 +78,7 @@ python -c "import sklearn, scipy, pandas, numpy" 2>/dev/null || {
 TASKD="$REPO_DIR/../任务中间层/任务守护.sh"
 # -u：关闭输出缓冲，使 SLURM 日志可实时 tail
 PY_CMD="python -u 小肽优化_节点内.py \
-    --targets '${PEPOPT_TARGETS:-HTR1A+BIN1}' \
+    --targets '${PEPOPT_TARGETS:-HTR1A+BIN1+UNC13C+ASIC1A}' \
     --cycle-seqs '${PEPOPT_CYCLE_SEQS:-24}' \
     --max-hours '${PEPOPT_MAX_HOURS:-118}'"
 

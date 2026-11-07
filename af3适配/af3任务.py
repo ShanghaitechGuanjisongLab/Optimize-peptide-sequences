@@ -54,6 +54,13 @@ def gen_task(json_path: str, env: dict, task_root: str) -> str:
     runner_snap = os.path.join(tdir, "_AF3打包推理快照.sh")
     shutil.copyfile(runner_src, runner_snap)
     os.chmod(runner_snap, 0o755)
+    cache_snap = os.path.join(tdir, "_编译缓存快照.py")
+    shutil.copyfile(os.path.join(HERE, "编译缓存.py"), cache_snap)
+    msa_snap = os.path.join(tdir, "_msa缓存快照.py")
+    shutil.copyfile(MSA_CACHE, msa_snap)
+    env = dict(env)
+    env["AF3_COMPILE_CACHE_CONFIG"] = cache_snap
+    env["AF3_MSA_CACHE"] = msa_snap
 
     out_dir = env["AF3_OUT_DIR"]
     lines = [
@@ -67,14 +74,16 @@ def gen_task(json_path: str, env: dict, task_root: str) -> str:
         lines.append(f"export {k}={_sh_quote(env[k])}")
     lines.append(f"export AF3_BUNDLE_DIR={_sh_quote(tdir)}")
     lines += [
-        # 任务开始时内嵌缓存 MSA：命中 → AF3 全跳过搜索；未命中 → 现场搜索
-        f"python3 {_sh_quote(MSA_CACHE)} embed {_sh_quote(dst_json)}",
+        # 显式模板缺 MSA 时 embed 非零：立即失败，不能带着不完整输入启动 AF3。
+        f"{env.get('AF3_PYTHON', 'python3')} {_sh_quote(msa_snap)} embed {_sh_quote(dst_json)}",
+        "rc=$?",
+        "if [ $rc -ne 0 ]; then exit $rc; fi",
         f"bash {_sh_quote(runner_snap)}",
         "rc=$?",
         # 任务结束时自愈：把本任务算出的 MSA 收割入缓存，供后续任务复用
         f"find {_sh_quote(out_dir)} -maxdepth 2 -name '*_data.json' "
         f"-path {_sh_quote('*' + name + '*')} "
-        f"-exec python3 {_sh_quote(MSA_CACHE)} harvest {{}} + 2>/dev/null || true",
+        f"-exec {env.get('AF3_PYTHON', 'python3')} {_sh_quote(msa_snap)} harvest {{}} + 2>/dev/null || true",
         "exit $rc",
     ]
     launcher = os.path.join(tdir, "_启动器.sh")

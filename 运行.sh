@@ -33,7 +33,7 @@ cd "$(dirname "$0")"
 mode="${1:-loop}"
 
 REPO_DIR="$(pwd)"
-DB_ROOT="${PEPOPT_DB_ROOT:-/public_bme2/Share200T/管吉松/peptide_opt_db}"
+DB_ROOT="${PEPOPT_DB_ROOT:-/public_bme2/Share200T/管吉松/peptide_opt_db_four_target_9e4e}"
 RUNS_DIR="$DB_ROOT/runs"
 WATCHDOG_INTERVAL=5                            # cron 自愈周期（分钟）
 BLOCK_BEGIN="# >>> pepopt-watchdog >>>"
@@ -41,8 +41,8 @@ BLOCK_END="# <<< pepopt-watchdog <<<"
 
 # ---- 【当前形态】单个长驻循环作业 ----
 LOOP_JOB_NAME="pepopt-loop"
-# 新阶段默认三靶标（目标 = ipTM(Asic1a)×ipTM(HTR1A)×ipTM(BIN1) 乘积最大）
-LOOP_TARGETS="${PEPOPT_TARGETS:-HTR1A,BIN1}"   # 开关：2026-10-20 停算 ASIC1A
+# 当前生产目标：HTR1A/BIN1/UNC13C/ASIC1A 四者 ipTM 乘积最大。
+LOOP_TARGETS="${PEPOPT_TARGETS:-HTR1A,BIN1,UNC13C,ASIC1A}"
 LOOP_CYCLE_SEQS="${PEPOPT_CYCLE_SEQS:-24}"
 LOOP_DISABLED="$RUNS_DIR/loop.disabled"       # stop 写入 → 看门狗不再续交
 LOOP_WLOG="$RUNS_DIR/循环看门狗.log"
@@ -53,6 +53,20 @@ TASKCTL_DIR="${TASKCTL_HOME:-$REPO_DIR/../任务中间层}"
 TASKCTL="$TASKCTL_DIR/任务控制.sh"             # 中间层客户端
 # service.info 存在 = 当前作业是「守护托管」形态（重载码退出会被守护接住，节点不释放）
 SVC_INFO="${TASKCTL_STATE:-$TASKCTL_DIR/运行状态}/service.info"
+
+# 当前安装为 anaconda3；兼容旧 miniconda3，不让 source 失败干扰编排启动。
+activate_orchestration_env() {
+  local conda_sh=""
+  for candidate in "${CONDA_SH:-}" "$HOME/anaconda3/etc/profile.d/conda.sh" \
+                   "$HOME/miniconda3/etc/profile.d/conda.sh" \
+                   "$HOME/miniforge3/etc/profile.d/conda.sh"; do
+    if [[ -n "$candidate" && -f "$candidate" ]]; then conda_sh="$candidate"; break; fi
+  done
+  if [[ -n "$conda_sh" ]]; then
+    source "$conda_sh"
+    conda activate base
+  fi
+}
 
 # ---- 【legacy】登录节点常驻驱动 ----
 PID_FILE="$RUNS_DIR/infinite.pid"
@@ -83,11 +97,19 @@ install_watchdog() {
     # cron 环境 PATH 极简，不含 SLURM(/opt/gridview/slurm/bin) 与 conda，而驱动要调 sbatch/squeue/scontrol → 必须把登录时的完整 PATH 写进来。
     echo "PATH=$PATH"
     # 战役参数必须烙进 crontab 行：cron 无登录环境，缺省会读到默认 DB/靶标→续交的作业会打回旧库或跑错靶标（多战役并存时串库）。
-    echo "PEPOPT_DB_ROOT=${PEPOPT_DB_ROOT:-/public_bme2/Share200T/管吉松/peptide_opt_db}"
-    # 靶标必须引单一真源 $LOOP_TARGETS，不得在此重复写默认值：
-    # 旧版写死 :-HTR1A,BIN1,ASIC1A，导致停算 ASIC1A 后看门狗续交的作业又打回三靶标。
+    echo "PEPOPT_DB_ROOT=${PEPOPT_DB_ROOT:-/public_bme2/Share200T/管吉松/peptide_opt_db_four_target_9e4e}"
     echo "PEPOPT_TARGETS=$LOOP_TARGETS"
     echo "PEPOPT_CYCLE_SEQS=${PEPOPT_CYCLE_SEQS:-24}"
+    # cron 不继承登录环境；高端 GPU 和推理环境参数必须一并固化。
+    echo "PEPOPT_PARTITION=${PEPOPT_PARTITION:-bme_gpu}"
+    echo "PEPOPT_ACCOUNT=${PEPOPT_ACCOUNT:-liuzhen1}"
+    echo "PEPOPT_GPU_TYPE=${PEPOPT_GPU_TYPE:-NVIDIAA10080GBPCIe}"
+    echo "PEPOPT_GPU_MAX_TOKENS=${PEPOPT_GPU_MAX_TOKENS:-5120}"
+    echo "PEPOPT_FLASH_ATTN=${PEPOPT_FLASH_ATTN:-triton}"
+    echo "PEPOPT_XLA_7X=${PEPOPT_XLA_7X:-0}"
+    echo "PEPOPT_CONDA_ENV=${PEPOPT_CONDA_ENV:-af3}"
+    echo "PEPOPT_AF3_ENV_PREFIX=${PEPOPT_AF3_ENV_PREFIX:-/public_bme2/Share200T/管吉松/envs/af3}"
+    echo "PEPOPT_AF3_PYTHON=${PEPOPT_AF3_PYTHON:-/public_bme2/Share200T/管吉松/envs/af3/bin/python}"
     echo "*/$WATCHDOG_INTERVAL * * * * $WATCHDOG >/dev/null 2>&1"
     echo "$BLOCK_END"
   } >> "$tmp"
@@ -137,8 +159,7 @@ kill_legacy_driver() {
 }
 
 submit_loop() {
-  source ~/miniconda3/etc/profile.d/conda.sh
-  conda activate base
+  activate_orchestration_env
   # submit_loop_job 内部会做预检查(PREFLIGHT_OK)并自行避免重复提交；
   # 若 QoS 提交窗口被旧 bundle 作业占满而失败，看门狗会在窗口空出后自动补交。
   python -u - <<PY
@@ -207,8 +228,7 @@ stop_loop() {
 
 # 穷尽覆盖进度（候选全集 51091 的已派发/待评估 + 全覆盖 ETA）
 coverage_line() {
-  source ~/miniconda3/etc/profile.d/conda.sh
-  conda activate base
+  activate_orchestration_env
   python -u - <<PY 2>/dev/null
 import re, sys
 sys.path.insert(0, "$REPO_DIR")
@@ -307,7 +327,7 @@ status_loop() {
   echo
   squeue -u "$USER" -o "%.8i %.14j %.2t %.10M %.20R" 2>/dev/null | head -8
   echo
-  source ~/miniconda3/etc/profile.d/conda.sh; conda activate base
+  activate_orchestration_env
   python -u 小肽优化_无限.py --status
 }
 
@@ -325,8 +345,7 @@ start_infinite() {
   mkdir -p "$RUNS_DIR"
   local ts; ts=$(date +%Y%m%d_%H%M%S)
   local log="$RUNS_DIR/infinite_${ts}.log"
-  source ~/miniconda3/etc/profile.d/conda.sh
-  conda activate base
+  activate_orchestration_env
   # --migrate：把家目录旧结果迁入共享库（幂等，已迁过会自动跳过）
   # 后台日志由共享库的 runs/ 目录持久化，计算节点与登录节点都可见。
   # 注：setsid 只能脱离会话/进程组，逃不出 sshd.service 的 cgroup（实测），故仍需 cron 看门狗兵托（见 作业脚本/驱动看门狗.sh 文件头）。
@@ -384,15 +403,14 @@ status_infinite() {
   echo
   squeue -u "$USER" -o "%.8i %.14j %.2t %.10M %.20R" 2>/dev/null | head -8
   echo
-  source ~/miniconda3/etc/profile.d/conda.sh; conda activate base
+  activate_orchestration_env
   python -u 小肽优化_无限.py --status
 }
 
 # ---- 本地集群推理后端（有限入口）：编排跑在登录节点，进度实时输出 ----
 run_local() {
   local entry="$1"; shift
-  source ~/miniconda3/etc/profile.d/conda.sh
-  conda activate base
+  activate_orchestration_env
   echo "🧬 启动本地集群推理（进度实时输出，Ctrl+C 退出编排；已提交的 GPU 作业不受影响）"
   echo "------------------------------------------------------"
   python -u "$entry" "$@"

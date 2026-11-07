@@ -67,13 +67,15 @@ from 小肽公共库 import create_af3_json     # 补采任务的 AF3 输入构�
 
 # ===================== 配置 =====================
 
-# 靶标真源在 小肽优化_无限（已含 ASIC1A 同源三聚体），此处不重复定义
+# 四靶标使用同一套模板参数；默认数据库与旧二因子战役隔离。
 TARGET_ORDER      = inf.TARGET_ORDER
-# 评估靶标开关：2026-10-20 停算 ASIC1A（目标 = HTR1A×BIN1 两乘积；数据/路径保留，恢复时改回 "HTR1A,BIN1,ASIC1A" 并同步 小肽数据库.PRODUCT_TARGETS）
-DEFAULT_TARGETS   = "HTR1A,BIN1"
-CYCLE_SEQS        = 8                  # 每轮序列数（×靶标数 = 每轮任务数）
-CYCLE_FIXED_SEC   = 4703.0             # 每轮固定开销：三个 chain B 的 MSA（实测 2026-10-13）ASIC1a 526aa=1410s + HTR1A 422aa=1738s + BIN1 593aa=1555s ≈ 78min（同源多聚体的拷贝链 MSA 被 functools.cache 缓存：chain C/D 实测仅 0.02s）
-CYCLE_PER_SEQ_SEC = 3500.0             # 每序列边际（实测）：肽链A MSA 708s +ASIC1a 理 2735s（1597 tokens×5 samples，显存99%溢出）+ HTR1A/BIN1 推理 ~400s gap-fill 行（只缺 ASIC1A）约 3440s/序列；新序列（三靶标）约 3970s/序列
+DEFAULT_TARGETS   = "HTR1A,BIN1,UNC13C,ASIC1A"
+CYCLE_SEQS        = 8                  # 每轮序列数（×4 = 每轮最多 32 个任务）A100四靶标保守预算；前三靶标有旧实测，UNC13C 先取保守值，后续由日志标定。
+TARGET_MSA_SEC    = {"ASIC1A": 1410.0, "HTR1A": 1738.0,
+                     "BIN1": 1555.0, "UNC13C": 3000.0}
+TARGET_INFER_SEC  = {"ASIC1A": 1800.0, "HTR1A": 93.0,
+                     "BIN1": 230.0, "UNC13C": 1200.0}
+PEPTIDE_MSA_SEC   = 708.0
 SAFETY_MARGIN_SEC = 1200               # 距 SLURM 时限的安全余量（20min）
 MAX_HOURS_DEFAULT = 118.0              # 5 天(120h)上限减去 2h 余量
 EMPTY_CYCLE_LIMIT = 3                  # 连续 N 轮零产出即退出（避免空烧 5 天）
@@ -96,19 +98,23 @@ def _handle_stop(signum, frame):
           "下个作业会收割）", flush=True)
 
 
-def cycle_seconds(n_seq):
-    """估计一轮（n_seq 个序列 × 激活靶标数）的墙钟秒数。"""
-    # 任务数 = 序列数 × 靶标数，但 chain B MSA 每靶标只建一次（进程内缓存），
-    # 故固定开销与靶标数成正比，边际成本与任务数成正比。
-    return CYCLE_FIXED_SEC + CYCLE_PER_SEQ_SEC * n_seq
+def cycle_seconds(n_seq, active_targets=None):
+    """按实际靶标估计墙钟；同靶标 MSA 固定开销每轮只付一次。"""
+    targets = active_targets or inf.PRODUCT_TARGETS
+    fixed = sum(TARGET_MSA_SEC[t] for t in targets)
+    per_seq = PEPTIDE_MSA_SEC + sum(TARGET_INFER_SEC[t] for t in targets)
+    return fixed + per_seq * n_seq
 
 
-def size_next_cycle(remaining_sec, max_seqs):
-    """按剩余时间反推这一轮该放几个序列（尽量把 GPU 用满，又不被时限掐断）。"""
+def size_next_cycle(remaining_sec, max_seqs, active_targets=None):
+    """按剩余时间反推本轮序列数。"""
+    targets = active_targets or inf.PRODUCT_TARGETS
     budget = remaining_sec - SAFETY_MARGIN_SEC
-    if budget <= CYCLE_FIXED_SEC:
-        return 0                              # 连一轮固定开销都放不下 → 收工
-    n = int(math.floor((budget - CYCLE_FIXED_SEC) / CYCLE_PER_SEQ_SEC))
+    fixed = sum(TARGET_MSA_SEC[t] for t in targets)
+    per_seq = PEPTIDE_MSA_SEC + sum(TARGET_INFER_SEC[t] for t in targets)
+    if budget <= fixed:
+        return 0
+    n = int(math.floor((budget - fixed) / per_seq))
     return max(1, min(n, max_seqs))
 
 
@@ -132,6 +138,8 @@ def build_runner_env(bundle_dir, out_dir=None):
         "AF3_DB_DIR": loc.LOCAL_DB_DIR,
         "AF3_WORK_DIR": _ROOT,
         "AF3_CONDA_ENV": loc.CONDA_ENV,
+        "AF3_ENV_PREFIX": loc.AF3_ENV_PREFIX,
+        "AF3_PYTHON": loc.AF3_PYTHON,
         "AF3_FLASH_ATTN": loc.FLASH_ATTENTION_IMPL,
         "AF3_NEED_XLA_7X_FLAG": "1" if loc.NEED_XLA_7X_FLAG else "0",
         "AF3_MSA_CPUS": str(loc.MSA_CPUS_PER_GPU),
@@ -304,7 +312,7 @@ def make_resample_fn(deadline):
                 job = f"{tag}_{t.lower()}_s{seed}"
                 job_json = create_af3_json(
                     pep, inf.TARGET_SEQS[t], job, model_seeds=[seed],
-                    target_copies=inf.TARGET_COPIES.get(t, 1))
+                    **inf.target_af3_options(t))
                 with open(os.path.join(bundle, f"{job}.json"), "w") as f:
                     json.dump(job_json, f, indent=2)
                 jobs.append((tag, t, job))
@@ -364,7 +372,7 @@ def prepare_cycle(seqs, active_targets, cycle_dir):
             os.makedirs(canon, exist_ok=True)
             inp = loc.write_input_json(
                 seq, inf.TARGET_SEQS[t], job_name, canon,
-                target_copies=inf.TARGET_COPIES.get(t, 1))
+                **inf.target_af3_options(t))
             tk = loc.estimate_tokens(inp)
             if tk > loc.GPU_MAX_TOKENS:
                 skipped.append(f"{job_name}: {tk} tokens > {loc.GPU_MAX_TOKENS}")
@@ -386,6 +394,7 @@ def drain_backlog(active_targets, cycle_dir, seq_budget):
     rd = db.results_dir()
     if not os.path.isdir(rd):
         return 0, 0
+    os.makedirs(cycle_dir, exist_ok=True)
 
     pending = {}                       # tag -> [（任务名，input.json 路径）]
 
@@ -412,7 +421,11 @@ def drain_backlog(active_targets, cycle_dir, seq_budget):
     # 避免对已完整的序列做无谓的目录探测。
     reg, rows = db.load_sequence_registry(), db.load_database()
     n_gap = 0
+    more_backlog = False
     for tag in sorted(reg):
+        if len(pending) >= seq_budget:
+            more_backlog = True             # 内嵌 9E4E 较大，只生成本批次的输入
+            break
         info = reg[tag]
         pep = info.get("peptide")
         row = rows.get(tag, {})
@@ -432,7 +445,7 @@ def drain_backlog(active_targets, cycle_dir, seq_budget):
                 os.makedirs(canon, exist_ok=True)
                 inp = loc.write_input_json(
                     pep, inf.TARGET_SEQS[t], name, canon,
-                    target_copies=inf.TARGET_COPIES.get(t, 1))
+                    **inf.target_af3_options(t))
             except OSError as e:
                 print(f"  ⚠️ gap-fill 写输入失败 {name}：{e}", flush=True)
                 continue
@@ -448,12 +461,13 @@ def drain_backlog(active_targets, cycle_dir, seq_budget):
             try:
                 shutil.copyfile(inp, os.path.join(cycle_dir, f"{name}.json"))
                 n_task += 1
-            except OSError:
-                pass
+            except OSError as e:
+                print(f"  ⚠️ 补算输入复制失败 {name}：{e}", flush=True)
     left_seq = len(pending) - n_seq
+    left_text = (f"；尚余 {left_seq} 序列待后续轮次" if left_seq > 0 else
+                 "；后续仍有历史序列待补" if more_backlog else "")
     print(f"  🧹 补跑遗留/缺失：{n_seq} 序列 / {n_task} 任务"
-          f"（遗留任务 {n_leftover} + 缺失靶标补齐 {n_gap}）"
-          + (f"；尚余 {left_seq} 序列待后续轮次" if left_seq > 0 else ""),
+          f"（遗留任务 {n_leftover} + 缺失靶标补齐 {n_gap}）" + left_text,
           flush=True)
     return n_seq, n_task
 
@@ -480,6 +494,8 @@ def consume_restart_flag(p):
 
 
 def run_loop(active_targets, cycle_seqs, max_hours):
+    if db.db_root() == db.DEFAULT_DB_ROOT:
+        print("   战役初始化：", db.initialize_four_target_campaign(), flush=True)
     p = db.paths(ensure=True)
     start = time.time()
     deadline = start + max_hours * 3600.0
@@ -498,7 +514,7 @@ def run_loop(active_targets, cycle_seqs, max_hours):
     if inf.SWEEP_ENABLED:
         print("   覆盖起点  ：" + inf.coverage_report(active_targets), flush=True)
     print(f"   每轮      ：≤{cycle_seqs} 序列 × {len(active_targets)} 靶标 "
-          f"≈ {cycle_seconds(cycle_seqs) / 3600:.1f}h", flush=True)
+          f"≈ {cycle_seconds(cycle_seqs, active_targets) / 3600:.1f}h", flush=True)
     print(f"   时间预算  ：{max_hours:.1f}h（到期自动退出，由看门狗续交下一作业）",
           flush=True)
     print(f"   共享数据库：{p['root']}", flush=True)
@@ -522,7 +538,7 @@ def run_loop(active_targets, cycle_seqs, max_hours):
             break
 
         cycle_no += 1
-        n_seq = size_next_cycle(remaining, cycle_seqs)
+        n_seq = size_next_cycle(remaining, cycle_seqs, active_targets)
         if n_seq < 1:
             print("\n⏰ 剩余时间不足一轮，退出。", flush=True)
             break
@@ -531,7 +547,7 @@ def run_loop(active_targets, cycle_seqs, max_hours):
         print(f"\n== [周期 {cycle_no}] {time.strftime('%F %T')} | "
               f"已用 {elapsed_h:.1f}h / {max_hours:.0f}h | "
               f"剩 {remaining / 3600:.1f}h → 本轮 {n_seq} 序列 "
-              f"（≈{(cycle_seconds(n_seq)) / 3600:.1f}h）", flush=True)
+              f"（≈{cycle_seconds(n_seq, active_targets) / 3600:.1f}h）", flush=True)
 
         # 1）先收割上一个周期的成果（首轮则收割历史遗留/其它入口的完成结果）
         #    收割内部做序贯采样入库（β 统计量），并在入库数过 2^k 时触发数据库整理（P̃·N>M 决定每条记录重复搜索多少次，补采真跑 AF3 新 seed）
@@ -564,7 +580,7 @@ def run_loop(active_targets, cycle_seqs, max_hours):
                 picks = inf.heuristic_pick(stream, want, active_targets)
         if inf.SWEEP_ENABLED:
             print("  " + inf.coverage_report(active_targets,
-                                            cycle_secs=cycle_seconds(n_seq),
+                                            cycle_secs=cycle_seconds(n_seq, active_targets),
                                             per_cycle=max(want, 1)), flush=True)
         if picks:
             print(f"  🎯 选中 {len(picks)} 个新序列："
@@ -643,9 +659,7 @@ def main():
         description="计算节点内的无限搜索循环作业（结果持续追加进共享数据库）")
     ap.add_argument("--targets", default=os.environ.get("PEPOPT_TARGETS")
                     or DEFAULT_TARGETS,
-                    help="靶标列表，用 ',' 或 '+' 分隔，必须含 HTR1A（默认 HTR1A,BIN1；"
-                         "UNC13C 需 A100/H100 解锁后加进来）。注意经 SLURM --export "
-                         "下发时只能用 '+'，逗号会被截断（见 parse_targets）")
+                    help="四靶标列表，用 ',' 或 '+' 分隔；SLURM 下发必须用 '+ '")
     ap.add_argument("--cycle-seqs", type=int,
                     default=int(os.environ.get("PEPOPT_CYCLE_SEQS") or CYCLE_SEQS),
                     help=f"每轮最多序列数（默认 {CYCLE_SEQS}）")
@@ -663,18 +677,18 @@ def main():
         ap.error("--targets 必须包含 HTR1A（优化目标）")
     active = [t for t in TARGET_ORDER if t in want]
 
-    # 硬守卫：只跑 HTR1A 而没有 BIN1，等于丢掉目标乘积的一半因子（本项目目标 = ipTM(HTR1A) × ipTM(BIN1) 最大化）：乘积恒为 None → BEST_TOP10 只能退回单看 HTR1A、GP 也拿不到真正的训练目标，产出的序列无法排名 → 白烧几天机时；历史上这个退化是由 PEPOPT_TARGETS 逗号截断造成的，故在此拦住。
-    # 确实只想跑单靶标（如调试）时，显式 PEPOPT_ALLOW_SINGLE_TARGET=1。
-    if len(active) == 1 and os.environ.get("PEPOPT_ALLOW_SINGLE_TARGET") != "1":
-        ap.error(
-            f"靶标只有 {active}：目标乘积缺半边因子，产出无法排名，已拒绝启动以免"
-            "白烧机时。\n"
-            f"  原始参数：{args.targets!r}\n"
-            "  常见原因：经 SLURM `--export` 下发时用了逗号 → 被 SLURM 按逗号截断"
-            "（--export 列表自身以逗号分隔）。\n"
-            "  修正：下发时用 '+' 分隔，如 PEPOPT_TARGETS=HTR1A+BIN1（"
-            "submit_loop_job() 已如此生成）。\n"
-            "  如确实只想跑单靶标，显式设 PEPOPT_ALLOW_SINGLE_TARGET=1。")
+    # 默认必须是完整四因子；调试子集须显式放行，防止静默退回旧目标。
+    if set(active) != set(db.PRODUCT_TARGETS) \
+            and os.environ.get("PEPOPT_ALLOW_TARGET_SUBSET") != "1":
+        ap.error(f"生产扫描必须覆盖 {db.PRODUCT_TARGETS}，实际为 {active}。"
+                 "调试子集请显式设 PEPOPT_ALLOW_TARGET_SUBSET=1。")
+    max_tokens = max(len(inf.SEQ_202) + len(inf.TARGET_SEQS[t])
+                     * inf.TARGET_COPIES.get(t, 1) for t in active)
+    if max_tokens > loc.GPU_MAX_TOKENS:
+        ap.error(f"最大复合物 {max_tokens} tokens 超过当前上限 "
+                 f"{loc.GPU_MAX_TOKENS}；UNC13C 需 A100/H100 80GB。")
+    from 小肽模板 import load as load_template
+    load_template()                         # 缺模板/哈希不符时在提交前立即失败
 
     signal.signal(signal.SIGTERM, _handle_stop)
     signal.signal(signal.SIGINT, _handle_stop)

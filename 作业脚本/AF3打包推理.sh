@@ -45,6 +45,9 @@ shopt -s nullglob
 : "${AF3_WORK_DIR:?缺少环境变量 AF3_WORK_DIR}"
 
 AF3_CONDA_ENV="${AF3_CONDA_ENV:-af3_old}"
+AF3_ENV_PREFIX="${AF3_ENV_PREFIX:-}"
+AF3_PYTHON="${AF3_PYTHON:-${AF3_ENV_PREFIX:+$AF3_ENV_PREFIX/bin/python}}"
+AF3_PYTHON="${AF3_PYTHON:-python}"
 AF3_CONDA_SH="${AF3_CONDA_SH:-}"
 AF3_HMMER_DIR="${AF3_HMMER_DIR:-}"
 AF3_FLASH_ATTN="${AF3_FLASH_ATTN:-xla}"
@@ -62,22 +65,25 @@ if [ ! -f "$RUN_AF3" ]; then
     exit 2
 fi
 
-# ---- 激活推理环境 ----
-if [ -z "$AF3_CONDA_SH" ]; then
+# 优先共享环境的绝对 Python；未配置时保留旧 conda 环境回退。
+if [ -n "$AF3_ENV_PREFIX" ]; then
+    export PATH="$AF3_ENV_PREFIX/bin:$PATH"
+    export CONDA_PREFIX="$AF3_ENV_PREFIX"
+elif [ -z "$AF3_CONDA_SH" ]; then
     for c in "$HOME/miniconda3/etc/profile.d/conda.sh" \
              "$HOME/anaconda3/etc/profile.d/conda.sh" \
              "$HOME/miniforge3/etc/profile.d/conda.sh"; do
         if [ -f "$c" ]; then AF3_CONDA_SH="$c"; break; fi
     done
 fi
-if [ -n "$AF3_CONDA_SH" ] && [ -f "$AF3_CONDA_SH" ]; then
+if [ -z "$AF3_ENV_PREFIX" ] && [ -n "$AF3_CONDA_SH" ] && [ -f "$AF3_CONDA_SH" ]; then
     # shellcheck disable=SC1090
     source "$AF3_CONDA_SH"
     if ! conda activate "$AF3_CONDA_ENV"; then
         echo "❌ 激活 conda 环境 '$AF3_CONDA_ENV' 失败" >&2
         exit 2
     fi
-else
+elif [ -z "$AF3_ENV_PREFIX" ]; then
     echo "⚠️ 未定位到 conda.sh，沿用当前环境的 python" >&2
 fi
 [ -n "$AF3_HMMER_DIR" ] && export PATH="$AF3_HMMER_DIR:$PATH"
@@ -93,7 +99,22 @@ export XLA_PYTHON_CLIENT_PREALLOCATE=false
 export TF_FORCE_UNIFIED_MEMORY=true
 export XLA_CLIENT_MEM_FRACTION=3.2
 
+# 在导入 JAX 前配置跨进程持久化编译与 autotune 缓存。
+# 每次新 Python 进程都能读取，不再依赖 HQ worker 的长生命周期。
+export AF3_FLASH_ATTN
+export AF3_NEED_XLA_7X_FLAG
+AF3_COMPILE_CACHE_CONFIG="${AF3_COMPILE_CACHE_CONFIG:-$AF3_WORK_DIR/af3适配/编译缓存.py}"
+AF3_MSA_CACHE="${AF3_MSA_CACHE:-$AF3_WORK_DIR/af3适配/msa缓存.py}"
+"$AF3_PYTHON" "$AF3_COMPILE_CACHE_CONFIG" || exit $?
+
 cd "$AF3_WORK_DIR" || { echo "❌ 无法进入 $AF3_WORK_DIR" >&2; exit 2; }
+
+# HQ 与整包直跑都先补 MSA；显式 9E4E 模板缺 MSA 时 embed 会非零退出。
+# 不使用 || true：AF3 不允许 templates 已设置而 MSA 未设置。
+json_inputs=("$AF3_BUNDLE_DIR"/*.json)
+if [ ${#json_inputs[@]} -gt 0 ]; then
+    "$AF3_PYTHON" "$AF3_MSA_CACHE" embed "${json_inputs[@]}" || exit $?
+fi
 
 
 # has_result <任务名> —— 判断该任务是否已出结果
@@ -134,7 +155,7 @@ consolidate_outputs() {
 
 # run_once <"--input_dir=DIR" | "--json_path=FILE">
 run_once() {
-    python "$RUN_AF3" "$1" \
+    "$AF3_PYTHON" "$RUN_AF3" "$1" \
         --output_dir="$AF3_OUT_DIR" \
         --model_dir="$AF3_MODEL_DIR" \
         --db_dir="$AF3_DB_DIR" \
@@ -194,7 +215,7 @@ stage1_parallel() {
         [ -z "$(ls -A "$split_root/g$i" 2>/dev/null)" ] && continue
         echo "  ▶ 流[i=${gpu_ids[$i]}]：$(cd "$split_root/g$i" && printf '%s ' *.json)"
         CUDA_VISIBLE_DEVICES="${gpu_ids[$i]}" \
-            python "$RUN_AF3" "--input_dir=$split_root/g$i" \
+            "$AF3_PYTHON" "$RUN_AF3" "--input_dir=$split_root/g$i" \
             --output_dir="$AF3_OUT_DIR" \
             --model_dir="$AF3_MODEL_DIR" \
             --db_dir="$AF3_DB_DIR" \

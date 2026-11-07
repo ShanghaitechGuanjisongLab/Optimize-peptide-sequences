@@ -96,10 +96,12 @@ LOCAL_RESULTS_DIR = os.environ.get("PEPOPT_RESULTS_DIR", "").strip() \
 # 外置作业脚本目录：SLURM 实际执行的 .sh 脚本存放处，不再把 shell 内嵌进 Python 字符串
 SCRIPTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "作业脚本")
 
-# SLURM 资源配置（每个“序列×靶标”为一个推理任务，多任务打包进单个作业）
-# PEPOPT_PARTITION 可覆盖（将来申请到 A100/H100 分区时切换）
-LOCAL_PARTITION = os.environ.get("PEPOPT_PARTITION", "").strip() or "bme_gpupub"
-LOCAL_ACCOUNT   = "v-jiamh"                   # SLURM 账户（无此分区/账户组合会被拒）
+# 四靶标默认走已实测可立即调度的 A100 80GB；legacy 分区仍可用环境变量显式指定。
+LOCAL_PARTITION = os.environ.get("PEPOPT_PARTITION", "").strip() or "bme_gpu"
+LOCAL_ACCOUNT   = os.environ.get("PEPOPT_ACCOUNT", "").strip() or (
+    "liuzhen1" if LOCAL_PARTITION == "bme_gpu" else "v-jiamh")
+LOCAL_GPU_TYPE  = os.environ.get("PEPOPT_GPU_TYPE", "").strip() or (
+    "NVIDIAA10080GBPCIe" if LOCAL_PARTITION == "bme_gpu" else "")
 LOCAL_MEMORY    = "64G"                       # **每 GPU** 的主机内存配额（总量按卡数放大）
 LOCAL_CPUS      = 8                           # **每 GPU** 的 CPU 配额（受 QoS cpu 上限钳制）
 LOCAL_TIME      = "48:00:00"                  # 单个作业最长时限（打包模式下含多个任务）
@@ -216,7 +218,8 @@ MAX_INFLIGHT    = max(1, QOS_LIMITS["submit"])
 # 若申请到 A100/H100-80G：设环境变量 PEPOPT_GPU_MAX_TOKENS=5120 与
 # PEPOPT_FLASH_ATTN=triton（见下），并把 runner 的 AF3_NEED_XLA_7X_FLAG 置 0，
 # 即可补齐 UNC13C；代码无需改动。
-GPU_MAX_TOKENS  = int(os.environ.get("PEPOPT_GPU_MAX_TOKENS", "") or 2048)
+GPU_MAX_TOKENS  = int(os.environ.get("PEPOPT_GPU_MAX_TOKENS", "") or (
+    5120 if LOCAL_PARTITION == "bme_gpu" else 2048))
 
 # flash attention 实现（对应 run_alphafold.py 的 --flash_attention_implementation）：
 #   "xla"：不用 flash attention，跨设备可用，但注意力显存 O(N^2)。
@@ -224,10 +227,17 @@ GPU_MAX_TOKENS  = int(os.environ.get("PEPOPT_GPU_MAX_TOKENS", "") or 2048)
 #   "triton"：真正的 flash attention，显存 O(N) 且更快，但需 Ampere（算力 8.0+，
 #              即 A100/H100）。A100-80G 上换成 triton 后，大体系不再受显存平方律限制。
 #   "cudnn"：cuDNN 实现，同样需 Ampere，测试不如 triton 充分。
-FLASH_ATTENTION_IMPL = os.environ.get("PEPOPT_FLASH_ATTN", "").strip() or "xla"
+FLASH_ATTENTION_IMPL = os.environ.get("PEPOPT_FLASH_ATTN", "").strip() or (
+    "triton" if LOCAL_PARTITION == "bme_gpu" else "xla")
 # CUDA 算力 7.x (V100/T4) 需要给 JAX 注入禁用 HLO 融合通道的 XLA_FLAGS；
-# Ampere+ (A100/H100) 不需要，置 "0" 跳过。PEPOPT_XLA_7X=0 可覆盖默认值。
-NEED_XLA_7X_FLAG = os.environ.get("PEPOPT_XLA_7X", "1") == "1"
+# Ampere+ (A100/H100) 不需要，置 "0" 跳过。PEPOPT_XLA_7X 可覆盖默认值。
+NEED_XLA_7X_FLAG = os.environ.get(
+    "PEPOPT_XLA_7X", "0" if LOCAL_PARTITION == "bme_gpu" else "1") == "1"
+
+
+def gpu_gres(n_gpu):
+    """UNC13C 必须在 80GB 卡上运行，避免调度到同分区的 40GB 卡。"""
+    return f"gpu:{LOCAL_GPU_TYPE}:{n_gpu}" if LOCAL_GPU_TYPE else f"gpu:{n_gpu}"
 
 # token 数超限的任务不提交，写入此标记，以免每次重跑都重复刷警告
 OOM_SKIP_MARKER = ".oom_skipped"
@@ -236,7 +246,15 @@ OOM_SKIP_MARKER = ".oom_skipped"
 # 留空则依赖作业节点 PATH 中可直接找到
 LOCAL_HMMER_DIR = ""
 
-CONDA_ENV       = "af3_old"                 # 推理用 conda 环境（含 alphafold3+jax）
+CONDA_ENV = os.environ.get("PEPOPT_CONDA_ENV", "").strip() or (
+    "af3" if LOCAL_PARTITION == "bme_gpu" and LOCAL_ACCOUNT == "liuzhen1"
+    else "af3_old")
+AF3_ENV_PREFIX = os.environ.get("PEPOPT_AF3_ENV_PREFIX", "").strip() or (
+    "/public_bme2/Share200T/管吉松/envs/af3"
+    if LOCAL_PARTITION == "bme_gpu" and LOCAL_ACCOUNT == "liuzhen1" else "")
+AF3_PYTHON = os.environ.get("PEPOPT_AF3_PYTHON", "").strip() or (
+    os.path.join(AF3_ENV_PREFIX, "bin", "python") if AF3_ENV_PREFIX else "python")
+AF3_ENV_BIN = os.path.join(AF3_ENV_PREFIX, "bin") if AF3_ENV_PREFIX else ""
 
 FORCE_RESUBMIT  = os.environ.get("FORCE_RESUBMIT", "0") == "1"   # 强制重提交失败作业
 
@@ -541,6 +559,18 @@ def preflight_check():
     if not os.path.isfile(weights):
         errors.append(f"模型权重不存在: {weights}")
 
+    if os.environ.get("PEPOPT_SKIP_ENV_CHECK") != "1":
+        try:
+            env_check = subprocess.run(
+                [AF3_PYTHON, "-c", "import alphafold3, jax, pyhmmer"],
+                capture_output=True, text=True, timeout=120)
+            if env_check.returncode != 0:
+                detail = (env_check.stderr or env_check.stdout).strip().splitlines()
+                errors.append(f"共享推理环境 {AF3_PYTHON} 缺 alphafold3/jax/pyhmmer："
+                              f"{detail[-1] if detail else '导入失败'}")
+        except (OSError, subprocess.TimeoutExpired) as e:
+            errors.append(f"无法检查推理环境 {AF3_PYTHON}：{e}")
+
     # 数据库：要求解压后的文件（AF3 不接受 .zst）；缺失时把解压提交为
     # 计算节点异步作业，无需在登录节点维持 SSH 连接，也不占用登录节点资源。
     ready, missing_db = database_ready()
@@ -554,8 +584,8 @@ def preflight_check():
             f"   解压作业在计算节点运行中, 新的推理作业会跳过提交"
         )
 
-    # hmm 工具检查（数据管线必需；推理用环境为 CONDA_ENV）
-    env_bin = os.path.expanduser(f"~/miniconda3/envs/{CONDA_ENV}/bin")
+    # HMMER 使用共享环境的绝对路径，不依赖当前用户的 conda 安装。
+    env_bin = AF3_ENV_BIN or os.path.expanduser(f"~/miniconda3/envs/{CONDA_ENV}/bin")
     if not shutil.which("jackhmmer") and not os.path.isfile(os.path.join(env_bin, "jackhmmer")) \
             and not LOCAL_HMMER_DIR:
         errors.append(
@@ -713,6 +743,8 @@ def build_bundle_sbatch_cmd(bundle_id, bundle_dir):
         f"AF3_DB_DIR={LOCAL_DB_DIR}",
         f"AF3_WORK_DIR={work_dir}",
         f"AF3_CONDA_ENV={CONDA_ENV}",
+        f"AF3_ENV_PREFIX={AF3_ENV_PREFIX}",
+        f"AF3_PYTHON={AF3_PYTHON}",
         f"AF3_FLASH_ATTN={FLASH_ATTENTION_IMPL}",
         f"AF3_NEED_XLA_7X_FLAG={'1' if NEED_XLA_7X_FLAG else '0'}",
         f"AF3_MSA_CPUS={MSA_CPUS_PER_GPU}",
@@ -731,7 +763,7 @@ def build_bundle_sbatch_cmd(bundle_id, bundle_dir):
         "--nodes=1",
         f"--cpus-per-task={cpu_total}",
         f"--mem={mem_total}",
-        f"--gres=gpu:{n_gpu}",
+        f"--gres={gpu_gres(n_gpu)}",
         f"--time={LOCAL_TIME}",
         "--export=ALL," + ",".join(env_pairs),
         runner,
@@ -847,7 +879,7 @@ def build_loop_job_cmd(targets, cycle_seqs, max_hours=None):
         "--nodes=1",
         f"--cpus-per-task={cpu_total}",
         f"--mem={mem_total}",
-        f"--gres=gpu:{n_gpu}",
+        f"--gres={gpu_gres(n_gpu)}",
         f"--time={time_str}",
         "--export=ALL," + ",".join(env_pairs),
         os.path.join(SCRIPTS_DIR, "AF3循环作业.sh"),
@@ -981,20 +1013,19 @@ def submit_pending_bundle():
 
 
 def write_input_json(peptide_seq, target_seq, job_name, result_dir,
-                    target_copies=1):
-    """写入单任务的 AF3 输入 JSON（提交由打包机制统一处理）。
-
-    target_copies：靶标链数（同源多聚体）；3 = Asic1a 同源三聚体（详见小肽公共库.create_af3_json）。"""
+                    target_copies=1, target_templates=None):
+    """写入单任务 AF3 JSON，保留同源多聚体与显式结构模板。"""
     input_json = os.path.join(result_dir, "input.json")
     job = create_af3_json(peptide_seq, target_seq, job_name,
-                          target_copies=target_copies)
+                          target_copies=target_copies,
+                          target_templates=target_templates)
     with open(input_json, "w") as f:
         json.dump(job, f, indent=2)
     return input_json
 
 
 def local_predict_and_score(peptide_seq, target_seq, target_name, out_dir,
-                            auto_submit=True, verbose=True):
+                            auto_submit=True, verbose=True, af3_options=None):
     """
     服务器版 predict_and_score 的本地替身：
       - 已有结果 → 提取评分并返回（score，iptm，zip路径）
@@ -1008,7 +1039,8 @@ def local_predict_and_score(peptide_seq, target_seq, target_name, out_dir,
     # ---- 已完成：提取评分 ----
     summary = find_summary_json(result_dir)
     if summary:
-        scores = extract_scores_from_summary(summary)
+        import 小肽数据库 as db
+        scores = db.extract_scores(summary, target_name) or extract_scores_from_summary(summary)
         if scores:
             iptm = scores["iptm"]
             score = round(1.0 - iptm, 4)
@@ -1030,7 +1062,8 @@ def local_predict_and_score(peptide_seq, target_seq, target_name, out_dir,
             return score, iptm, zip_path
 
     # ---- 未完成：写入输入并触发打包提交（含失败自动重试）----
-    write_input_json(peptide_seq, target_seq, job_name, result_dir)
+    write_input_json(peptide_seq, target_seq, job_name, result_dir,
+                     **(af3_options or {}))
     marker = os.path.join(result_dir, ".submitted")
     if os.path.isfile(marker) and not FORCE_RESUBMIT:
         try:

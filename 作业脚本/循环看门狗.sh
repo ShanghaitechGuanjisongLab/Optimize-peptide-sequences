@@ -19,13 +19,13 @@
 set -u
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-DB_ROOT="${PEPOPT_DB_ROOT:-/public_bme2/Share200T/管吉松/peptide_opt_db}"
+DB_ROOT="${PEPOPT_DB_ROOT:-/public_bme2/Share200T/管吉松/peptide_opt_db_four_target_9e4e}"
 RUNS_DIR="$DB_ROOT/runs"
 DISABLED="$RUNS_DIR/loop.disabled"
 LOCK="$RUNS_DIR/循环看门狗.lock"
 WLOG="$RUNS_DIR/循环看门狗.log"
 JOB_NAME="pepopt-loop"
-TARGETS="${PEPOPT_TARGETS:-HTR1A,BIN1}"   # 开关：2026-10-20 停算 ASIC1A
+TARGETS="${PEPOPT_TARGETS:-HTR1A,BIN1,UNC13C,ASIC1A}"
 CYCLE_SEQS="${PEPOPT_CYCLE_SEQS:-24}"
 
 cd "$REPO" || exit 1

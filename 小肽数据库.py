@@ -35,7 +35,9 @@ from datetime import datetime
 # 路径与常量
 # ---------------------------------------------------------------------
 
-DEFAULT_DB_ROOT = "/public_bme2/Share200T/管吉松/peptide_opt_db"
+# 新战役隔离：绝不把旧二因子 obj_* 或无 9E4E 模板的 ASIC1A 结果混入四因子统计。
+LEGACY_DB_ROOT = "/public_bme2/Share200T/管吉松/peptide_opt_db"
+DEFAULT_DB_ROOT = "/public_bme2/Share200T/管吉松/peptide_opt_db_four_target_9e4e"
 SUMMARY_SUFFIX = "_summary_confidences.json"
 TARGETS_ALL = ("ASIC1A", "HTR1A", "BIN1", "UNC13C")
 
@@ -328,13 +330,13 @@ def load_database():
     return by_tag
 
 
-# 目标乘积因子（**总开关**）：2026-10-20 停算 ASIC1A，目标 = ipTM(HTR1A)×ipTM(BIN1)。恢复三乘积只需改成本元组（如 ("ASIC1A", "HTR1A", "BIN1")）并把评估靶标（小肽优化_节点内.DEFAULT_TARGETS 等）加回 ASIC1A —— iptm_asic1a 列、TARGET_COPIES、同源三聚体等数据与代码路径全程保留。
-PRODUCT_TARGETS = ("HTR1A", "BIN1")
+# 当前唯一生产目标：四个 ipTM 全部越高越好，任一缺失则不参与正式排名。
+PRODUCT_TARGETS = ("HTR1A", "BIN1", "UNC13C", "ASIC1A")
 
 
 def objective_product(row):
     """目标函数：Π ipTM(t)（t ∈ PRODUCT_TARGETS），**越大越好**。任一因子缺失返回 None（不参与排名）。
-    兼容两种输入：load_database() 的 float dict 与 CSV 原始字符串行。ASIC1A 数据保留但当前不参与目标（见 PRODUCT_TARGETS 开关注释）。"""
+    兼容两种输入：load_database() 的 float dict 与 CSV 原始字符串行。"""
     vals = [_to_float(row.get(f"iptm_{t.lower()}")) for t in PRODUCT_TARGETS]
     if any(v is None for v in vals):
         return None
@@ -695,20 +697,16 @@ def import_archived(archive_csv, source="archived", dry_run=False):
 # ---------------------------------------------------------------------
 
 def refresh_best(top_n=10):
-    """按目标乘积降序（缺乘积回退 iptm_htr1a 降序）维护 BEST_TOP10/。
-
-    约束已全部取消：优化目标是 PRODUCT_TARGETS 各因子的乘积尽可能大，不存在上限与可行域。榜单因子集**不由函数参数决定**（旧版的 off_threshold / targets 形参从未被函数体引用，已于 2026-10-22 删除以免误导），唯一真源 = 模块顶部的 `PRODUCT_TARGETS` 开关：将来补算 UNC13C 后把它加进该元组再跑本函数，榜单自动按三因子乘积重排。"""
+    """只按完整四因子乘积降序；缺因子不回退 HTR1A，避免伪四因子榜单。"""
     by_tag = load_database()
     p = paths(ensure=True)
     rows = []
     for tag, r in by_tag.items():
-        h = r.get("iptm_htr1a")
-        if h is None:
-            continue
         obj = objective_product(r)
-        rank = obj if obj is not None else h
-        rows.append((-rank, tag, r))
-    rows.sort()
+        if obj is None:
+            continue
+        rows.append((-obj, tag, r, obj))
+    rows.sort(key=lambda x: (x[0], x[1]))
     best = rows[:top_n]
 
     best_dir = p["best_dir"]
@@ -720,13 +718,13 @@ def refresh_best(top_n=10):
             shutil.rmtree(old, ignore_errors=True)
 
     index = []
-    for rank_no, (neg_rank, tag, r) in enumerate(best, 1):
+    for rank_no, (neg_rank, tag, r, obj) in enumerate(best, 1):
         src = ensure_best_structure(tag)
         dest = os.path.join(best_dir, f"rank{rank_no:02d}_{tag}_HTR1A.zip")
         if src:
             shutil.copy(src, dest)
         index.append({"rank": rank_no, "tag": tag, "peptide": r.get("peptide", ""),
-                      "objective_product": r.get("objective_product"),
+                      "objective_product": obj,
                       "iptm_asic1a": r.get("iptm_asic1a"),
                       "iptm_htr1a": r.get("iptm_htr1a"),
                       "iptm_bin1": r.get("iptm_bin1"),
@@ -871,9 +869,99 @@ def migrate_legacy(legacy_results_dir=None, dry_run=False):
 
 
 def get_objective(tag):
-    """查询 tag 的当前 objective = ipTM(HTR1A) × ipTM(BIN1)；任一因子缺失时返回 None"""
+    """查询 tag 的当前四因子 objective；任一因子缺失时返回 None。"""
     by_tag = load_database()
     r = by_tag.get(tag)
     if not r:
         return None
     return objective_product(r)
+
+
+def initialize_four_target_campaign(archive_root=LEGACY_DB_ROOT, dry_run=False):
+    """从旧库一次性复制注册表及 HTR1A/BIN1/UNC13C 数值。
+
+    不复制 ASIC1A（新任务必须使用 9E4E 模板），不复制 obj_*（避免二/四因子样本混算），不复制结构目录。新库已有主表时不重复初始化。
+    """
+    archive_csv = os.path.join(archive_root, "peptide_database.csv")
+    p = paths()
+    if os.path.isfile(p["master_csv"]):
+        return {"initialized": False, "reason": "新库已初始化", "root": db_root()}
+    registry = _read_csv(os.path.join(archive_root, "sequences.csv"), SEQREG_FIELDS)
+    if not registry:
+        raise RuntimeError(f"旧库注册表不可读或为空：{archive_root}/sequences.csv")
+    archived = _read_csv(archive_csv, MASTER_FIELDS)
+    value_source = "peptide_database.csv"
+    if not archived:
+        # 主表常由旧账号以 600 权限写入；注册表和 summary 可读时只读恢复数值，不调用 consolidate_task（它会移动旧目录），也不索取额外权限。
+        value_source = "af3_results/*_summary_confidences.json"
+        by_var = {}
+        results = os.path.join(archive_root, "af3_results")
+        if not os.path.isdir(results):
+            raise RuntimeError(f"旧主表不可读且结果目录不存在：{results}")
+        valid_tags = {r["tag"]: r for r in registry}
+        for name in sorted(os.listdir(results)):
+            parsed = split_job_name(name)
+            if parsed is None or parsed[0] not in valid_tags \
+                    or parsed[1] not in ("HTR1A", "BIN1", "UNC13C"):
+                continue
+            full = os.path.join(results, name)
+            summary = find_summary(full)
+            if not summary:
+                continue
+            scores = extract_scores(summary, parsed[1])
+            if not scores:
+                continue
+            reg = valid_tags[parsed[0]]
+            row = by_var.setdefault(reg["var_region"], {c: "" for c in MASTER_FIELDS})
+            row.update({"tag": parsed[0], "var_region": reg["var_region"],
+                        "peptide": reg["peptide"]})
+            t = parsed[1].lower()
+            row[f"iptm_{t}"] = scores["iptm"]
+            row[f"ranking_{t}"] = scores.get("ranking_score")
+        archived = list(by_var.values())
+    if dry_run:
+        return {"initialized": False, "dry_run": True, "sequences": len(registry),
+                "archived_rows": len(archived), "archive": archive_root,
+                "value_source": value_source}
+    paths(ensure=True)
+    for r in registry:
+        if r.get("tag") and r.get("var_region") and r.get("peptide"):
+            register_sequence(r["tag"], r["var_region"], r["peptide"])
+    now = _now()
+    out = []
+    for old in archived:
+        var, peptide = old.get("var_region"), old.get("peptide")
+        if not var or not peptide:
+            continue
+        h, b, u = (_to_float(old.get("iptm_htr1a")),
+                   _to_float(old.get("iptm_bin1")), _to_float(old.get("iptm_unc13c")))
+        if h is None and b is None and u is None:
+            continue
+        row = {c: "" for c in MASTER_FIELDS}
+        row.update({"tag": resolve_tag(var), "peptide": peptide, "var_region": var,
+                    "source": "archived_pre9e4e", "created_at": now, "updated_at": now})
+        for target, value in (("htr1a", h), ("bin1", b), ("unc13c", u)):
+            if value is not None:
+                row[f"iptm_{target}"] = f"{value:.6f}"
+                rank = _to_float(old.get(f"ranking_{target}"))
+                if rank is not None:
+                    row[f"ranking_{target}"] = f"{rank:.6f}"
+        if h is not None:
+            row["score_htr1a"] = f"{1.0 - h:.6f}"
+        out.append(row)
+    _rewrite_master(out)
+    return {"initialized": True, "sequences": len(registry), "archived_rows": len(out),
+            "archive": archive_root, "value_source": value_source, "root": db_root(),
+            "asic1a": "recompute_with_9e4e", "objective": "x".join(PRODUCT_TARGETS)}
+
+
+if __name__ == "__main__":
+    import argparse
+    ap = argparse.ArgumentParser(description="小肽共享数据库维护")
+    ap.add_argument("command", choices=("init-four-target", "stats"))
+    ap.add_argument("--dry-run", action="store_true")
+    args = ap.parse_args()
+    if args.command == "init-four-target":
+        print(initialize_four_target_campaign(dry_run=args.dry_run))
+    else:
+        print(stats())

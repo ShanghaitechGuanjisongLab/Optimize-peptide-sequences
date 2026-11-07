@@ -1,7 +1,10 @@
 """
 小肽序列优化 — 贝叶斯优化（有限预算）入口
 =============================================================
-⚠️ 目标口径声明（2026-10-22 校正）：本入口仍在旧口径上跑——采集函数 = 纯 EI，y = score_htr1a = 1 − ipTM(HTR1A)（单目标最大化 HTR1A），**未接入目标乘积**；而当前主推链路（`小肽优化_节点内.py` + `小肽优化_无限.py`，即共享数据库上的长驻循环作业）已改为 y = 1 − ipTM(HTR1A) × ipTM(BIN1) 的乘积最大化。两者不可混读，本入口的 BEST_STRUCTURE / result_bo.xlsx 排序不代表全库最佳。若要统一到乘积目标需改 5 处：y_obs（run_bo 主循环）、best_y、best_feasible_row 判定、history_y、收尾报表；改完必须在离线假分数上实测（本入口会真提交 AF3 任务，不能拿集群作业当测试台）。下面的“搜索策略”描述的是历史设计（含已取消的双底线约束），保留仅供考古对比。
+当前口径（2026-11-06）：y = 1 − Π ipTM(HTR1A/BIN1/UNC13C/ASIC1A)，纯 EI；ASIC1A 为同源三聚体并使用 Asic1a_9E4E.cif 派生的 A 链模板。
+以下 2026-10 的单目标与底线约束描述仅作历史设计记录，不再代表当前实现。
+
+⚠️ 历史目标口径（2026-10-22）：当时采集函数 = 纯 EI，y = score_htr1a = 1 − ipTM(HTR1A)。
 
 为什么换掉蒙特卡洛：
   AF3 单次评估昂贵（每候选 ×3 次预测），本项目真正的瓶颈是“评估预算”（服务器版每日约 30 个任务 ≈ 每天 10 个候选）。贝叶斯优化用代理模型（高斯过程）从已评估样本中学习“序列特征 → 分数”的映射，每轮只把评估机会花在最有希望的候选上，样本效率远高于随机抽样式的蒙特卡洛/遗传算法。
@@ -66,21 +69,23 @@ from sklearn.gaussian_process.kernels import Matern, WhiteKernel
 from sklearn.preprocessing import StandardScaler
 
 from 小肽公共库 import (SEQ_202, FIXED_A, ORIG_TAIL,
-                            HTR1A_SEQ, UNC13C_SEQ, BIN1_SEQ,
+                            HTR1A_SEQ, UNC13C_SEQ, BIN1_SEQ, ASIC1A_SEQ,
                             generate_mutant)
 
 # ===================== 靶标配置 =====================
 
-# 三个靶标各自独立预测。UNC13C 复合物约 2233 tokens，超过 bme_gpupub 分区 V100 的官方上限 1280 tokens （见 小肽优化_本地集群.GPU_MAX_TOKENS），在 V100 上必然显存溢出，因此支持 --targets HTR1A,BIN1 只跑 V100 放得下的两个靶标（结果独立存放）；待申请到 A100/H100 再以全靶标运行补齐 UNC13C 约束。
-TARGET_SEQS    = {"HTR1A": HTR1A_SEQ, "UNC13C": UNC13C_SEQ, "BIN1": BIN1_SEQ}
-TARGET_ORDER   = ["HTR1A", "UNC13C", "BIN1"]   # 固定评估顺序
-OFF_TARGETS    = ["UNC13C", "BIN1"]            # 旧阶段“底线蛋白”语义（ipTM 越低越好）；本入口仅用作报表明细列名，不作判定
-_OFF_COL       = {"UNC13C": "iptm_unc13c", "BIN1": "iptm_bin1"}   # 评估 CSV 列名
+TARGET_SEQS = {"HTR1A": HTR1A_SEQ, "UNC13C": UNC13C_SEQ,
+               "BIN1": BIN1_SEQ, "ASIC1A": ASIC1A_SEQ}
+TARGET_ORDER = ["HTR1A", "BIN1", "UNC13C", "ASIC1A"]
+OFF_TARGETS = ["UNC13C", "BIN1", "ASIC1A"]  # 历史常量名；现均为正向乘积因子
+_OFF_COL = {t: f"iptm_{t.lower()}" for t in OFF_TARGETS}
+EVAL_FIELDS = ["peptide", "score_htr1a", "iptm_unc13c", "iptm_bin1",
+               "iptm_asic1a", "objective_product", "score_objective", "round"]
 
 # ===================== 贝叶斯优化配置 =====================
 
-BO_ROOT        = "output_bo"                 # 本方法输出根目录（靶标子集运行时指向独立目录）
-EVAL_CSV       = os.path.join(BO_ROOT, "bo_evaluations.csv")
+BO_ROOT = "output_bo_four_target"          # 与旧单目标记录隔离
+EVAL_CSV = os.path.join(BO_ROOT, "bo_evaluations.csv")
 ACTIVE_TARGETS = list(TARGET_ORDER)            # 本次实际评估的靶标（--targets 可缩减）
 ACTIVE_OFF     = [t for t in OFF_TARGETS if t in ACTIVE_TARGETS]
 OFF_THRESHOLD  = 0.8                          # ❗休眠：仅被 feasible_prob 引用，而后者已无调用方（约束已从采集函数中删除）
@@ -104,7 +109,7 @@ def set_active_targets(names):
     if len(ACTIVE_TARGETS) < len(TARGET_ORDER):
         BO_ROOT = "output_bo_" + "-".join(t.lower() for t in ACTIVE_TARGETS)
     else:
-        BO_ROOT = "output_bo"
+        BO_ROOT = "output_bo_four_target"
     EVAL_CSV = os.path.join(BO_ROOT, "bo_evaluations.csv")
     return [t for t in TARGET_ORDER if t not in ACTIVE_TARGETS]
 
@@ -246,16 +251,21 @@ def select_batch(acq, X_cand, indices, batch_size):
 
 # ---------------- 评估流程 ----------------
 
-def evaluate_sequence(seq, seq_tag, out_root, predict_fn):
-    """对单个序列评估全部激活靶标（默认 3 个，--targets 可缩减），全部就绪时返回 dict，否则 None。
+def evaluate_sequence(seq, seq_tag, out_root, predict_fn, af3_options_fn=None):
+    """对单个序列评估全部激活靶标（默认四个），全部就绪时返回 dict，否则 None。
 
     关键：先遍历所有激活靶标、逐个创建并提交预测任务，**不因某个靶标结果未就绪就提前 return**。否则该靶标后面的靶标任务永远不会被创建——例如 UNC13C 因token超限被拦截而始终未就绪时，排在它后面的 BIN1 会被连带锁死，表现为“BIN1 尚未生成任务”。所有激活靶标任务都创建/提交后，只要有任一未就绪就返回 None（已创建的任务下次重跑继续，不会重复提交）。"""
     res = {}
     for target_name in ACTIVE_TARGETS:
         target_seq = TARGET_SEQS[target_name]
         out_dir = os.path.join(out_root, f"{seq_tag}_{target_name}")
-        score, iptm, path = predict_fn(seq, target_seq, target_name, out_dir,
-                                       auto_submit=True)
+        if af3_options_fn:
+            score, iptm, path = predict_fn(
+                seq, target_seq, target_name, out_dir, auto_submit=True,
+                af3_options=af3_options_fn(target_name))
+        else:
+            score, iptm, path = predict_fn(seq, target_seq, target_name, out_dir,
+                                           auto_submit=True)
         # 未就绪不 return，继续把后续靶标任务创建出来
         res[target_name] = None if iptm is None else {
             "score": score, "iptm": iptm, "path": path}
@@ -265,30 +275,35 @@ def evaluate_sequence(seq, seq_tag, out_root, predict_fn):
 
 
 def load_evaluations():
-    """续跑：读取已评估候选记录（返回 DataFrame；直接用 csv 模块避免pandas对 .csv 写入时的压缩依赖探测问题）"""
-    cols = ["peptide", "score_htr1a", "iptm_unc13c", "iptm_bin1", "round"]
+    """续跑读取四因子评估记录；旧缺列安全补 NaN，不混入新输出目录。"""
     if os.path.isfile(EVAL_CSV):
         rows = []
         with open(EVAL_CSV, newline="") as f:
             for r in csv.DictReader(f):
-                rows.append({c: r[c] for c in cols})
-        df = pd.DataFrame(rows, columns=cols)
-        for c in cols[1:]:
+                rows.append({c: r.get(c) for c in EVAL_FIELDS})
+        df = pd.DataFrame(rows, columns=EVAL_FIELDS)
+        for c in EVAL_FIELDS[1:]:
             df[c] = pd.to_numeric(df[c], errors="coerce")
         print(f"⏩ 发现 {len(df)} 条已评估记录：{EVAL_CSV}（断点续跑）")
         return df
-    return pd.DataFrame(columns=cols)
+    return pd.DataFrame(columns=EVAL_FIELDS)
 
 
 def append_eval_row(row):
     """追加写入一条评估记录（首次写入时带表头）"""
     header = not os.path.isfile(EVAL_CSV)
     with open(EVAL_CSV, "a", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=["peptide", "score_htr1a",
-                                          "iptm_unc13c", "iptm_bin1", "round"])
+        w = csv.DictWriter(f, fieldnames=EVAL_FIELDS)
         if header:
             w.writeheader()
         w.writerow(row)
+
+
+def objective_of(row):
+    """激活靶标的 ipTM 乘积；缺任一因子返回 NaN。"""
+    vals = [pd.to_numeric(row.get(f"iptm_{t.lower()}"), errors="coerce")
+            for t in ACTIVE_TARGETS]
+    return float(np.prod(vals)) if all(pd.notna(v) for v in vals) else float("nan")
 
 
 def feasible(row):
@@ -299,7 +314,7 @@ def feasible(row):
 # ---------------- 主循环 ----------------
 
 def run_bo(predict_fn, pool_size=DEFAULT_POOL, batch_size=DEFAULT_BATCH,
-           budget=DEFAULT_BUDGET):
+           budget=DEFAULT_BUDGET, af3_options_fn=None):
     os.makedirs(BO_ROOT, exist_ok=True)
     pool = build_candidate_pool(pool_size)
     X_pool = np.array([feat_of(s) for s in pool])
@@ -325,22 +340,24 @@ def run_bo(predict_fn, pool_size=DEFAULT_POOL, batch_size=DEFAULT_BATCH,
 
     def track_best(row, path_htr1a):
         nonlocal best_feasible_row, best_path
-        if feasible(row):
-            if best_feasible_row is None or row["score_htr1a"] < best_feasible_row["score_htr1a"]:
+        score = row.get("score_objective", float("nan"))
+        if feasible(row) and pd.notna(score):
+            if best_feasible_row is None or score < best_feasible_row["score_objective"]:
                 best_feasible_row = row
                 best_path = path_htr1a
 
     def save_new_row(peptide, res, round_no):
         nonlocal df_eval
-        row = {"peptide": peptide,
-               "score_htr1a": res["HTR1A"]["score"],
-               "iptm_unc13c": res["UNC13C"]["iptm"] if "UNC13C" in res else float("nan"),
-               "iptm_bin1": res["BIN1"]["iptm"] if "BIN1" in res else float("nan"),
+        row = {"peptide": peptide, "score_htr1a": res["HTR1A"]["score"],
                "round": round_no}
+        for target in OFF_TARGETS:
+            row[_OFF_COL[target]] = res[target]["iptm"] if target in res else float("nan")
+        row["objective_product"] = objective_of(row)
+        row["score_objective"] = 1.0 - row["objective_product"]
         append_eval_row(row)
         df_eval = pd.concat([df_eval, pd.DataFrame([row])], ignore_index=True)
         track_best(row, res["HTR1A"]["path"])
-        history_y.append(best_feasible_row["score_htr1a"]
+        history_y.append(best_feasible_row["score_objective"]
                          if best_feasible_row is not None else np.nan)
 
     # 先把历史记录重放进 best 轨迹（续跑情形）
@@ -355,7 +372,8 @@ def run_bo(predict_fn, pool_size=DEFAULT_POOL, batch_size=DEFAULT_BATCH,
             if seq in set(df_eval["peptide"]):
                 continue
             out_root = os.path.join(BO_ROOT, out_subdir, f"seq_{idx:04d}")
-            res = evaluate_sequence(seq, f"seq_{idx:04d}", out_root, predict_fn)
+            res = evaluate_sequence(seq, f"seq_{idx:04d}", out_root, predict_fn,
+                                    af3_options_fn=af3_options_fn)
             if res is None:
                 print(f"  ⏳ [{round_no}] seq_{idx:04d} 结果未就绪，跳过（下次重跑继续）")
                 continue
@@ -383,11 +401,12 @@ def run_bo(predict_fn, pool_size=DEFAULT_POOL, batch_size=DEFAULT_BATCH,
         if len(rows) == 0:
             print("  ⚠️ 尚无已评估候选（预测任务均未就绪），等待结果完成后重跑本脚本。")
             break
-        X_obs = np.array([feat_of(s) for s in rows["peptide"]])
-        X_obs_s = scaler.transform(X_obs)
-        y_obs = rows["score_htr1a"].to_numpy(dtype=float)
+        fit_rows = rows[np.isfinite(rows["score_objective"].to_numpy(dtype=float))]
+        X_obs = np.array([feat_of(s) for s in fit_rows["peptide"]])
+        X_obs_s = scaler.transform(X_obs) if len(fit_rows) else np.empty((0, X_pool_s.shape[1]))
+        y_obs = fit_rows["score_objective"].to_numpy(dtype=float)
 
-        if n_eval >= 3:
+        if len(fit_rows) >= 3:
             gp_t = fit_gp(X_obs_s, y_obs)
 
             uneval = [i for i in range(len(pool))
@@ -398,7 +417,7 @@ def run_bo(predict_fn, pool_size=DEFAULT_POOL, batch_size=DEFAULT_BATCH,
             X_cand_s = X_pool_s[uneval]
 
             if best_feasible_row is not None:
-                best_y = best_feasible_row["score_htr1a"]
+                best_y = best_feasible_row["score_objective"]
                 acq = constrained_acquisition(gp_t, [], X_cand_s, best_y)
                 picked = select_batch(acq, X_cand_s, uneval, batch_size)
             else:
@@ -425,9 +444,9 @@ def run_bo(predict_fn, pool_size=DEFAULT_POOL, batch_size=DEFAULT_BATCH,
     print("\n" + "=" * 60)
     if best_feasible_row is not None:
         best_seq = best_feasible_row["peptide"]
-        best_score = best_feasible_row["score_htr1a"]
+        best_score = best_feasible_row["score_objective"]
         print(f"🏆 最佳序列：{best_seq}")
-        print(f"📊 最佳 score：{best_score}  （ipTM = {1 - best_score:.3f}）")
+        print(f"📊 四因子乘积：{1 - best_score:.6f}（score = {best_score:.6f}）")
         for t in OFF_TARGETS:
             v = best_feasible_row[_OFF_COL[t]]
             desc = f"{v:.3f}" if pd.notna(v) else "未评估（本次运行已搁置, 待高端 GPU 补跑）"
@@ -439,13 +458,12 @@ def run_bo(predict_fn, pool_size=DEFAULT_POOL, batch_size=DEFAULT_BATCH,
             import shutil
             shutil.copy(best_path, dest)
             print(f"📁 最佳结果已保存：{dest}")
-        pd.DataFrame([[best_seq, best_score,
-                       best_feasible_row["iptm_unc13c"],
-                       best_feasible_row["iptm_bin1"]]],
-                     columns=["最优序列", "最优分数(1-iptm)",
-                              "UNC13C_ipTM", "BIN1_ipTM"]
-                     ).to_excel(os.path.join(BO_ROOT, "result_bo.xlsx"),
-                                index=False)
+        report = {"最优序列": best_seq, "最优分数(1-四因子乘积)": best_score,
+                  "四因子乘积": 1.0 - best_score}
+        report.update({f"{t}_ipTM": best_feasible_row[f"iptm_{t.lower()}"]
+                       for t in TARGET_ORDER})
+        pd.DataFrame([report]).to_excel(os.path.join(BO_ROOT, "result_bo.xlsx"),
+                                        index=False)
     else:
         print("❌ 尚无可行评估结果（可能作业仍在计算，重跑本脚本继续）。")
 
@@ -455,9 +473,9 @@ def run_bo(predict_fn, pool_size=DEFAULT_POOL, batch_size=DEFAULT_BATCH,
         xs, ys = zip(*valid)
         plt.figure(figsize=(10, 5))
         plt.plot(np.arange(1, len(ys) + 1), ys, "o-", markersize=3)
-        plt.xlabel("评估数量 (可行候选累计)")
-        plt.ylabel("best score = 1 - ipTM(HTR1A)")
-        plt.title("贝叶斯优化: 最优界面置信度随评估数变化")
+        plt.xlabel("评估数量 (完整四因子候选累计)")
+        plt.ylabel("best score = 1 - product(ipTM)")
+        plt.title("贝叶斯优化: 四因子乘积随评估数变化")
         plt.tight_layout()
         plt.savefig(os.path.join(BO_ROOT, "bo_curve.png"))
         plt.close()
@@ -488,6 +506,8 @@ if __name__ == "__main__":
         parser.error(f"--targets 含未知靶标 {sorted(unknown)}，可选：{TARGET_ORDER}")
     if "HTR1A" not in want:
         parser.error("--targets 必须包含 HTR1A（优化目标）")
+    if args.server and "ASIC1A" in want:
+        parser.error("ASIC1A 必须使用本地 9E4E 单链模板，云端入口不支持该任务")
     pending_targets = set_active_targets(want)
 
     random.seed(42)
@@ -495,8 +515,7 @@ if __name__ == "__main__":
 
     print("=" * 60)
     off_desc = "+".join(ACTIVE_OFF) if ACTIVE_OFF else "无"
-    print(f"🧬 贝叶斯优化 — 小肽序列（**旧口径**：最大化 ipTM(HTR1A)，已无 {off_desc} 上限约束；"
-          "未接入乘积目标，榜单不代表全库最佳）")
+    print("🧬 贝叶斯优化 — 最大化 HTR1A/BIN1/UNC13C/ASIC1A 四者 ipTM 乘积")
     print(f"   本次评估靶标：{ACTIVE_TARGETS} | 结果目录：{BO_ROOT}/")
     if pending_targets:
         print(f"   ⏸️  搁置靶标：{pending_targets}（V100 显存放不下，待 A100/H100 以全靶标重跑补齐；已有 HTR1A/BIN1 结果会被直接复用）")
@@ -515,4 +534,5 @@ if __name__ == "__main__":
         print("运行模式：本地集群推理（默认，自动提交 SLURM GPU 作业，无配额限制）")
 
     run_bo(predict_fn, pool_size=args.pool, batch_size=args.batch,
-           budget=args.budget)
+           budget=args.budget,
+           af3_options_fn=None if args.server else __import__("小肽模板").target_options)

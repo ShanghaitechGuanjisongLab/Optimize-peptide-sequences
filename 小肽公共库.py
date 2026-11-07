@@ -159,40 +159,38 @@ def enumerate_space(center=ORIG_TAIL, max_edit=2, min_len=6, max_len=10):
 
 
 def create_af3_json(peptide_seq, target_seq, job_name, model_seeds=[1],
-                   target_copies=1):
-    """
-    创建 AlphaFold3 Web Server 格式的 JSON 任务。
-    预测肽链(peptide_seq)与靶标(target_seq)的蛋白-蛋白复合物。
+                   target_copies=1, target_templates=None):
+    """创建 AF3 输入；可选给靶标内嵌自定义单链 mmCIF 模板。
 
-    target_copies：靶标链数（同源多聚体）。AF3 JSON 语义：同一序列挂 N 个链ID=同源 N 聚体，等价于 AlphaFold Server 界面上的 Copies=N。例：target_copies=3 → 靶标链 id ['B','C','D']，用于 Asic1a 同源三聚体。复合物 token = len(peptide) + len(target)*copies。
-
-    返回：dict （AF3 JSON 格式）
+    target_templates 的每项含 mmcif、queryIndices、templateIndices，索引均为序列的 0-based 下标。AF3 要求自定义 templates 与 MSA 同时提供，MSA 由af3适配/msa缓存.py 在任务启动前补齐，缺缓存时必须显式失败。
     """
     if target_copies < 1:
         raise ValueError(f"target_copies 必须 >=1，得到 {target_copies}")
-    # 靶标链 ID：B 起连续分配（B、C、D……）
-    target_ids = [chr(ord("B") + i) for i in range(target_copies)]
-    job = {
+    target_protein = {
+        "id": [chr(ord("B") + i) for i in range(target_copies)],
+        "sequence": target_seq,
+    }
+    if target_templates is not None:
+        if not isinstance(target_templates, list):
+            raise TypeError("target_templates 必须是列表")
+        for template in target_templates:
+            qi = template.get("queryIndices", [])
+            ti = template.get("templateIndices", [])
+            if not template.get("mmcif") or len(qi) != len(ti) or not qi:
+                raise ValueError("AF3 模板必须含 mmcif 和等长、非空的索引数组")
+            if min(qi + ti) < 0 or max(qi) >= len(target_seq):
+                raise ValueError("AF3 模板 queryIndices 越界")
+        target_protein["templates"] = target_templates
+    return {
         "name": job_name,
         "modelSeeds": model_seeds,
         "sequences": [
-            {
-                "protein": {
-                    "id": ["A"],           # 小肽链
-                    "sequence": peptide_seq
-                }
-            },
-            {
-                "protein": {
-                    "id": target_ids,      # 靶标链（多 ID 同序列 = 同源多聚体）
-                    "sequence": target_seq
-                }
-            }
+            {"protein": {"id": ["A"], "sequence": peptide_seq}},
+            {"protein": target_protein},
         ],
         "dialect": "alphafold3",
-        "version": 1
+        "version": 1,
     }
-    return job
 
 
 def extract_scores_from_zip(zip_path):
