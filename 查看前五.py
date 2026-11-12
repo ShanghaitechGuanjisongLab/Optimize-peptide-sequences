@@ -11,14 +11,7 @@ import 小肽数据库 as db
 TARGETS = db.PRODUCT_TARGETS
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--by-htr1a", action="store_true",
-        help="在当前启用靶标评分齐全的记录中按 HTR1A ipTM 排序",
-    )
-    args = parser.parse_args()
-
+def 读取排名(按HTR1A=False):
     rows = []
     for tag, row in db.load_database().items():
         values = [row.get(f"iptm_{target.lower()}") for target in TARGETS]
@@ -27,28 +20,36 @@ def main():
         product = math.prod(values)
         rows.append((product, tag, row, values))
 
-    if args.by_htr1a:
+    if 按HTR1A:
         rows.sort(key=lambda item: (-item[2]["iptm_htr1a"], item[1]))
-        sort_description = "HTR1A ipTM"
     else:
         rows.sort(key=lambda item: (-item[0], item[1]))
-        sort_description = " × ".join(TARGETS) + " 乘积"
+    return rows
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--by-htr1a", action="store_true",
+        help="在当前启用靶标评分齐全的记录中按 HTR1A ipTM 排序",
+    )
+    args = parser.parse_args()
+    rows = 读取排名(args.by_htr1a)
+    sort_description = "HTR1A ipTM" if args.by_htr1a else " × ".join(TARGETS) + " 乘积"
     print(f"数据库：{db.db_root()}")
     print(f"排序：{sort_description} | 靶标齐全记录：{len(rows)} 条")
     if not rows:
         print("没有符合当前排序条件的记录。")
         return
 
-    print("\n排名  序列                         " + "  ".join(f"{靶标:>6}" for 靶标 in TARGETS) + "    乘积      样本")
+    print("\n排名  序列                         " + "  ".join(f"{靶标:>6}" for 靶标 in TARGETS))
     for rank, (product, tag, row, values) in enumerate(rows[:5], 1):
         peptide = row.get("peptide") or ""
-        sample_count = int(row.get("obj_n") or 0)
         def format_score(value, width):
             return f"{value:>{width}.2f}" if value is not None else f"{'-':>{width}}"
 
-        product_text = f"{product:>8.6f}" if product is not None else "       -"
         分量文本 = "  ".join(format_score(值, 6) for 值 in values)
-        print(f"{rank:>2}    {peptide:<28} {分量文本}  {product_text}  {sample_count:>5}")
+        print(f"{rank:>2}    {peptide:<28} {分量文本}")
 
 
 if __name__ == "__main__":

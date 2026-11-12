@@ -68,6 +68,116 @@ class FourTargetTests(unittest.TestCase):
         del row["iptm_asic1a"]
         self.assertIsNone(self.db.objective_product(row))
 
+    def test_汇总复用的排名保持完整性排序和合法零分(self):
+        import 查看前五 as 排名
+
+        评分表 = {"s1": {"iptm_htr1a": 0.9, "iptm_asic1a": 0.3}, "s2": {"iptm_htr1a": 0.7, "iptm_asic1a": 0.8}, "s3": {"iptm_htr1a": 0.8, "iptm_asic1a": 0.0}, "missing": {"iptm_htr1a": 0.99}, "invalid": {"iptm_htr1a": 0.99, "iptm_asic1a": float("nan")}}
+        with patch.object(self.db, "load_database", return_value=评分表):
+            self.assertEqual([项[1] for 项 in 排名.读取排名()], ["s2", "s1", "s3"])
+            self.assertEqual([项[1] for 项 in 排名.读取排名(按HTR1A=True)], ["s1", "s3", "s2"])
+
+    def test_独立前五只输出序列和靶标分量不输出乘积样本列(self):
+        import 查看前五 as 排名
+
+        排名记录 = [(0.56, "s000", {"peptide": "SEQ", "obj_n": 999}, [0.7, 0.8])]
+        with patch.object(排名, "读取排名", return_value=排名记录) as 读取, patch.object(排名, "TARGETS", ("HTR1A", "ASIC1A")), patch("sys.argv", ["查看前五.py"]), patch("builtins.print") as 打印:
+            排名.main()
+        输出行 = [调用.args[0].strip() for 调用 in 打印.call_args_list]
+        表头 = next(行 for 行 in 输出行 if 行.startswith("排名"))
+        self.assertEqual(表头.split(), ["排名", "序列", "HTR1A", "ASIC1A"])
+        self.assertEqual(输出行[-1].split(), ["1", "SEQ", "0.70", "0.80"])
+        读取.assert_called_once_with(False)
+
+    def test_汇总前五固定区仅输出一次且表中只显示可变区(self):
+        import 信息汇总 as 汇总
+
+        可变区列表 = ["ASPFDVVCS", "KSPFDVVCS"]
+        前五 = {"数据库": "只读库", "启用靶标": ["HTR1A", "ASIC1A"], "齐全记录数": 2, "记录": [{"排名": 编号, "序列": self.common.FIXED_A + 可变区, "分量": {"HTR1A": 0.7, "ASIC1A": 0.3}, "乘积": 0.21, "样本数": 5} for 编号, 可变区 in enumerate(可变区列表, 1)]}
+        数据 = {"查询时间": "2026-11-12", "前五": 前五, "运行靶标": [], "Slurm等待": [], "HQ等待": [], "错误": {}}
+        原数据 = json.dumps(数据)
+        文本 = 汇总.格式化汇总(数据)
+        self.assertEqual(文本.count(self.common.FIXED_A), 1)
+        self.assertIn("固定区：" + self.common.FIXED_A, 文本)
+        self.assertIn("可变区", 文本)
+        for 可变区 in 可变区列表:
+            self.assertIn(可变区, 文本)
+            self.assertNotIn(self.common.FIXED_A + 可变区, 文本)
+        self.assertEqual(json.dumps(数据), 原数据)
+
+    def test_汇总关联GPU运行任务和节点且排除CPU监控(self):
+        import 信息汇总 as 汇总
+
+        def 作业(编号, 名称, GPU数, 状态):
+            return {"info": {"id": 编号, "name": 名称, "task_stats": {状态: 1}}, "tasks": [{"id": 0, "state": 状态, "worker": 2}], "submits": [{"array": {"priority": 21, "resources": [{"resources": [{"resource": "gpus", "request": {"Compact": GPU数 * 10000}}, {"resource": "gpumem", "request": {"显存范围": [220000, 440000]}}] if GPU数 else [{"resource": "cpus", "request": {"Compact": 10000}}]}]}}]}
+
+        详情 = [作业(1, "taskctl-autoscale", 0, "running"), 作业(2, "s000_asic1a_s42", 1, "running"), 作业(3, "s001_asic1a", 1, "waiting")]
+        工作者 = [{"id": 2, "allocation": {"id": "slurm40"}, "configuration": {"hostname": "node40", "resources": {"resources": [{"name": "gpus", "kind": "list", "values": ["0"]}, {"name": "gpumem", "kind": "sum", "size": 400000}]}}}]
+        调用 = []
+
+        def 查询(*参数):
+            调用.append(参数)
+            return [项["info"] for 项 in 详情] if 参数[1] == "list" and 参数[0] == "job" else 工作者 if 参数[0] == "worker" else 详情
+
+        快照 = 汇总.读取HQ快照(查询)
+        self.assertEqual(len(快照["运行靶标"]), 1)
+        self.assertEqual((快照["运行靶标"][0]["节点"], 快照["运行靶标"][0]["靶标"], 快照["运行靶标"][0]["每卡显存GiB"]), ("node40", "ASIC1A", 40))
+        self.assertEqual([项["作业号"] for 项 in 快照["等待任务"]], [3])
+        self.assertEqual(调用, [("job", "list", "--all"), ("job", "info", "1,2,3"), ("worker", "list")])
+
+    def test_汇总Slurm候选节点区分显卡型号和排除约束(self):
+        import 信息汇总 as 汇总
+
+        def 运行(参数):
+            if 参数[0] == "squeue":
+                return "100|elastic|gpu|gpu:1|8|32G|5-00:00:00|QOSMaxJobsPerUserLimit|N/A\n101|cky|gpu|gpu:A10040GB:1|8|64G|8:00:00|Priority|2026-11-13T01:00:00"
+            if 参数[-1] == "100":
+                return "JobId=100 ReqNodeList=(null) ExcNodeList=small"
+            if 参数[-1] == "101":
+                return "JobId=101 ReqNodeList=(null) ExcNodeList=(null)"
+            if 参数[1:3] == ["show", "hostnames"]:
+                return "small"
+            return "NodeName=small Partitions=gpu Gres=gpu:V10032GB:4\nNodeName=large Partitions=gpu Gres=gpu:A10080GB:4\nNodeName=medium Partitions=gpu Gres=gpu:A10040GB:4\nNodeName=other Partitions=other Gres=gpu:A10080GB:4"
+
+        记录 = 汇总.读取Slurm等待(运行)
+        self.assertEqual(记录[0]["候选节点"], ["large", "medium"])
+        self.assertEqual(记录[0]["每卡显存档位GiB"], [40, 80])
+        self.assertEqual(记录[0]["预计开始"], "未知")
+        self.assertEqual(记录[1]["候选节点"], ["medium"])
+        self.assertEqual(记录[1]["每卡显存档位GiB"], [40])
+        文本 = 汇总.格式化Slurm等待(记录)
+        self.assertIn("申请显存(GiB/卡)", 文本)
+        self.assertIn("40/80(未限定单档)", 文本)
+        self.assertNotIn("GPU数", 文本.splitlines()[0])
+        self.assertNotIn("GPU请求", 文本.splitlines()[0])
+
+    def test_汇总Slurm仅非单GPU时显示数量并区分未知显存(self):
+        import 信息汇总 as 汇总
+
+        基础 = {"Slurm作业号": "100", "作业名": "elastic", "分区": "gpu", "GPU数": 1, "每卡显存档位GiB": [80], "显存档位未知": False, "候选节点": ["node80"], "预计开始": "未知", "等待原因": "Priority"}
+        for GPU数 in (0, 2):
+            with self.subTest(GPU数=GPU数):
+                记录 = dict(基础, GPU数=GPU数, 每卡显存档位GiB=[], 显存档位未知=True)
+                文本 = 汇总.格式化Slurm等待([基础, 记录])
+                self.assertIn("GPU数", 文本.splitlines()[0])
+                self.assertIn("CPU" if GPU数 == 0 else "未知", 文本)
+        self.assertIn("没有 Slurm 排队作业", 汇总.格式化Slurm等待([]))
+
+    def test_汇总某项失败仍保留其他三表且不当成空队列(self):
+        import 信息汇总 as 汇总
+
+        def 失败(*参数):
+            raise RuntimeError("HQ服务离线")
+
+        前五 = {"数据库": "只读库", "启用靶标": ["HTR1A", "ASIC1A"], "齐全记录数": 0, "记录": []}
+        结果 = 汇总.生成汇总(查询HQ=失败, 查询Slurm=lambda: [], 查询排名=lambda: 前五)
+        self.assertEqual(结果["前五"], 前五)
+        self.assertEqual(结果["Slurm等待"], [])
+        self.assertIsNone(结果["HQ等待"])
+        文本 = 汇总.格式化汇总(结果)
+        self.assertTrue(all(标题 in 文本 for 标题 in ("一、当前前五", "二、计算中的靶标及节点", "三、Slurm 层等待分配", "四、HQ 层等待任务")))
+        self.assertIn("查询失败：HQ服务离线", 文本)
+        self.assertNotIn("HQ 当前没有等待任务", 文本)
+
     def test_靶标配置是唯一名单且无效时拒绝运行(self):
         with tempfile.TemporaryDirectory() as 目录:
             配置路径 = Path(目录) / "靶标配置.json"
