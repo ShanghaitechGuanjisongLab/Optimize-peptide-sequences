@@ -74,7 +74,7 @@ OFF_COL       = {"UNC13C": "iptm_unc13c", "BIN1": "iptm_bin1"}
 TARGET_COPIES = {"ASIC1A": 3}
 # 四因子乘积的唯一真源；ASIC1A 必须使用指定 9E4E A 链模板。
 PRODUCT_TARGETS = list(db.PRODUCT_TARGETS)
-DEFAULT_TARGETS = "HTR1A,BIN1,UNC13C,ASIC1A"
+DEFAULT_TARGETS = ",".join(db.PRODUCT_TARGETS)
 
 
 def target_af3_options(target):
@@ -534,11 +534,11 @@ def submit_candidates(seqs, active_targets):
     return n
 
 
-def harvest_and_report(active_targets, new_sample_fn=None):
+def harvest_and_report(active_targets, new_sample_fn=None, exclude_jobs=None):
     """收割新完成结果入库，序贯采样入库（β 统计量），刷新 BEST_TOP10，打印统计。返回（收割新增条数，新增 tags 集合）。
 
     new_sample_fn 透传给数据库整理做补采（真跑 AF3 新 seed）；留 None 时整理只消费池内免费样本。"""
-    n_new, skipped, new_tags = db.harvest_results()
+    n_new, skipped, new_tags = db.harvest_results(exclude_jobs=exclude_jobs)
     n_fit = seq_sample.ingest_new_records(new_sample_fn)
     if n_fit:
         print(f"  🧮 序贯采样入库 {n_fit} 条（β 统计量已写入 obj_* 列）", flush=True)
@@ -655,6 +655,9 @@ def climb_new_records(new_tags, active_targets, new_sample_fn, max_rounds=None):
             if rounds_cap > 0 and rnd >= rounds_cap:
                 print(f" （达 {rounds_cap} 轮上限，最佳 {best:.4f}）", flush=True)
                 break
+    # 补采会同时改 iptm_* 与 obj_max；必须同步展示榜，不能只更新主表统计。
+    if stat["improved"]:
+        db.refresh_best(top_n=TOP_N_BEST)
     print(f"  🧗 爬山结束：{stat['climbed']} 条参与 / {stat['rounds']} 轮补采 / "
           f"{stat['improved']} 条刷新纪录 / {stat['samples']} 样本计入拟合",
           flush=True)

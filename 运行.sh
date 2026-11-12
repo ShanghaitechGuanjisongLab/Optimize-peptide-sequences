@@ -41,8 +41,7 @@ BLOCK_END="# <<< pepopt-watchdog <<<"
 
 # ---- 【当前形态】单个长驻循环作业 ----
 LOOP_JOB_NAME="pepopt-loop"
-# 当前生产目标：HTR1A/BIN1/UNC13C/ASIC1A 四者 ipTM 乘积最大。
-LOOP_TARGETS="${PEPOPT_TARGETS:-HTR1A,BIN1,UNC13C,ASIC1A}"
+LOOP_TARGETS="$("${TASKCTL_PYTHON:-python3}" "$REPO_DIR/小肽数据库.py" 靶标)" || exit 4
 LOOP_CYCLE_SEQS="${PEPOPT_CYCLE_SEQS:-24}"
 LOOP_DISABLED="$RUNS_DIR/loop.disabled"       # stop 写入 → 看门狗不再续交
 LOOP_WLOG="$RUNS_DIR/循环看门狗.log"
@@ -96,9 +95,9 @@ install_watchdog() {
     echo "SHELL=/bin/bash"
     # cron 环境 PATH 极简，不含 SLURM(/opt/gridview/slurm/bin) 与 conda，而驱动要调 sbatch/squeue/scontrol → 必须把登录时的完整 PATH 写进来。
     echo "PATH=$PATH"
-    # 战役参数必须烙进 crontab 行：cron 无登录环境，缺省会读到默认 DB/靶标→续交的作业会打回旧库或跑错靶标（多战役并存时串库）。
+    # 数据库和算力参数写入 cron；靶标只保存可选配置路径，名单始终在运行时读取。
     echo "PEPOPT_DB_ROOT=${PEPOPT_DB_ROOT:-/public_bme2/Share200T/管吉松/peptide_opt_db_four_target_9e4e}"
-    echo "PEPOPT_TARGETS=$LOOP_TARGETS"
+    if [[ -n "${PEPOPT_TARGET_CONFIG:-}" ]]; then echo "PEPOPT_TARGET_CONFIG=$PEPOPT_TARGET_CONFIG"; fi
     echo "PEPOPT_CYCLE_SEQS=${PEPOPT_CYCLE_SEQS:-24}"
     # cron 不继承登录环境；高端 GPU 和推理环境参数必须一并固化。
     echo "PEPOPT_PARTITION=${PEPOPT_PARTITION:-bme_gpu}"
@@ -181,7 +180,8 @@ start_loop() {
   kill_legacy_driver
   local j; j="$(loop_jobs)"
   if [[ -n "${j// /}" ]]; then
-    echo "♾️  循环作业已在队列：$j（不重复提交）"
+    echo "♾️  循环作业已在队列：$j；检查是否需要补齐其他显存档位"
+    submit_loop
   else
     echo "🚀 提交长驻循环作业：靶标=$LOOP_TARGETS | 每轮 $LOOP_CYCLE_SEQS 序列 …"
     submit_loop

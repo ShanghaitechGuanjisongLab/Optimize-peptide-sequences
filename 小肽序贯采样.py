@@ -12,6 +12,7 @@
   - **入库存 argmax 样本的各分量**：使 objective_product = Π iptm_<target> 严格成立。
 """
 
+import math
 import os
 import sys
 
@@ -199,7 +200,8 @@ def run_consolidation(new_sample_fn, max_rounds=24):
       阶段1  consolidation_pass 配“只登记需求”的 sampler 跑到收敛：免费消费各记录 pool 里的样本，并收集所有“池空但 P̃·N>M 仍成立”的记录；
       阶段2  对登记需求批量真跑 AF3 生成新乘积样本，全部挂进对应记录的 pool，交下一轮 pass 按设计逐个消费、重排、再判；直到无人达标、补采无果或补采批数用尽。
     **单点/退化记录也全部补采爬山**（2026-10-21 规格）：β 拟合无解（n=1、样本全同、全 0/全 1）时尾概率恒 0，P̃·N>M 永不成立 → 按该规则永无补采机会；consolidation_pass 对此类记录改走与首次同规格的爬山（只要还在破纪录就持续登记补采需求，整批未破纪录即置 obj_climb 收束），同样经上述两阶段批量机制供样。
-    new_sample_fn：fn(tags) -> {tag：[新乘积样本]}（批量接口，无法生成的 tag 不出现在结果里）；None 时只消费池内免费样本。
+    new_sample_fn：fn(tags, n={tag: 样本缺口}) -> {tag：[新乘积样本]}；缺口用于任务优先级。
+    无法生成的 tag 不出现在结果里；None 时只消费池内免费样本。
     返回 consolidation_pass 各轮统计之和 {"added", "rounds", "capped"}。"""
     max_batches = max(1, int(os.environ.get("PEPOPT_RESAMPLE_BATCHES", "2")))
     max_tags = max(1, int(os.environ.get("PEPOPT_RESAMPLE_TAGS", "2")))
@@ -216,9 +218,14 @@ def run_consolidation(new_sample_fn, max_rounds=24):
     batches = 0
     for _ in range(max_rounds):
         demand = []
+        deficits = {}
 
         def sampler(tag):                 # 只登记需求；样本由阶段2 批量补给 pool
             demand.append(tag)
+            fit = fits[tag]
+            top_max = max(record["fit"].max_x for record in records)
+            threshold = (top_max + 1.0) / 2.0 if fit.max_x == top_max else top_max
+            deficits[tag] = max(1, math.ceil(fit.prob_gt(threshold) * len(records) - fit.n))
             return None
 
         res = consolidation_pass(records, sampler)
@@ -227,7 +234,8 @@ def run_consolidation(new_sample_fn, max_rounds=24):
         if not demand or new_sample_fn is None or batches >= max_batches:
             break
         batches += 1
-        batch = new_sample_fn(list(dict.fromkeys(demand))[:max_tags]) or {}
+        tags = sorted(dict.fromkeys(demand), key=lambda tag: -deficits[tag])[:max_tags]
+        batch = new_sample_fn(tags, n={tag: deficits[tag] for tag in tags}) or {}
         if not batch:
             break
         for tag, xs in batch.items():

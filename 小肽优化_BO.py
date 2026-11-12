@@ -68,6 +68,7 @@ from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import Matern, WhiteKernel
 from sklearn.preprocessing import StandardScaler
 
+from 小肽数据库 import PRODUCT_TARGETS as 当前乘积靶标
 from 小肽公共库 import (SEQ_202, FIXED_A, ORIG_TAIL,
                             HTR1A_SEQ, UNC13C_SEQ, BIN1_SEQ, ASIC1A_SEQ,
                             generate_mutant)
@@ -84,9 +85,9 @@ EVAL_FIELDS = ["peptide", "score_htr1a", "iptm_unc13c", "iptm_bin1",
 
 # ===================== 贝叶斯优化配置 =====================
 
-BO_ROOT = "output_bo_four_target"          # 与旧单目标记录隔离
+BO_ROOT = "output_bo_" + "-".join(靶标.lower() for 靶标 in 当前乘积靶标)
 EVAL_CSV = os.path.join(BO_ROOT, "bo_evaluations.csv")
-ACTIVE_TARGETS = list(TARGET_ORDER)            # 本次实际评估的靶标（--targets 可缩减）
+ACTIVE_TARGETS = list(当前乘积靶标)
 ACTIVE_OFF     = [t for t in OFF_TARGETS if t in ACTIVE_TARGETS]
 OFF_THRESHOLD  = 0.8                          # ❗休眠：仅被 feasible_prob 引用，而后者已无调用方（约束已从采集函数中删除）
 N_INIT         = 8                            # 冷启动随机评估数（不含初始序列）
@@ -496,7 +497,7 @@ if __name__ == "__main__":
                         help=f"每轮评估的候选数（默认 {DEFAULT_BATCH}）")
     parser.add_argument("--pool", type=int, default=DEFAULT_POOL,
                         help=f"候选库大小（默认 {DEFAULT_POOL}）")
-    parser.add_argument("--targets", default=",".join(TARGET_ORDER),
+    parser.add_argument("--targets", default=",".join(ACTIVE_TARGETS),
                         help="逗号分隔的待评估靶标（必须含 HTR1A）。V100 分区用--targets HTR1A,BIN1：UNC13C 复合物 ~2233 tokens 超过V100上限 1280，搁置待 A100/H100 补跑")
     args = parser.parse_args()
 

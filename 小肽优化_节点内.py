@@ -69,7 +69,7 @@ from 小肽公共库 import create_af3_json     # 补采任务的 AF3 输入构�
 
 # 四靶标使用同一套模板参数；默认数据库与旧二因子战役隔离。
 TARGET_ORDER      = inf.TARGET_ORDER
-DEFAULT_TARGETS   = "HTR1A,BIN1,UNC13C,ASIC1A"
+DEFAULT_TARGETS   = ",".join(db.PRODUCT_TARGETS)
 CYCLE_SEQS        = 8                  # 每轮序列数（×4 = 每轮最多 32 个任务）A100四靶标保守预算；前三靶标有旧实测，UNC13C 先取保守值，后续由日志标定。
 TARGET_MSA_SEC    = {"ASIC1A": 1410.0, "HTR1A": 1738.0,
                      "BIN1": 1555.0, "UNC13C": 3000.0}
@@ -128,8 +128,9 @@ def build_runner_env(bundle_dir, out_dir=None):
       BASH_FUNC_* —— bash 函数导出（如 module()），写进生成脚本的 export 语句会变成 `export BASH_FUNC_module()='() {...}'` → 语法错误 → 任务全 FAILED。
       CUDA_VISIBLE_DEVICES —— 卡号应由中间层的 任务包装.sh 按 HQ 分配结果映射。
         启动器若把它快照成固定值，会在包装器**之后**覆盖掉正确映射，使中间层的 GPU 资源语义形同虚设（多卡时全部任务挤到编排进程那一块卡上）。"""
+
     env = {k: v for k, v in os.environ.items()
-           if not k.startswith("BASH_FUNC_") and k != "CUDA_VISIBLE_DEVICES"}
+           if not k.startswith(("BASH_FUNC_", "TASKCTL_GPU_")) and k != "CUDA_VISIBLE_DEVICES"}
     env.update({
         "AF3_CODE_DIR": loc.AF3_CODE_DIR,
         "AF3_BUNDLE_DIR": os.path.abspath(bundle_dir),
@@ -153,34 +154,135 @@ def build_runner_env(bundle_dir, out_dir=None):
 # ---- 任务中间层（通用 HyperQueue 封装）接入；AF3 适配层在本项目内 ----
 TASKCTL_DIR = os.path.join(os.path.dirname(_ROOT), "任务中间层")
 AF3_TASKS_PY = os.path.join(_ROOT, "af3适配", "af3任务.py")
+_HQ_REFILL = None
+
+
+def load_hq_adapter():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("af3任务", AF3_TASKS_PY)
+    adapter = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(adapter)
+    return adapter
+
+
+def active_hq_names():
+    if _HQ_REFILL is None:
+        return set()
+    return {job.get("name") for job in load_hq_adapter().queue_jobs()
+            if (job.get("task_stats") or {}).get("running")
+            or (job.get("task_stats") or {}).get("waiting")}
+
+
+class HqQueueRefiller:
+    """有任务可派发时，为每种靶标保留最低 waiting 数量，缺项优先。"""
+
+    def __init__(self, targets, deadline, adapter, per_target=None, stream=None):
+        self.targets = tuple(targets)
+        self.deadline = deadline
+        self.adapter = adapter
+        self.per_target = max(1, int(per_target if per_target is not None
+                                    else os.environ.get("PEPOPT_QUEUE_MIN_PER_TARGET", "1")))
+        self.stream = stream
+        self.directory = os.path.join(db.db_root(), "queue_inputs")
+
+    def refill(self, jobs):
+        if _STOP or time.time() >= self.deadline - SAFETY_MARGIN_SEC:
+            return
+        counts = self.adapter.waiting_target_counts(jobs, self.targets)
+        missing = {target: max(0, self.per_target - counts[target]) for target in self.targets}
+        if not any(missing.values()):
+            return
+        active = {job.get("name") for job in jobs
+                  if (job.get("task_stats") or {}).get("running")
+                  or (job.get("task_stats") or {}).get("waiting")}
+        registry, rows = db.load_sequence_registry(), db.load_database()
+        靶标缺口 = 全库靶标缺口(self.targets, registry, rows)
+        submitted = []
+
+        def priority(tag):
+            row = rows.get(tag, {})
+            values = [row.get(f"iptm_{target.lower()}") for target in self.targets]
+            known = [value for value in values if value is not None and math.isfinite(value)]
+            return (0, -math.prod(known), tag) if known else (1, 0.0, tag)
+
+        def enqueue(tag, peptide, target, task_priority=0):
+            name = f"{tag}_{target.lower()}"
+            canonical = db.canonical_dir(tag, target)
+            if name in active or db.find_summary(canonical):
+                return
+            os.makedirs(canonical, exist_ok=True)
+            source = loc.write_input_json(peptide, inf.TARGET_SEQS[target], name,
+                                          canonical, **inf.target_af3_options(target))
+            if loc.estimate_tokens(source) > loc.GPU_MAX_TOKENS:
+                return
+            os.makedirs(self.directory, exist_ok=True)
+            path = os.path.join(self.directory, f"{name}.json")
+            shutil.copyfile(source, path)
+            self.adapter.submit(path, build_runner_env(self.directory),
+                                os.path.join(self.directory, "_hq_tasks"),
+                                priority=task_priority)
+            active.add(name)
+            missing[target] -= 1
+            submitted.append(name)
+
+        for tag in sorted(registry, key=priority):
+            if not any(missing.values()):
+                break
+            peptide = registry[tag].get("peptide")
+            if not peptide:
+                continue
+            row = rows.get(tag, {})
+            for target in self.targets:
+                if missing[target] and row.get(f"iptm_{target.lower()}") is None:
+                    enqueue(tag, peptide, target, resample_priority(靶标缺口[target]))
+        if any(missing.values()):
+            count = max(missing.values())
+            if inf.SWEEP_ENABLED:
+                candidates = inf.sweep_pick(self.targets, count)
+            else:
+                if self.stream is None:
+                    self.stream = inf.CandidateStream(seed=42)
+                candidates = inf.heuristic_pick(self.stream, count, self.targets)
+            for peptide in candidates:
+                variable = peptide[len(inf.FIXED_A):]
+                tag = db.resolve_tag(variable)
+                db.register_sequence(tag, variable, peptide)
+                for target in self.targets:
+                    if missing[target]:
+                        enqueue(tag, peptide, target)
+        if submitted:
+            print(f"  📥 按靶标补充等待队列：{submitted}；剩余缺口={missing}", flush=True)
 
 
 def run_af3_cycle_hq(bundle_dir, out_dir=None, priority=0):
     """把 bundle 里每个 JSON 提交为独立 HQ 任务，等待全部终态。
 
-    好处：一任务一 job → `任务控制.sh cancel <id>` 精确取消单个预测，`add`随时插队（priority 越大越先跑）；任务内 MSA 经 msa缓存.py磁盘缓存免重复搜索（内嵌即免搜索，特征逐字节等价于现场搜索）。
-
-    部分失败容错：逐任务提交，单个提交失败不中断其余；全部失败才抛异常（此时队列为空，调用方可安全回退整包直跑，不会重复计算）。个别任务运行失败不致命：结果已落盘，交给收割阶段入库，下一周期 drain 补齐。"""
-    import importlib.util
+    priority 越大越先运行；提交、查询或补队列失败立即抛错，已提交任务仍由 HQ 管理。
+    不自动直跑、不重复提交；任务内 MSA 经磁盘缓存复用。"""
     names = sorted(f for f in os.listdir(bundle_dir)
                    if f.endswith(".json") and not f.startswith(("_", ".")))
+    def job_priority(filename):
+        return (priority.get(os.path.splitext(filename)[0], 0)
+                if isinstance(priority, dict) else priority)
+
+    names.sort(key=lambda filename: -job_priority(filename))
     if not names:
         print("  ⚠️ bundle 内无 JSON，跳过", flush=True)
         return 0
-    spec = importlib.util.spec_from_file_location("af3任务", AF3_TASKS_PY)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
+    mod = load_hq_adapter()
 
     env = build_runner_env(bundle_dir, out_dir)
     env["AF3_GPUS_PER_JOB"] = "1"             # 每任务独占 1 个 GPU 槽
     task_root = os.path.join(os.path.abspath(bundle_dir), "_hq_tasks")
     os.makedirs(task_root, exist_ok=True)
 
-    ids, failed, adopted = [], [], []
+    ids, adopted = [], []
     # 接管而非重提：编排进程被 restart-service 重启后，它上次提交的任务往往**仍在
     # HQ 队列里跑**（worker 不随编排进程生死）。只查磁盘 summary 会把这些在途任务
     # 误判为遗留并重新提交 → 同一个预测算两遍（单卡下等于翻倍工时）。
-    active = mod.pending_jobs()
+    active = {job["name"]: job["id"] for job in mod.queue_jobs()
+              if (job.get("task_stats") or {}).get("running")
+              or (job.get("task_stats") or {}).get("waiting")}
     for n in names:
         stem = os.path.splitext(n)[0]
         if active.get(stem) is not None:
@@ -189,57 +291,23 @@ def run_af3_cycle_hq(bundle_dir, out_dir=None, priority=0):
             continue
         try:
             ids.append(mod.submit(os.path.join(bundle_dir, n), env, task_root,
-                                  priority=priority))
-        except Exception as e:               # noqa：BLE001 - 单任务失败不中断
-            failed.append((n, str(e)))
-            print(f"  ⚠️ 提交失败 {n}：{e}", flush=True)
+                                  priority=job_priority(n)))
+        except Exception as error:
+            raise RuntimeError(f"AF3 提交失败 {n}：{error}；已提交任务 {ids} 仍由 HQ 管理") from error
     if not ids:
-        raise RuntimeError(f"任务中间层全部提交失败：{failed[:2]}")
+        raise RuntimeError("没有可等待的 HQ 任务")
     print(f"  🚀 已提交 {len(ids) - len(adopted)}/{len(names)} 个 AF3 任务到任务中间层"
           f"（可随时 add/cancel）：{ids}"
           + (f"\n     ♻️ 其中 {len(adopted)} 个为接管重启前仍在队列的任务，未重复提交"
              if adopted else ""), flush=True)
-    mod.wait(ids)
-    if failed:
-        print(f"  ⚠️ {len(failed)} 个任务提交失败，由下周期 drain 补齐",
-              flush=True)
+    mod.wait(ids, on_poll=_HQ_REFILL)
     print("  ✅ 本周期全部 AF3 任务已到终态", flush=True)
     return 0
 
 
 def run_af3_cycle(bundle_dir, out_dir=None, priority=0):
-    """在**本作业内**跑 AF3；返回退出码。
-
-    双路径：
-      * HQ 路径（默认，PEPOPT_HQ_MODE=1）：每个 JSON 一个独立任务提交到任务中间层，可随时添加/取消单个预测，MSA 走磁盘缓存免重复搜索。
-      * 直跑路径（PEPOPT_HQ_MODE=0 或 HQ 路径异常时自动回退）：整包跑AF3打包推理.sh（MSA 进程内摊销 + 两阶段容错）。
-
-    直跑路径的 runner 先复制成**快照**再执行：bash 按字节偏移边读边执行脚本，而编辑器写 作业脚本/*.sh 是**原地截断重写**（inode 不变）→ 若本长驻作业执行期间有人修改了仓库里的 runner，bash 回读到下一条命令时就会错位（语法崩或行为失控；2026-10-04 实测踩到，靠临时回滚才救回在跑的5天作业）。快照使长驻作业与仓库后续改动彻底解耦。
-
-    两条路径都只需容忍非零退出码：已完成任务的结果都在盘上，交给收割阶段入库。"""
-    if os.environ.get("PEPOPT_HQ_MODE", "1") != "0":
-        try:
-            return run_af3_cycle_hq(bundle_dir, out_dir, priority=priority)
-        except Exception as e:                   # noqa：BLE001 - 不让作业裸崩
-            print(f"  ⚠️ HQ 路径失败（{e}），回退整包直跑", flush=True)
-    src = os.path.join(_ROOT, "作业脚本", "AF3打包推理.sh")
-    if not os.path.isfile(src):
-        print(f"  ❌ 缺 runner：{src}", flush=True)
-        return 2
-    snap = os.path.join(os.path.abspath(bundle_dir), "_runner_snapshot.sh")
-    try:
-        shutil.copyfile(src, snap)
-        os.chmod(snap, 0o755)
-    except OSError as e:
-        print(f"  ⚠️ 快照失败（{e}），回退直接执行仓库副本", flush=True)
-        snap = src
-    print("  🚀 启动 AF3 推理（作业内直接执行，不再 sbatch）", flush=True)
-    try:
-        p = subprocess.run(["bash", snap], env=build_runner_env(bundle_dir, out_dir))
-        return p.returncode
-    except Exception as e:                       # noqa：BLE001 - 不能让作业裸崩
-        print(f"  ❌ runner 执行异常：{e}", flush=True)
-        return 2
+    """只允许 HQ 执行；查询、补队列或提交失败立即报错，绝不直跑回退。"""
+    return run_af3_cycle_hq(bundle_dir, out_dir, priority=priority)
 
 
 # ===================== 组装一轮 =====================
@@ -264,10 +332,25 @@ RESAMPLE_BUNDLE = "current"          # 固定名；置 KEEP_RESAMPLES=1 时不�
 RESAMPLE_PRIORITY = int(os.environ.get("PEPOPT_RESAMPLE_PRIORITY", "20"))
 
 
+def resample_priority(deficit):
+    deficit = int(deficit)
+    if deficit < 1 or RESAMPLE_PRIORITY < 1:
+        raise ValueError("补采缺口和基础优先级必须为正数")
+    return RESAMPLE_PRIORITY + deficit
+
+
+def 全库靶标缺口(靶标列表, 注册表=None, 评分表=None):
+    注册表 = db.load_sequence_registry() if 注册表 is None else 注册表
+    评分表 = db.load_database() if 评分表 is None else 评分表
+    标签列表 = (set(注册表) | set(评分表)) - {""}
+    return {靶标: sum(评分表.get(标签, {}).get(f"iptm_{靶标.lower()}") is None or not math.isfinite(评分表[标签][f"iptm_{靶标.lower()}"]) for 标签 in 标签列表) for 靶标 in 靶标列表}
+
+
 def make_resample_fn(deadline):
     """构造数据库整理的批量补采生成器（真跑 AF3 新 seed，非抽随机数）。
 
-    契约 fn(tag, n=1) -> {tag：[新乘积样本…]} 或 fn(tags) -> {...}（爬山单条 or 整理批量）。
+    契约 fn(tag, n=1) 或 fn(tags, n={tag: 样本缺口}) -> {tag：[新乘积样本…]}。
+    n 仅决定补采优先级；每轮仍跑一个新 seed，由统计器消费样本后重新判断缺口。
     raw=True 时改返回 {tag：{"products"：[乘积…]，"samples"：{靶标：[逐样本 ipTM]}}}，供首次爬山把最佳样本的**分量**写回 iptm_* 列（只有乘积无从定位分量）。
     实现：对每个 tag 的**变因子**靶标（有逐样本数据者，固定因子是常数无需重跑）各跑一次新 seed 的 AF3 → 逐样本配对相乘得新乘积样本；一次调用打包成一个 bundle 跑（chain-B MSA 每靶标只建一次，逐条单跑太浪费）。
     时间护栏：距 deadline 不足 SAFETY_MARGIN×3 时不再开新补采（宁可少补，不能把时限烧在补采上）。"""
@@ -320,7 +403,9 @@ def make_resample_fn(deadline):
             return {}
         print(f"  🔁 整理补采：{len(plan)} 条记录 × 新 seed={seed} → {len(jobs)} 个 AF3 任务",
               flush=True)
-        run_af3_cycle(bundle, out_dir=out_root, priority=RESAMPLE_PRIORITY)
+        priorities = {job: resample_priority(n[tag] if isinstance(n, dict) else n)
+                  for tag, target, job in jobs}
+        run_af3_cycle(bundle, out_dir=out_root, priority=priorities)
         # 逐任务提取新样本，按靶标配对相乘（固定因子为常数）；
         # 变因子缺任何一个都放弃该记录——乘积缺因子会得到错误的样本值
         per_tag = {}
@@ -352,6 +437,7 @@ def prepare_cycle(seqs, active_targets, cycle_dir):
     返回（已排入的任务数，跳过的原因列表）。token 超限的任务在提交前拦截。"""
     os.makedirs(cycle_dir, exist_ok=True)
     n_task, skipped = 0, []
+    active_jobs = active_hq_names()
     for seq in seqs:
         var = seq[len(inf.FIXED_A):]
         # resolve_tag 而非 make_tag：已登记过的序列必须沿用当初的标签（旧的 5 位
@@ -364,6 +450,8 @@ def prepare_cycle(seqs, active_targets, cycle_dir):
             continue
         for t in active_targets:
             job_name = f"{tag}_{t.lower()}"
+            if job_name in active_jobs:
+                continue
             canon = db.canonical_dir(tag, t)
             # consolidate_task 会先把 AF3 的时间戳兄弟目录折叠进规范目录再判定，
             # 比只查规范目录更可靠（漏判会导致已算完的任务被重算）。
@@ -384,19 +472,21 @@ def prepare_cycle(seqs, active_targets, cycle_dir):
 
 # ===================== 主循环 =====================
 
-def drain_backlog(active_targets, cycle_dir, seq_budget):
+def drain_backlog(active_targets, cycle_dir, seq_budget, task_priorities=None):
     """把**历史遗留的未完成任务**排入本轮（防孤儿化）。返回（序列数，任务数）。
 
     为何必需：旧形态（登录节点驱动 + 反复 sbatch 小包）被取消或驱动被杀时，会留下“已有 input.json、但永远不会有 summary”的任务目录。而新入口的候选来自 `inf.known_sequences()`（= sequences.csv 全量）的排除集 → 这些序列
     **再也不会被选中**，于是永久缺半边结果：既拖累“完整评估”计数，也让目标乘积缺因子（objective 为 None → 不进排名、GP 训练集也少一条）。本函数直接复用它们已生成的 input.json 把缺的补上。
 
-    按 tag 分组计数，每轮最多补 seq_budget 个序列，以免一次塞爆时间预算。"""
+    每轮最多补 seq_budget 个序列；按已有激活靶标 ipTM 乘积降序选批，
+    缺失因子不参与乘积，无已知评分者排最后，同分按 tag 排序。"""
     rd = db.results_dir()
     if not os.path.isdir(rd):
         return 0, 0
     os.makedirs(cycle_dir, exist_ok=True)
 
     pending = {}                       # tag -> [（任务名，input.json 路径）]
+    active_jobs = active_hq_names()
 
     # ---- 第1类：已有 input.json 但永远等不到 summary 的遗留任务 ----
     for name in sorted(os.listdir(rd)):
@@ -405,6 +495,8 @@ def drain_backlog(active_targets, cycle_dir, seq_budget):
             continue
         parsed = db.split_job_name(name)
         if parsed is None or parsed[1] not in active_targets:
+            continue
+        if f"{parsed[0]}_{parsed[1].lower()}" in active_jobs:
             continue
         if db.consolidate_task(*parsed) is not None:
             continue                              # 已完成（含时间戳兄弟折叠）
@@ -420,13 +512,27 @@ def drain_backlog(active_targets, cycle_dir, seq_budget):
     # 因而**永远不会被重新选中** → 不补就永久缺半边。此处按主表已有值快速预筛，
     # 避免对已完整的序列做无谓的目录探测。
     reg, rows = db.load_sequence_registry(), db.load_database()
+    靶标缺口 = 全库靶标缺口(active_targets, reg, rows)
+    leftovers, pending = pending, {}
+
+    def priority_key(tag):
+        row = rows.get(tag, {})
+        values = [row.get(f"iptm_{target.lower()}") for target in active_targets]
+        known_values = [value for value in values
+                        if value is not None and math.isfinite(value)]
+        if not known_values:
+            return (1, 0.0, tag)
+        return (0, -math.prod(known_values), tag)
+
     n_gap = 0
     more_backlog = False
-    for tag in sorted(reg):
+    for tag in sorted(set(reg) | set(leftovers), key=priority_key):
         if len(pending) >= seq_budget:
             more_backlog = True             # 内嵌 9E4E 较大，只生成本批次的输入
             break
-        info = reg[tag]
+        if tag in leftovers:
+            pending[tag] = leftovers[tag]
+        info = reg.get(tag, {})
         pep = info.get("peptide")
         row = rows.get(tag, {})
         if not pep:
@@ -436,7 +542,7 @@ def drain_backlog(active_targets, cycle_dir, seq_budget):
             if row.get(f"iptm_{t.lower()}") is not None:
                 continue                          # 主表已有值 → 不缺
             name = f"{tag}_{t.lower()}"
-            if name in has:
+            if name in has or name in active_jobs:
                 continue
             if db.consolidate_task(tag, t) is not None:
                 continue                          # 盘上已完成，下次收割即入库
@@ -460,6 +566,9 @@ def drain_backlog(active_targets, cycle_dir, seq_budget):
         for name, inp in pending[tag]:
             try:
                 shutil.copyfile(inp, os.path.join(cycle_dir, f"{name}.json"))
+                if task_priorities is not None:
+                    靶标 = db.split_job_name(name)[1]
+                    task_priorities[name] = resample_priority(max(1, 靶标缺口[靶标]))
                 n_task += 1
             except OSError as e:
                 print(f"  ⚠️ 补算输入复制失败 {name}：{e}", flush=True)
@@ -494,12 +603,17 @@ def consume_restart_flag(p):
 
 
 def run_loop(active_targets, cycle_seqs, max_hours):
+    global _HQ_REFILL
     if db.db_root() == db.DEFAULT_DB_ROOT:
         print("   战役初始化：", db.initialize_four_target_campaign(), flush=True)
+    口径重建 = db.确保乘积口径()
+    if 口径重建 is not None:
+        print("   乘积口径已切换：", 口径重建, flush=True)
     p = db.paths(ensure=True)
     start = time.time()
     deadline = start + max_hours * 3600.0
     stream = inf.CandidateStream(seed=42)      # 仅 SWEEP_ENABLED=0 时使用
+    _HQ_REFILL = HqQueueRefiller(active_targets, deadline, load_hq_adapter(), stream=stream).refill
     empty_cycles = 0
     cycle_no = 0
     reload_exit = False                        # True → 以 EXIT_RELOAD 退出，让守护重启本进程
@@ -552,7 +666,8 @@ def run_loop(active_targets, cycle_seqs, max_hours):
         # 1）先收割上一个周期的成果（首轮则收割历史遗留/其它入口的完成结果）
         #    收割内部做序贯采样入库（β 统计量），并在入库数过 2^k 时触发数据库整理（P̃·N>M 决定每条记录重复搜索多少次，补采真跑 AF3 新 seed）
         n_new, new_tags = inf.harvest_and_report(active_targets,
-                                                 new_sample_fn=make_resample_fn(deadline))
+                                                 new_sample_fn=make_resample_fn(deadline),
+                                                 exclude_jobs=active_hq_names())
         if new_tags:
             inf.climb_new_records(new_tags, active_targets,
                                   make_resample_fn(deadline))
@@ -563,7 +678,9 @@ def run_loop(active_targets, cycle_seqs, max_hours):
         os.makedirs(cycle_dir, exist_ok=True)
 
         # 3）先补上次遗留的未完成任务（防孤儿化），剩余预算再挑新候选
-        d_seq, d_task = drain_backlog(active_targets, cycle_dir, n_seq)
+        task_priorities = {}
+        d_seq, d_task = drain_backlog(active_targets, cycle_dir, n_seq,
+                        task_priorities=task_priorities)
         picks, space_done = [], False
         want = max(0, n_seq - d_seq)
         if want > 0:
@@ -614,15 +731,15 @@ def run_loop(active_targets, cycle_seqs, max_hours):
               flush=True)
         empty_cycles = 0
 
-        # 5）作业内直接跑 AF3（阻塞至本周期结束）
-        rc = run_af3_cycle(cycle_dir)
+        rc = run_af3_cycle(cycle_dir, priority=task_priorities)
         status = "✅" if rc == 0 else f"⚠️ 退出码 {rc}"
         print(f"  {status} 周期 {cycle_no} 的 AF3 结束 "
               f"（{(time.time() - start) / 3600:.1f}h）", flush=True)
 
         # 6）立刻收割本周期的结果，使下一轮的 GP 能用上最新数据
         got, got_tags = inf.harvest_and_report(active_targets,
-                                               new_sample_fn=make_resample_fn(deadline))
+                                               new_sample_fn=make_resample_fn(deadline),
+                                               exclude_jobs=active_hq_names())
         if got_tags:
             inf.climb_new_records(got_tags, active_targets,
                                   make_resample_fn(deadline))
@@ -636,7 +753,8 @@ def run_loop(active_targets, cycle_seqs, max_hours):
 
     print(f"\n👋 作业内无限循环结束（共 {cycle_no} 个周期）", flush=True)
     final_n, final_tags = inf.harvest_and_report(active_targets,
-                                                  new_sample_fn=make_resample_fn(deadline))
+                                                  new_sample_fn=make_resample_fn(deadline),
+                                                  exclude_jobs=active_hq_names())
     if final_tags:
         inf.climb_new_records(final_tags, active_targets,
                               make_resample_fn(deadline))
@@ -657,9 +775,7 @@ def parse_targets(raw):
 def main():
     ap = argparse.ArgumentParser(
         description="计算节点内的无限搜索循环作业（结果持续追加进共享数据库）")
-    ap.add_argument("--targets", default=os.environ.get("PEPOPT_TARGETS")
-                    or DEFAULT_TARGETS,
-                    help="四靶标列表，用 ',' 或 '+' 分隔；SLURM 下发必须用 '+ '")
+    ap.add_argument("--targets", default=DEFAULT_TARGETS, help="默认读取靶标配置；显式调试名单可用 ',' 或 '+' 分隔")
     ap.add_argument("--cycle-seqs", type=int,
                     default=int(os.environ.get("PEPOPT_CYCLE_SEQS") or CYCLE_SEQS),
                     help=f"每轮最多序列数（默认 {CYCLE_SEQS}）")

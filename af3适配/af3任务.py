@@ -18,17 +18,39 @@ af3任务.py — 把 AF3 预测任务接入任务中间层（HyperQueue）
 
 import glob
 import json
+import math
 import os
 import re
 import shutil
 import subprocess
 import sys
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 # 任务控制.sh 在通用任务中间层（与本项目平级的 任务中间层/）；TASKCTL_HOME 可覆盖。本目录是 AF3 专属适配层，中间层本身不含任何任务适配。
 _MW = os.environ.get("TASKCTL_HOME") or os.path.join(HERE, "..", "..", "任务中间层")
 TASKCTL = os.path.join(_MW, "任务控制.sh")
 MSA_CACHE = os.path.join(HERE, "msa缓存.py")
+
+
+def pause_at_batch_boundary():
+    """维护切换时在加载下一批适配层之前暂停，不打断本批结果入库。"""
+    state = os.environ.get("TASKCTL_STATE", os.path.join(_MW, "运行状态"))
+    requested = os.path.join(state, "af3-drain.requested")
+    if not os.path.isfile(requested):
+        return
+    ready = requested + ".ready"
+    temporary = ready + f".{os.getpid()}.tmp"
+    with open(temporary, "w") as stream:
+        json.dump({"pid": os.getpid(), "host": os.uname().nodename,
+                   "time": time.time()}, stream)
+    os.replace(temporary, ready)
+    print("AF3 已在下一批适配层加载边界暂停，等待维护切换", flush=True)
+    while os.path.isfile(requested):
+        time.sleep(1)
+
+
+pause_at_batch_boundary()
 
 
 def _sh_quote(s: str) -> str:
@@ -93,6 +115,32 @@ def gen_task(json_path: str, env: dict, task_root: str) -> str:
     return tdir
 
 
+def queue_jobs():
+    """严格读取 HQ 队列；查询失败时不能把队列当成空队列重提任务。"""
+    result = subprocess.run(["bash", TASKCTL, "list", "--json"],
+                            capture_output=True, text=True, timeout=60)
+    if result.returncode:
+        raise RuntimeError(f"无法读取 HQ 队列：{result.stderr.strip()}")
+    jobs = json.loads(result.stdout or "[]")
+    if not isinstance(jobs, list):
+        raise ValueError("HQ 队列返回格式异常")
+    return jobs
+
+
+def waiting_target_counts(jobs, targets):
+    """只统计 waiting；运行中任务不占每种靶标的待运行保有量。"""
+    counts = dict.fromkeys(targets, 0)
+    for job in jobs:
+        waiting = (job.get("task_stats") or {}).get("waiting", 0)
+        if not waiting:
+            continue
+        for target in targets:
+            if re.search(rf"_{re.escape(target.lower())}(?:_s\d+)?$", job.get("name", "").lower()):
+                counts[target] += waiting
+                break
+    return counts
+
+
 def pending_jobs():
     """HQ 中尚未终态的任务：{name: job_id}。
 
@@ -103,14 +151,8 @@ def pending_jobs():
 
     终态判据：task_stats 的 running+waiting 为零（HQ 0.27 的 json 输出**无 state 字段**，
     实测字段为 id/name/is_open/task_count/task_stats；is_open 恒为 False，不得用作判据）。
-    任何异常都返回空集：宁可退化为重提（不丢计算），也不能让作业裸崩。"""
-    try:
-        r = subprocess.run(["bash", TASKCTL, "list", "--json"],
-                           capture_output=True, text=True, timeout=60)
-        jobs = json.loads(r.stdout or "[]")
-    except Exception as e:                   # noqa: BLE001
-        print(f"  ⚠️  无法读取任务中间层队列({e}), 本次不做接管查重", flush=True)
-        return {}
+    查询失败直接报错，不能把未知状态当作空队列重提。"""
+    jobs = queue_jobs()
     out = {}
     for j in jobs:
         ts = j.get("task_stats") or {}
@@ -121,19 +163,61 @@ def pending_jobs():
     return out
 
 
+COMPILATION_BUCKETS = (256, 512, 768, 1024, 1280, 1536, 2048,
+                       2560, 3072, 3584, 4096, 4608, 5120)
+
+
+def minimum_gpu_memory(json_path, env=None):
+    """按蛋白复合物大小估算充足显存 GiB，作为范围上限，不映射显卡容量。
+
+    当前默认 bfloat16/5 个扩散样本的保守初始容量模型，尚无峰值实测标定：
+    ceil((固定开销 + pair 系数 * (bucket / 1024)^2) * 余量)。
+    默认固定开销 6 GiB、pair 系数 8 GiB、余量 1.15；三个 AF3_MEMORY_*
+    参数可据实测调整。超过默认最大 bucket 时，AF3 按实际 token 数编译。
+    """
+    settings = os.environ if env is None else env
+    fixed = float(settings.get("AF3_MEMORY_FIXED_GB", "6"))
+    pair = float(settings.get("AF3_MEMORY_PAIR_GB", "8"))
+    margin = float(settings.get("AF3_MEMORY_MARGIN", "1.15"))
+    if any(not math.isfinite(value) or value <= 0 for value in (fixed, pair, margin)) \
+            or margin < 1:
+        raise ValueError("AF3 显存估算系数必须为有限正数，余量必须至少为 1")
+    with open(json_path, encoding="utf-8") as stream:
+        job = json.load(stream)
+    tokens = 0
+    for entry in job.get("sequences", []):
+        protein = entry.get("protein")
+        if not protein:
+            raise ValueError("当前显存估算仅支持蛋白体系，不能忽略非蛋白实体")
+        chain_ids = protein.get("id")
+        copies = len(chain_ids) if isinstance(chain_ids, list) else 1
+        tokens += len(protein["sequence"]) * copies
+    if tokens <= 0:
+        raise ValueError(f"AF3 输入无有效蛋白序列，无法声明所需显存：{json_path}")
+    bucket = next((size for size in COMPILATION_BUCKETS if size >= tokens), tokens)
+    return math.ceil((fixed + pair * (bucket / 1024) ** 2) * margin)
+
+
+def 显存需求范围(json_path, env=None):
+    上限 = minimum_gpu_memory(json_path, env)
+    return 上限 / 2, 上限
+
+
 def submit(json_path: str, env: dict, task_root: str, priority: int = 0,
            gpus: int = 1, cpus: int = 6, name: str = None) -> int:
     """生成并提交单个 AF3 任务；返回 HQ job id。"""
     tdir = gen_task(json_path, env, task_root)
     name = name or os.path.splitext(os.path.basename(json_path))[0]
+    下限, 上限 = 显存需求范围(json_path, env) if gpus else (0, 0)
     r = subprocess.run(
         ["bash", TASKCTL, "add",
          "--name", name, "--gpus", str(gpus), "--cpus", str(cpus),
+         "--gpu-memory", f"{下限:g}:{上限:g}" if gpus else "0",
          "--priority", str(priority),
          "--", "bash", os.path.join(tdir, "_启动器.sh")],
         capture_output=True, text=True)
     m = re.search(r"ID=(\d+)", r.stdout)
-    if not m:
+    if r.returncode or not m:
         raise RuntimeError(f"提交失败：{r.stdout}{r.stderr}")
     return int(m.group(1))
 
@@ -142,29 +226,38 @@ def submit_all(jsons, env: dict, task_root: str, priority: int = 0,
                gpus: int = 1, cpus: int = 6):
     """批量提交；返回 job id 列表。
 
-    按文件名排序 → 同序列的各靶标任务相邻入队 → 1 GPU 串行时 MSA 自愈链（任务1收割 → 任务2内嵌）自然成立。首个提交失败即抛异常（此时队列为空，调用方可安全回退直接执行）；中途失败则抛异常但已提交的任务继续运行。"""
+    按文件名排序，同序列的靶标相邻入队。首个错误立即抛出；已提交任务继续运行，禁止直跑回退。"""
     ids = []
-    last_err = None
     for jp in sorted(jsons):
-        try:
-            ids.append(submit(jp, env, task_root, priority=priority,
-                              gpus=gpus, cpus=cpus))
-        except Exception as e:                      # noqa: BLE001
-            last_err = e
-            break
-    if last_err is not None:
-        if ids:
-            # 已有任务入队：等它们跑完再抛，让收割阶段收走已完成结果
-            wait(ids)
-        raise last_err
+        ids.append(submit(jp, env, task_root, priority=priority,
+                          gpus=gpus, cpus=cpus))
     return ids
 
 
-def wait(ids):
-    """阻塞至所有任务终态（hq job wait 逐个等，总时长 = 最慢者）。"""
-    for jid in ids:
-        subprocess.run(["bash", TASKCTL, "wait", str(jid)],
-                       capture_output=True, text=True)
+def wait(ids, on_poll=None, poll_seconds=15):
+    """等待全部成功，失败、取消或队列异常立即抛错；等待时可补充队列。"""
+    owned = set(ids)
+    while owned:
+        jobs = queue_jobs()
+        tracked = {job["id"]: job for job in jobs if job["id"] in owned}
+        if owned - tracked.keys():
+            raise RuntimeError(f"HQ 队列缺少待等待任务：{sorted(owned - tracked.keys())}")
+        failed = {job_id: job.get("task_stats") for job_id, job in tracked.items()
+                  if any((job.get("task_stats") or {}).get(state)
+                         for state in ("failed", "canceled", "aborted"))}
+        if failed:
+            raise RuntimeError(f"AF3 HQ 任务未成功完成：{failed}")
+        if on_poll is not None:
+            on_poll(jobs)
+        active = {job_id for job_id, job in tracked.items()
+                  if (job.get("task_stats") or {}).get("running")
+                  or (job.get("task_stats") or {}).get("waiting")}
+        if not active:
+            if any(not (job.get("task_stats") or {}).get("finished")
+                   for job in tracked.values()):
+                raise RuntimeError("HQ 任务既未运行也未成功完成，状态异常")
+            return
+        time.sleep(poll_seconds)
 
 
 def main():

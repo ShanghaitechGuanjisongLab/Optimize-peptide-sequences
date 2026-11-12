@@ -25,6 +25,7 @@ import re
 import csv
 import glob
 import json
+import math
 import zlib
 import shutil
 import zipfile
@@ -330,8 +331,24 @@ def load_database():
     return by_tag
 
 
-# 当前唯一生产目标：四个 ipTM 全部越高越好，任一缺失则不参与正式排名。
-PRODUCT_TARGETS = ("HTR1A", "BIN1", "UNC13C", "ASIC1A")
+def 读取启用靶标(配置路径=None):
+    配置路径 = 配置路径 or os.environ.get("PEPOPT_TARGET_CONFIG") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "靶标配置.json")
+    with open(配置路径, encoding="utf-8") as 文件:
+        配置 = json.load(文件)
+    名单 = 配置.get("启用靶标") if isinstance(配置, dict) else None
+    if not isinstance(名单, list) or not 名单 or any(not isinstance(靶标, str) for 靶标 in 名单):
+        raise ValueError("靶标配置的启用靶标必须为非空字符串列表")
+    if len(set(名单)) != len(名单):
+        raise ValueError("靶标配置包含重复靶标")
+    未知靶标 = set(名单) - set(TARGETS_ALL)
+    if 未知靶标:
+        raise ValueError(f"靶标配置包含未知靶标：{sorted(未知靶标)}")
+    if "HTR1A" not in 名单:
+        raise ValueError("启用靶标必须包含 HTR1A")
+    return tuple(名单)
+
+
+PRODUCT_TARGETS = 读取启用靶标()
 
 
 def objective_product(row):
@@ -503,6 +520,74 @@ def load_obj_fit(tag):
     return BetaFit.from_stats(r)
 
 
+def 确保乘积口径():
+    路径 = paths()
+    标记路径 = os.path.join(路径["root"], "乘积口径.json")
+    if not os.path.isfile(路径["master_csv"]):
+        return None
+    if os.path.isfile(标记路径):
+        with open(标记路径, encoding="utf-8") as 文件:
+            标记 = json.load(文件)
+        if 标记.get("靶标") == list(PRODUCT_TARGETS):
+            return None
+    return 重建乘积口径()
+
+
+def 重建乘积口径():
+    """仅在生产暂停时调用；备份旧主表，按当前靶标重建乘积与统计，保留历史预测。"""
+    import 小肽序贯采样 as 序贯采样
+    from 小肽统计 import BetaFit
+    路径 = paths(ensure=True)
+    记录 = _read_csv(路径["master_csv"], MASTER_FIELDS)
+    if not 记录:
+        raise RuntimeError("主表为空或不可读，拒绝重建乘积口径")
+    备份目录 = os.path.join(路径["root"], "runs", "目标切换_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f"))
+    os.makedirs(备份目录)
+    shutil.copy2(路径["master_csv"], os.path.join(备份目录, "peptide_database.csv"))
+    原排名 = os.path.join(路径["best_dir"], "BEST_TOP10.csv")
+    if os.path.isfile(原排名):
+        shutil.copy2(原排名, os.path.join(备份目录, "BEST_TOP10.csv"))
+    当前数值 = load_database()
+    重建条数 = 0
+    for 行 in 记录:
+        已知乘积 = objective_product(行)
+        for 列 in _OBJ_COLS:
+            行[列] = ""
+        因子 = 序贯采样.collect_product_factors(行["tag"], 当前数值[行["tag"]])
+        if 因子 is not None and 因子[0]:
+            变因子, 固定因子 = 因子
+            样本 = 序贯采样.build_product_samples(变因子, 固定因子)
+            if any(not math.isfinite(值) for 值 in 样本):
+                raise ValueError(f"记录 {行['tag']} 的乘积样本含非有限值")
+            原样本数 = len(样本)
+            if 已知乘积 is not None and 已知乘积 > max(样本) + 1e-6:
+                样本.append(已知乘积)
+            拟合 = BetaFit()
+            拟合.consume_sequential(样本)
+            最佳下标 = max(range(len(样本)), key=lambda 下标: 样本[下标])
+            if 最佳下标 < 原样本数:
+                for 靶标, 靶标样本 in 变因子.items():
+                    行[f"iptm_{靶标.lower()}"] = f"{靶标样本[最佳下标]:.4f}"
+                for 靶标, 值 in 固定因子.items():
+                    行[f"iptm_{靶标.lower()}"] = f"{值:.4f}"
+            行.update(拟合.stats_dict())
+            重建条数 += 1
+        乘积 = objective_product(行)
+        行["objective_product"] = "" if 乘积 is None else f"{乘积:.6f}"
+        HTR1A评分 = _to_float(行.get("iptm_htr1a"))
+        if HTR1A评分 is not None:
+            行["score_htr1a"] = f"{1.0 - HTR1A评分:.4f}"
+        行["updated_at"] = _now()
+    _rewrite_master(记录)
+    结果 = {"靶标": list(PRODUCT_TARGETS), "记录数": len(记录), "重建统计条数": 重建条数, "备份目录": 备份目录, "时间": _now()}
+    临时标记 = os.path.join(路径["root"], "乘积口径.json.tmp")
+    with open(临时标记, "w", encoding="utf-8") as 文件:
+        json.dump(结果, 文件, ensure_ascii=False, indent=2)
+    refresh_best()
+    os.replace(临时标记, os.path.join(路径["root"], "乘积口径.json"))
+    return 结果
+
+
 _AA3TO1 = {
     "ALA": "A", "ARG": "R", "ASN": "N", "ASP": "D", "CYS": "C", "GLN": "Q",
     "GLU": "E", "GLY": "G", "HIS": "H", "ILE": "I", "LEU": "L", "LYS": "K",
@@ -575,7 +660,7 @@ def pack_result_zip(result_dir, job_name):
     return zip_path
 
 
-def harvest_results(results_root=None):
+def harvest_results(results_root=None, exclude_jobs=None):
     """扫描结果目录，把**新完成**的 AF3 结果提取评分并入库（幂等，可反复调用）。
 
     以（序列×靶标）为一组处理：AF3 可能把输出写到规范目录 <tag>_<target>/ 或追加时间戳的兄弟目录 <tag>_<target>_<ts>/，本函数先用 consolidate_task() 折叠到规范目录再取分，故两种布局都能收割；折叠后该任务不再被误判为“未完成”而重跑。入库成功后在规范目录写 .harvested，下次跳过。返回（新增数，{名：跳过原因}，新增 tags 集合）。"""
@@ -595,6 +680,8 @@ def harvest_results(results_root=None):
     n_new, skipped, new_tags = 0, {}, set()
     for (tag, target) in sorted(groups):
         key = f"{tag}_{target.lower()}"
+        if key in (exclude_jobs or ()):
+            continue
         canon = canonical_dir(tag, target, results_root)
         if os.path.isfile(os.path.join(canon, ".harvested")):
             continue
@@ -697,7 +784,7 @@ def import_archived(archive_csv, source="archived", dry_run=False):
 # ---------------------------------------------------------------------
 
 def refresh_best(top_n=10):
-    """只按完整四因子乘积降序；缺因子不回退 HTR1A，避免伪四因子榜单。"""
+    """只按当前因子齐全的乘积降序；缺因子不回退 HTR1A 单目标。"""
     by_tag = load_database()
     p = paths(ensure=True)
     rows = []
@@ -958,10 +1045,14 @@ def initialize_four_target_campaign(archive_root=LEGACY_DB_ROOT, dry_run=False):
 if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser(description="小肽共享数据库维护")
-    ap.add_argument("command", choices=("init-four-target", "stats"))
+    ap.add_argument("command", choices=("init-four-target", "stats", "重算乘积", "靶标"))
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
     if args.command == "init-four-target":
         print(initialize_four_target_campaign(dry_run=args.dry_run))
+    elif args.command == "重算乘积":
+        print(重建乘积口径())
+    elif args.command == "靶标":
+        print(",".join(PRODUCT_TARGETS))
     else:
         print(stats())

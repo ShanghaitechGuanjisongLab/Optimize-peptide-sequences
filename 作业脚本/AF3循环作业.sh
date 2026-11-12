@@ -17,9 +17,7 @@
 #   conda af3_old→ AF3 推理那一步（由 作业脚本/AF3打包推理.sh 自行激活）
 #
 # 可选环境变量：
-#   PEPOPT_TARGETS=HTR1A+BIN1   待评估靶标（V100 放不下 UNC13C）
-#                               ⭐ 分隔符必须是 '+'：该变量经 SLURM --export 下发，而 --export 列表以逗号分隔，值内含逗号会被截断（PEPOPT_TARGETS=HTR1A,BIN1 → 只收到 HTR1A）。
-#                               本脚本与 python 侧均已兼容 ',' 与 '+' 两种写法。
+#   PEPOPT_TARGET_CONFIG       可选配置文件路径；默认读取项目的靶标配置.json，不从环境变量保存另一份名单
 #   PEPOPT_CYCLE_SEQS=24        每轮序列数
 #   PEPOPT_MAX_HOURS=118        时间预算（= MaxTime 减去续交余量）
 #   PEPOPT_RESULTS_DIR          结果目录（须等于共享库的 af3_results）
@@ -28,26 +26,18 @@ set -uo pipefail
 
 REPO_DIR="${PEPOPT_WORK_DIR:-$SLURM_SUBMIT_DIR}"
 cd "$REPO_DIR" || { echo "❌ 无法进入 $REPO_DIR" >&2; exit 2; }
+PEPOPT_TARGETS="$("${TASKCTL_PYTHON:-python3}" "$REPO_DIR/小肽数据库.py" 靶标)" || exit 4
 
 echo "=============================================================="
 echo " 无限循环作业启动：$(date '+%F %T') | 节点 $(hostname)"
 echo "   作业号   ：${SLURM_JOB_ID:-?}"
 echo "   时限请求 ：${PEPOPT_TIME_REQUESTED:-?}（循环内部预算 ${PEPOPT_MAX_HOURS:-118}h）"
 echo "   GPU      ：${PEPOPT_GPUS_PER_JOB:-1} 张 | CPU ${SLURM_CPUS_ON_NODE:-?}"
-echo "   靶标（下发）：${PEPOPT_TARGETS:-HTR1A+BIN1+UNC13C+ASIC1A}"
+echo "   靶标（配置）：$PEPOPT_TARGETS"
 echo "   每轮序列 ：${PEPOPT_CYCLE_SEQS:-24}"
 echo "   仓库     ：$REPO_DIR"
 echo "   数据库   ：${PEPOPT_DB_ROOT:-/public_bme2/Share200T/管吉松/peptide_opt_db_four_target_9e4e}"
 echo "=============================================================="
-# shell 先做首屏守卫；Python main 再严格校验完整四因子。
-TARGET_CSV=",$(echo "${PEPOPT_TARGETS:-HTR1A+BIN1+UNC13C+ASIC1A}" | tr '+' ','),"
-for required in HTR1A BIN1 UNC13C ASIC1A; do
-    case "$TARGET_CSV" in
-        *",$required,"*) : ;;
-        *) echo "❌ 靶标下发异常：缺少 $required → 拒绝启动"; exit 4 ;;
-    esac
-done
-
 # ---- 激活编排环境（base：含 sklearn/pandas/matplotlib）----
 CONDA_SH="${PEPOPT_CONDA_SH:-}"
 if [ -z "$CONDA_SH" ]; then
@@ -78,7 +68,6 @@ python -c "import sklearn, scipy, pandas, numpy" 2>/dev/null || {
 TASKD="$REPO_DIR/../任务中间层/任务守护.sh"
 # -u：关闭输出缓冲，使 SLURM 日志可实时 tail
 PY_CMD="python -u 小肽优化_节点内.py \
-    --targets '${PEPOPT_TARGETS:-HTR1A+BIN1+UNC13C+ASIC1A}' \
     --cycle-seqs '${PEPOPT_CYCLE_SEQS:-24}' \
     --max-hours '${PEPOPT_MAX_HOURS:-118}'"
 
@@ -101,7 +90,5 @@ if [ -f "$TASKD" ]; then
     # exec 不会返回；守护的退出码即作业退出码（重载码 42 在守护内部消化）
 fi
 
-echo "⚠️ 未找到 $TASKD，AF3 将走整包直跑路径"
-export PEPOPT_HQ_MODE=0
-eval "$PY_CMD"
-exit $?
+echo "未找到任务守护 $TASKD，拒绝运行 AF3；不允许直跑回退" >&2
+exit 4

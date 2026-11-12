@@ -1,21 +1,39 @@
 **小肽序列优化**：基于 AlphaFold3 的小肽序列优化脚本仓库（蒙特卡洛 / 贝叶斯优化两种搜索策略，支持官方服务器与本地集群推理两种预测后端）。
 
-# 当前四靶标口径（2026-11-06）
+# 靶标配置（2026-11-10）
 
-当前默认生产扫描为 **HTR1A、BIN1、UNC13C、ASIC1A**，优化目标为：
+以后切换已支持的计算靶标，只修改 **`靶标配置.json`** 的 `启用靶标` 列表，然后重启编排进程。目前为 **HTR1A、ASIC1A**，BIN1、UNC13C 暂停，已有预测保留：
 
-$$\text{objective}=\text{ipTM}_{HTR1A}\times\text{ipTM}_{BIN1}\times\text{ipTM}_{UNC13C}\times\text{ipTM}_{ASIC1A}$$
+```json
+{"启用靶标": ["HTR1A", "ASIC1A"]}
+```
 
-- `小肽数据库.PRODUCT_TARGETS = ("HTR1A", "BIN1", "UNC13C", "ASIC1A")` 是唯一因子开关；缺任一因子的序列不进入正式 `BEST_TOP10.csv`，不会回退成 HTR1A 单目标榜单。
+$$\text{objective}=\prod_{t\in\text{启用靶标}}\text{ipTM}_{t}$$
+
+- `小肽数据库.PRODUCT_TARGETS` 从配置读取；生产默认名单、补采因子、贝叶斯默认值、排名筛选和显示列都跟随它。缺任一当前因子的序列不进入正式排名。
+- Shell 启动器、看门狗和排队作业启动时运行 `python 小肽数据库.py 靶标` 读取同一配置；cron 不再保存靶标名单，旧 `PEPOPT_TARGETS` 环境值不覆盖配置。
+- 名单变化后，生产启动时自动备份旧主表及统计，再按保留的真实样本重建当前乘积和排名；配置不变则不重复重建。已有 BIN1、UNC13C 等预测结果不会删除。
+- 支持 HTR1A、ASIC1A、BIN1、UNC13C，必须包含 HTR1A。空名单、重复或未知名称直接报错，不回退默认值。测试或独立战役可通过 `PEPOPT_TARGET_CONFIG` 指向另一份配置文件，而不是再定义一份名单。
 - ASIC1A 使用同源三聚体 B/C/D，肽—ASIC1A 分数取 A 链对三亚基界面 ipTM 的最大值；每个拷贝都使用 `Asic1a_9E4E.cif` 派生的 **A 链单链模板**。`小肽模板.py` 已生成并校验索引映射：526 个查询残基全部比对，517 个一致。
 - 模板派生文件为 `af3适配/Asic1a_9E4E_chainA.cif` 和 `af3适配/Asic1a_9E4E_template.json`。原始 CIF 保持不变。修改原始 CIF 或 `ASIC1A_SEQ` 后必须运行 `python 小肽模板.py prepare`。
-- 默认 SLURM 分区/账号为 `bme_gpu` / `liuzhen1`，显卡类型明确为 `NVIDIAA10080GBPCIe`，token 上限 5120，flash attention 为 `triton`。UNC13C 不会被提交到 40GB 卡或 V100。
+- 默认 SLURM 分区/账号为 `bme_gpu` / `liuzhen1`，长期请求为 A100 80GB；HQ 可按显存范围使用其他兼容 GPU，token 上限为 5120，attention 随实际 worker 选择。
 - 推理环境已迁移到 `/public_bme2/Share200T/管吉松/envs/af3`，其他用户只读可用，无需各自安装 conda 环境；项目固定使用 `/public_bme2/Share200T/管吉松/envs/af3/bin/python`。AF3/JAX/PyHMMER/HMMER 已安装，A100 实测和 9E4E 模板解析通过。离线重建缓存在 `/public_bme2/Share200T/管吉松/envs/af3-build-cache`。
 - 新数据库为 `/public_bme2/Share200T/管吉松/peptide_opt_db_four_target_9e4e`，已初始化：1404 条注册序列、1388 条带历史评分；旧主表不可读时从 AF3 summary 恢复数值。首次启动自动导入旧库的注册表和 HTR1A/BIN1/UNC13C 数值，**不导入旧 ASIC1A 结果及二因子 obj_* 统计**。旧库主表与结果目录保持只读复用；MSA 缓存继续共享。
-- 可先演练初始化：`python 小肽数据库.py init-four-target --dry-run`；正式运行仍为 `./运行.sh loop`。`./运行.sh bo` 同样使用四因子乘积，输出到 `output_bo_four_target/`。
-- 离线回归：`PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -s tests -v`。
+- 可先演练初始化：`python 小肽数据库.py init-four-target --dry-run`；正式运行仍为 `./运行.sh loop`。`./运行.sh bo` 同样读取当前名单，输出目录按靶标组合隔离。
+- 离线回归：`PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -s 测试 -p test_four_targets.py -v`。
+- 查看当前乘积分前五名：`python 查看前五.py`。
 
-> 下文 2026-10 的“两靶标生产口径”“V100 搁置 UNC13C/ASIC1A”及旧账号说明均为历史记录，不再描述当前默认配置。legacy 蒙特卡洛/云端入口不代表四靶标生产链路；ASIC1A 的指定模板任务只能使用本地 AF3 后端。
+## HQ 调度（2026-11-10）
+
+- 生产节点内入口只走 HQ：提交、查询、补队列或任务执行失败立即抛错，不允许整包直跑回退，`PEPOPT_HQ_MODE=0` 不再提供旁路。部分提交失败时，异常会列出已提交任务 ID；这些任务仍由 HQ 管理，不自动重提。
+- 普通新候选优先级为 0。历史缺项补算为 `20 + 缺失靶标数`；统计整理为 `20 + ceil(P*N-M)`（至少补 1 个），爬山的单次新样本请求缺口为 1。基础值由 `PEPOPT_RESAMPLE_PRIORITY` 设置，必须为正数。
+- 历史缺项仍先按已有靶标 ipTM 乘积选入批次，再为每个任务分别附上缺口优先级。统计补采先按缺口排序，再限制每批条数。
+- 相同优先级按提交顺序执行。大任务放不进当前小节点时，允许兼容的小任务回填；不抢占已经运行的预测，也不迁移旧队列。
+- 等待期间按配置补充队列，默认让每种启用靶标各有至少一个 waiting 任务，运行中任务不计入该数量。`PEPOPT_QUEUE_MIN_PER_TARGET` 可调；无候选、停止请求或临近时限时不再派发。
+- 显存上限按体系 token/bucket 估算，下限为上限的一半；原肽 HTR1A/BIN1/ASIC1A/UNC13C 分别声明 `5:10`、`6.5:13`、`22:44`、`32.5:65` GiB。这是尚未按峰值标定的初始模型，不是官方公式；调度资源名为 `gpumem`。实际每卡显存达到上限时维持原优先级并关闭统一内存，处于范围内时降一级且启用统一内存，低于下限时不运行。允许妥协不等于已实测保证成功或吞吐量不变，仍需足够的主机内存。
+- Slurm 请求按每个分区的实际显存档位逐档展开：从高于全部等待任务最大上限的最小档开始向下，每档一个；若分区没有更大档位，则从最大档开始。在提交名额耗尽、档位耗尽、等待任务耗尽或后续档位均低于全部任务下限时停止。已有的大卡等待不取消，同档位的不同 GPU 子型号不重复提交。`运行.sh loop` 和五分钟看门狗均补齐缺失档位，不再因已有一个长驻请求就停止检查。
+
+> 下文固定“两靶标”“四靶标”的名单及旧账号说明均为历史记录，不再描述当前默认配置。legacy 蒙特卡洛/云端入口不代表当前生产链路；ASIC1A 的指定模板任务只能使用本地 AF3 后端。
 
 # 简介
 

@@ -88,16 +88,33 @@ elif [ -z "$AF3_ENV_PREFIX" ]; then
 fi
 [ -n "$AF3_HMMER_DIR" ] && export PATH="$AF3_HMMER_DIR:$PATH"
 
+if [[ "${TASKCTL_GPU_COMPUTE_CAP:-}" == 7.* ]]; then
+    AF3_FLASH_ATTN=xla
+    AF3_NEED_XLA_7X_FLAG=1
+elif [[ "${TASKCTL_GPU_COMPUTE_CAP:-}" == 8.* || "${TASKCTL_GPU_COMPUTE_CAP:-}" == 9.* ]]; then
+    AF3_FLASH_ATTN=triton
+    AF3_NEED_XLA_7X_FLAG=0
+fi
+
 # ---- CUDA 算力 7.x GPU （V100/T4 等）必须禁用该 HLO 融合通道，否则 JAX 启动即报错 ----
 if [ "$AF3_NEED_XLA_7X_FLAG" = "1" ]; then
     export XLA_FLAGS="${XLA_FLAGS:+$XLA_FLAGS }--xla_disable_hlo_passes=custom-kernel-fusion-rewriter"
 fi
 
-# ---- 官方推荐的 unified memory：显存不足时溢出到主机内存以防 OOM（代价是变慢）----
-# 见 alphafold3/docs/performance.md 的 "Unified Memory" 一节
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
-export TF_FORCE_UNIFIED_MEMORY=true
-export XLA_CLIENT_MEM_FRACTION=3.2
+case "${TASKCTL_GPU_MEMORY_COMPROMISED:-0}" in
+    1)
+        export TF_FORCE_UNIFIED_MEMORY=true
+        export XLA_CLIENT_MEM_FRACTION=3.2
+        echo "显存妥协：启用统一内存"
+        ;;
+    0)
+        export TF_FORCE_UNIFIED_MEMORY=false
+        export XLA_CLIENT_MEM_FRACTION=0.95
+        echo "显存充足：关闭统一内存"
+        ;;
+    *) echo "显存妥协标志无效，拒绝运行 AF3" >&2; exit 2 ;;
+esac
 
 # 在导入 JAX 前配置跨进程持久化编译与 autotune 缓存。
 # 每次新 Python 进程都能读取，不再依赖 HQ worker 的长生命周期。
@@ -121,6 +138,10 @@ cd "$AF3_WORK_DIR" || { echo "❌ 无法进入 $AF3_WORK_DIR" >&2; exit 2; }
 # HQ 与整包直跑都先补 MSA；显式 9E4E 模板缺 MSA 时 embed 会非零退出。
 # 不使用 || true：AF3 不允许 templates 已设置而 MSA 未设置。
 json_inputs=("$AF3_BUNDLE_DIR"/*.json)
+bundle_names=()
+for input_json in "${json_inputs[@]}"; do
+    bundle_names+=("$(basename "$input_json" .json)")
+done
 if [ ${#json_inputs[@]} -gt 0 ]; then
     "$AF3_PYTHON" "$AF3_MSA_CACHE" embed "${json_inputs[@]}" || exit $?
 fi
@@ -144,10 +165,15 @@ has_result() {
 
 # consolidate_outputs —— 把 AF3 生成的 <名>_<时间戳>/ 兄弟目录折叠进规范目录 <名>/，使规范目录成为唯一结果位置（登录节点据此收割/去重/打包，也不再对已完成任务重跑）。多次重跑时任意一份含 summary 的兄弟保留到规范目录。
 consolidate_outputs() {
-    local sib base canon entry b
+    local sib base canon entry b name owned
     for sib in "$AF3_OUT_DIR"/*_[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]_[0-9][0-9][0-9][0-9][0-9][0-9]; do
         [ -d "$sib" ] || continue
         base="$(basename "$sib")"
+        owned=0
+        for name in "${bundle_names[@]}"; do
+            [[ "${base%_*_*}" == "$name" ]] && owned=1
+        done
+        [[ "$owned" -eq 1 ]] || continue
         canon="$AF3_OUT_DIR/${base%_*_*}"      # 去掉末尾 _<8位>_<6位>
         mkdir -p "$canon"
         if ! compgen -G "$canon/*_summary_confidences.json" > /dev/null; then

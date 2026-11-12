@@ -25,7 +25,7 @@ DISABLED="$RUNS_DIR/loop.disabled"
 LOCK="$RUNS_DIR/循环看门狗.lock"
 WLOG="$RUNS_DIR/循环看门狗.log"
 JOB_NAME="pepopt-loop"
-TARGETS="${PEPOPT_TARGETS:-HTR1A,BIN1,UNC13C,ASIC1A}"
+TARGETS="$("${TASKCTL_PYTHON:-python3}" "$REPO/小肽数据库.py" 靶标)" || exit 4
 CYCLE_SEQS="${PEPOPT_CYCLE_SEQS:-24}"
 
 cd "$REPO" || exit 1
@@ -48,14 +48,7 @@ fi
 # ---- 用户显式停用 → 尊重，不提交 ----
 [[ -f "$DISABLED" ]] && exit 0
 
-# ---- 队列里已有循环作业？----
-alive="$(squeue -u "${USER:-$LOGNAME}" -h -n "$JOB_NAME" -o '%i' 2>/dev/null | tr -d ' ')"
-if [[ -n "$alive" ]]; then
-  # 正常路径：什么都不做，也不刷日志（避免 5 天里堆出上万行空记录）
-  exit 0
-fi
-
-log "队列中无 $JOB_NAME 作业，准备续交（靶标=$TARGETS，每轮 $CYCLE_SEQS 序列）"
+log "检查逐档申请缺口（靶标=$TARGETS，每轮 $CYCLE_SEQS 序列）"
 
 # 预检查由 submit_loop_job() 内部把关（PREFLIGHT_OK 为假时它会拒绝提交）。
 # 这里把 stdout/stderr 一并留痕到日志，便于事后排查“为什么没交上去”。
@@ -72,8 +65,8 @@ PY
 )"
 rc=$?
 echo "$out" | tail -6 | sed 's/^/    | /' >> "$WLOG"
-if echo "$out" | grep -qE "submit: [0-9]+"; then
-  log "已续交，jobid=$(echo "$out" | grep -oE 'submit: [0-9]+' | awk '{print $2}')"
+if [[ "$rc" -eq 0 ]]; then
+  log "逐档申请检查完成；已有档位不重复提交"
 else
   log "提交未成功（rc=$rc），下个周期重试"
 fi

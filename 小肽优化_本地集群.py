@@ -886,28 +886,80 @@ def build_loop_job_cmd(targets, cycle_seqs, max_hours=None):
     ], budget_h
 
 
+def 逐档启动循环(targets, cycle_seqs, max_hours=None):
+    import importlib.util
+    from pathlib import Path
+    import 小肽数据库 as 数据库
+
+    项目 = Path(__file__).resolve().parent
+    中间层 = Path(os.environ.get("TASKCTL_HOME", 项目.parent / "任务中间层")).resolve()
+    状态目录 = Path(os.environ.get("TASKCTL_STATE", 中间层 / "运行状态"))
+    环境 = dict(os.environ, HQ_SERVER_DIR=str(状态目录 / "server"))
+    环境["LD_LIBRARY_PATH"] = "/public_bme2/Share200T/管吉松/envs/af3/lib:" + 环境.get("LD_LIBRARY_PATH", "")
+    环境["TASKCTL_AUTO_JOB_NAMES"] = ",".join((LOOP_JOB_NAME, "pepopt-small"))
+    服务 = subprocess.run([str(中间层 / "bin" / "hq"), "server", "info"], env=环境, capture_output=True, text=True, timeout=20)
+    if 服务.returncode == 0:
+        subprocess.run([sys.executable, str(中间层 / "自动扩容.py"), "start"], env=环境, capture_output=True, text=True, check=True, timeout=60)
+        return {"主服务在线": True, "plan": []}
+    if tuple(targets) != tuple(数据库.PRODUCT_TARGETS):
+        raise ValueError("逐档启动靶标必须与靶标配置一致")
+    import 小肽优化_节点内 as 节点入口
+
+    需求目录 = Path(数据库.db_root()) / "逐档启动输入"
+    需求目录.mkdir(parents=True, exist_ok=True)
+    优先级 = {}
+    已准备 = {}
+    for 路径 in sorted((Path(数据库.db_root()) / "cycles").glob("*/*.json")) + sorted((Path(数据库.db_root()) / "queue_inputs").glob("*.json")):
+        if 路径.stem.rsplit("_", 1)[-1].upper() in targets and not 路径.name.startswith("_"):
+            已准备[路径.stem] = 路径
+    for 路径 in list(已准备.values())[:max(1, int(cycle_seqs)) * len(targets)]:
+        shutil.copyfile(路径, 需求目录 / 路径.name)
+    if not 已准备:
+        注册表, 评分表 = 数据库.load_sequence_registry(), 数据库.load_database()
+        待补 = [项["peptide"] for 标签, 项 in 注册表.items() if 项.get("peptide") and any(评分表.get(标签, {}).get(f"iptm_{靶标.lower()}") is None for 靶标 in targets)][:max(1, int(cycle_seqs))]
+        节点入口.prepare_cycle(待补, targets, str(需求目录))
+    输入列表 = [路径 for 路径 in sorted(需求目录.glob("*.json")) if 路径.stem.rsplit("_", 1)[-1].upper() in targets and not 数据库.find_summary(数据库.canonical_dir(路径.stem.rsplit("_", 1)[0], 路径.stem.rsplit("_", 1)[-1].upper()))]
+    适配规范 = importlib.util.spec_from_file_location("逐档AF3需求", 项目 / "af3适配" / "af3任务.py")
+    适配层 = importlib.util.module_from_spec(适配规范)
+    适配规范.loader.exec_module(适配层)
+    请求列表 = []
+    for 编号, 路径 in enumerate(输入列表, 1):
+        下限, 上限 = 适配层.显存需求范围(str(路径))
+        请求列表.append({"job_id": 编号, "cpus": 6, "gpus": 1, "gpu_memory": 下限, "显存上限": 上限, "priority": 优先级.get(路径.stem, 0)})
+    状态目录.mkdir(parents=True, exist_ok=True)
+    配置路径 = 状态目录 / "逐档启动.json"
+    旧配置 = json.loads(配置路径.read_text()) if 配置路径.exists() else {}
+    启动环境 = {名称: 数值 for 名称, 数值 in 旧配置.get("环境", {}).items() if 名称 != "PEPOPT_TARGETS"}
+    启动环境.update({名称: 数值 for 名称, 数值 in os.environ.items() if 名称.startswith(("PEPOPT_", "TASKCTL_AUTO_")) and 名称 != "PEPOPT_TARGETS"})
+    命令, _ = build_loop_job_cmd(targets, cycle_seqs, max_hours)
+    导出 = next(参数 for 参数 in 命令 if 参数.startswith("--export="))
+    启动环境.update(dict(条目.split("=", 1) for 条目 in 导出.removeprefix("--export=ALL,").split(",") if "=" in 条目 and not 条目.startswith("PEPOPT_TARGETS=")))
+    启动环境["TASKCTL_AUTO_ACCOUNT"] = LOCAL_ACCOUNT
+    启动环境["TASKCTL_AUTO_JOB_NAMES"] = 环境["TASKCTL_AUTO_JOB_NAMES"]
+    启动环境.setdefault("TASKCTL_AUTO_MEMORY", "32G")
+    启动环境.setdefault("TASKCTL_AUTO_CPUS", "8")
+    作业输出 = subprocess.run(["squeue", "-h", "-u", os.environ.get("USER", ""), "-o", "%i|%j"], capture_output=True, text=True, check=True, timeout=20).stdout
+    保留作业 = [行.split("|", 1)[0] for 行 in 作业输出.splitlines() if "|" in 行 and 行.split("|", 1)[1] in (LOOP_JOB_NAME, "pepopt-small")]
+    配置 = {"作业脚本": str(项目 / "作业脚本" / "AF3循环作业.sh"), "请求": 请求列表, "保留作业": 保留作业, "环境": 启动环境}
+    临时路径 = 配置路径.with_suffix(f".tmp.{os.getpid()}")
+    临时路径.write_text(json.dumps(配置, ensure_ascii=False, indent=2), encoding="utf-8")
+    临时路径.replace(配置路径)
+    sys.path.insert(0, str(中间层))
+    扩容规范 = importlib.util.spec_from_file_location("逐档扩容入口", 中间层 / "自动扩容.py")
+    扩容器 = importlib.util.module_from_spec(扩容规范)
+    sys.modules[扩容规范.name] = 扩容器
+    扩容规范.loader.exec_module(扩容器)
+    return 扩容器.Controller(state=状态目录, 启动模式=True).tick(apply=True)
+
+
 def submit_loop_job(targets, cycle_seqs, max_hours=None):
-    """提交长驻循环作业；已在队列中则不重复提交。返回 jobid 或 None。"""
+    """按各可用分区的显存档位补齐长驻请求，不重复已有档位。"""
     if not PREFLIGHT_OK:
         print("  ⏸️  预检查未通过，跳过提交（请先补齐数据库/权重/工具条件）")
         return None
-    active = loop_job_active()
-    if active:
-        print(f"  ⏭️  无限循环作业已在队列：{active}（不重复提交）")
-        return None
-    cmd, budget_h = build_loop_job_cmd(targets, cycle_seqs, max_hours)
-    try:
-        out = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        jobid = out.stdout.strip().split()[-1]
-    except subprocess.CalledProcessError as e:
-        print(f"  ❌ sbatch 提交失败：{(e.stderr or '').strip() or e}")
-        return None
-    except FileNotFoundError as e:
-        print(f"  ❌ sbatch 提交失败：{e}")
-        return None
-    print(f"  🚀 已提交长驻循环作业 jobid={jobid}："
-          f"靶标={targets} | 每轮 {cycle_seqs} 序列 | 时间预算 {budget_h}h")
-    return jobid
+    结果 = 逐档启动循环(targets, cycle_seqs, max_hours)
+    print("逐档启动：", json.dumps(结果, ensure_ascii=False))
+    return 结果
 
 
 def estimate_tokens(input_json_path):
