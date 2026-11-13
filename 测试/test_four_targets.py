@@ -20,6 +20,8 @@ class FourTargetTests(unittest.TestCase):
         cls.tmp = tempfile.TemporaryDirectory(prefix="pepopt-four-test-")
         cls.root = Path(cls.tmp.name)
         cls.原靶标配置 = os.environ.get("PEPOPT_TARGET_CONFIG")
+        cls.原状态目录 = os.environ.get("TASKCTL_STATE")
+        os.environ["TASKCTL_STATE"] = str(cls.root / "任务状态")
         cls.测试配置 = cls.root / "靶标配置.json"
         cls.测试配置.write_text(json.dumps({"启用靶标": ["HTR1A", "ASIC1A"]}), encoding="utf-8")
         os.environ["PEPOPT_TARGET_CONFIG"] = str(cls.测试配置)
@@ -39,6 +41,10 @@ class FourTargetTests(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
+        if cls.原状态目录 is None:
+            os.environ.pop("TASKCTL_STATE", None)
+        else:
+            os.environ["TASKCTL_STATE"] = cls.原状态目录
         if cls.原靶标配置 is None:
             os.environ.pop("PEPOPT_TARGET_CONFIG", None)
         else:
@@ -118,11 +124,27 @@ class FourTargetTests(unittest.TestCase):
             调用.append(参数)
             return [项["info"] for 项 in 详情] if 参数[1] == "list" and 参数[0] == "job" else 工作者 if 参数[0] == "worker" else 详情
 
-        快照 = 汇总.读取HQ快照(查询)
+        快照 = 汇总.读取HQ快照(查询, 查询分区=lambda: {"slurm40": "bme_gpu"})
         self.assertEqual(len(快照["运行靶标"]), 1)
         self.assertEqual((快照["运行靶标"][0]["节点"], 快照["运行靶标"][0]["靶标"], 快照["运行靶标"][0]["每卡显存GiB"]), ("node40", "ASIC1A", 40))
+        self.assertEqual(快照["运行靶标"][0]["分区"], "bme_gpu")
         self.assertEqual([项["作业号"] for 项 in 快照["等待任务"]], [3])
         self.assertEqual(调用, [("job", "list", "--all"), ("job", "info", "1,2,3"), ("worker", "list")])
+
+    def test_汇总运行表按Slurm分配显示分区而非节点(self):
+        import 信息汇总 as 汇总
+
+        self.assertEqual(汇总.读取分配分区(lambda 参数: "100|bme_gpupub\n101|bme_gpu"), {"100": "bme_gpupub", "101": "bme_gpu"})
+        前五 = {"数据库": "只读库", "启用靶标": ["HTR1A", "ASIC1A"], "齐全记录数": 0, "记录": []}
+        记录 = {"节点": "node40", "分区": "bme_gpu", "每卡显存GiB": 40, "靶标": "ASIC1A", "HQ作业号": 1, "任务名": "s000_asic1a", "Slurm作业号": "101"}
+        数据 = {"查询时间": "2026-11-13", "前五": 前五, "运行靶标": [记录], "Slurm等待": [], "HQ等待": [], "错误": {}}
+        原数据 = json.dumps(数据)
+        文本 = 汇总.格式化汇总(数据)
+        运行表 = 文本.split("二、计算中的靶标及分区", 1)[1].split("三、Slurm", 1)[0]
+        self.assertIn("分区", 运行表.splitlines()[1])
+        self.assertIn("bme_gpu", 运行表)
+        self.assertNotIn("node40", 运行表)
+        self.assertEqual(json.dumps(数据), 原数据)
 
     def test_汇总Slurm候选节点区分显卡型号和排除约束(self):
         import 信息汇总 as 汇总
@@ -174,7 +196,7 @@ class FourTargetTests(unittest.TestCase):
         self.assertEqual(结果["Slurm等待"], [])
         self.assertIsNone(结果["HQ等待"])
         文本 = 汇总.格式化汇总(结果)
-        self.assertTrue(all(标题 in 文本 for 标题 in ("一、当前前五", "二、计算中的靶标及节点", "三、Slurm 层等待分配", "四、HQ 层等待任务")))
+        self.assertTrue(all(标题 in 文本 for 标题 in ("一、当前前五", "二、计算中的靶标及分区", "三、Slurm 层等待分配", "四、HQ 层等待任务")))
         self.assertIn("查询失败：HQ服务离线", 文本)
         self.assertNotIn("HQ 当前没有等待任务", 文本)
 
@@ -603,7 +625,16 @@ class FourTargetTests(unittest.TestCase):
                     refiller.refill([])
                     self.assertEqual(adapter.submit.call_count, previous)
 
-    def test_hq_wait_polls_refill_while_owned_tasks_run(self):
+    def test_HQ事件仅在任务或worker状态变化时刷新队列(self):
+        适配器 = self.node.load_hq_adapter()
+        for 类型 in ("task-started", "task-finished", "task-failed", "task-canceled", "task-aborted", "worker-connected", "worker-lost", "server-stop"):
+            self.assertTrue(适配器.需要刷新队列({"event": {"type": 类型}}))
+        for 类型 in ("job-created", "job-completed", "worker-overview"):
+            self.assertFalse(适配器.需要刷新队列({"event": {"type": 类型}}))
+        with self.assertRaisesRegex(ValueError, "事件内容无效"):
+            适配器.需要刷新队列({"event": None})
+
+    def test_HQ完成事件触发回调且不定时轮询(self):
         spec = importlib.util.spec_from_file_location("af3_wait", ROOT / "af3适配" / "af3任务.py")
         adapter = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(adapter)
@@ -611,10 +642,33 @@ class FourTargetTests(unittest.TestCase):
         running = [{"id": 7, "name": "s000_htr1a", "task_stats": {"running": 1}}]
         finished = [{"id": 7, "name": "s000_htr1a", "task_stats": {"finished": 1}}]
         with patch.object(adapter, "queue_jobs", side_effect=[running, finished]), \
+                patch.object(adapter, "任务事件流", return_value=iter([{"event": {"type": "task-finished", "job": 7, "task": 0}}])), \
                 patch.object(adapter.time, "sleep") as sleep:
             adapter.wait([7], on_poll=callback, poll_seconds=1)
             self.assertEqual(callback.call_count, 2)
-            self.assertEqual(sleep.call_count, 1)
+            sleep.assert_not_called()
+
+    def test_全局非当前批次完成事件同样立即触发收割并忽略历史终态(self):
+        适配器 = self.node.load_hq_adapter()
+        运行 = [{"id": 7, "task_stats": {"running": 1}}, {"id": 9, "task_stats": {"running": 1}}, {"id": 2, "is_open": False, "task_stats": {"finished": 1}}]
+        其他完成 = [运行[0], {"id": 9, "task_stats": {"finished": 1}}, 运行[2]]
+        全部完成 = [{"id": 7, "task_stats": {"finished": 1}}, *其他完成[1:]]
+        事件 = [{"event": {"type": "task-finished", "job": 2}}, {"event": {"type": "worker-overview"}}, {"event": {"type": "task-finished", "job": 9}}, {"event": {"type": "task-finished", "job": 9}}, {"event": {"type": "task-finished", "job": 7}}]
+        回调 = Mock()
+        with patch.object(适配器, "queue_jobs", side_effect=[运行, 其他完成, 全部完成]) as 查询, patch.object(适配器, "任务事件流", return_value=iter(事件)), patch.object(适配器.time, "sleep") as 休眠:
+            适配器.wait([7], on_poll=回调)
+        self.assertEqual(查询.call_count, 3)
+        self.assertEqual(回调.call_args_list[1].args[0], 其他完成)
+        休眠.assert_not_called()
+
+    def test_事件流断开或server停止均报错且不回退轮询(self):
+        适配器 = self.node.load_hq_adapter()
+        for 事件 in ([], [{"event": {"type": "server-stop"}}]):
+            with self.subTest(事件=事件), patch.object(适配器, "queue_jobs", return_value=[{"id": 7, "task_stats": {"running": 1}}]) as 查询, patch.object(适配器, "任务事件流", return_value=iter(事件)), patch.object(适配器.time, "sleep") as 休眠:
+                with self.assertRaisesRegex(RuntimeError, "事件流|server 已停止"):
+                    适配器.wait([7])
+                self.assertEqual(查询.call_count, 1)
+                休眠.assert_not_called()
 
     def test_harvest_does_not_move_active_worker_output(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -629,6 +683,38 @@ class FourTargetTests(unittest.TestCase):
                 self.assertTrue(summary.is_file())
                 self.assertFalse(Path(self.db.canonical_dir("s000", "ASIC1A")).exists())
                 self.assertEqual(self.db.harvest_results()[0], 1)
+
+    def test_等待队列已满时仍增量入库且不递归触发补采(self):
+        with tempfile.TemporaryDirectory() as 目录, patch.dict(os.environ, {"PEPOPT_DB_ROOT": 目录, "PEPOPT_RESULTS_DIR": str(Path(目录) / "af3_results")}):
+            self.db.paths(ensure=True)
+            self.db.register_sequence("s000", self.common.ORIG_TAIL, self.common.SEQ_202)
+            结果目录 = Path(self.db.canonical_dir("s000", "HTR1A"))
+            结果目录.mkdir()
+            (结果目录 / "s000_htr1a_summary_confidences.json").write_text(json.dumps({"iptm": 0.7, "ranking_score": 0.7}), encoding="utf-8")
+            适配器 = Mock()
+            适配器.waiting_target_counts.return_value = {"HTR1A": 1, "ASIC1A": 1}
+            补队列 = self.node.HqQueueRefiller(self.db.PRODUCT_TARGETS, time.time() + 86400, 适配器)
+            活动任务 = [{"name": "s100_asic1a", "task_stats": {"running": 1}}]
+            with patch.object(self.inf.seq_sample, "ingest_new_records") as 统计入库, patch.object(self.inf, "climb_new_records") as 爬山, patch.object(self.db, "refresh_best"):
+                补队列.refill(活动任务)
+                self.assertEqual(self.db.load_database()["s000"]["iptm_htr1a"], 0.7)
+                self.assertTrue((结果目录 / ".harvested").exists())
+                self.assertEqual(self.node.全库靶标缺口(["HTR1A"]), {"HTR1A": 0})
+                self.assertEqual(self.inf.增量收割基础结果()[0], 0)
+                统计入库.assert_not_called()
+                爬山.assert_not_called()
+                适配器.submit.assert_not_called()
+
+    def test_提前入库的记录用持久爬山标志恢复且不重复已完成爬山(self):
+        with tempfile.TemporaryDirectory() as 目录, patch.dict(os.environ, {"PEPOPT_DB_ROOT": 目录}):
+            记录 = [{"tag": 标签, "peptide": self.common.SEQ_202, "iptm_htr1a": "0.7", "iptm_asic1a": "0.3", "obj_n": "5", "obj_climb": 标志} for 标签, 标志 in (("pending", "0"), ("done", "1"))]
+            self.db._rewrite_master(记录)
+            self.assertEqual(self.db.load_database()["done"]["obj_climb"], 1)
+            with patch.object(self.db, "harvest_results", return_value=(0, {}, set())), patch.object(self.db, "refresh_best"), patch.object(self.inf.seq_sample, "ingest_new_records", return_value=0), patch.object(self.inf, "db_evaluated_rows", return_value=[]):
+                self.assertEqual(self.inf.harvest_and_report(self.db.PRODUCT_TARGETS), (0, {"pending"}))
+                记录[0]["obj_climb"] = "1"
+                self.db._rewrite_master(记录)
+                self.assertEqual(self.inf.harvest_and_report(self.db.PRODUCT_TARGETS), (0, set()))
 
     def test_hq_error_never_falls_back_to_direct_execution(self):
         with patch.object(self.node, "run_af3_cycle_hq", side_effect=RuntimeError("HQ unavailable")), \

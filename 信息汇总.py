@@ -1,4 +1,4 @@
-"""只读汇总前五序列、计算中的靶标和节点、Slurm 等待分配及 HQ 等待任务。"""
+"""只读汇总前五序列、计算中的靶标和分区、Slurm 等待分配及 HQ 等待任务。"""
 
 import argparse
 import csv
@@ -40,7 +40,7 @@ def 读取前五():
     return {"数据库": 排名.db.db_root(), "启用靶标": list(排名.TARGETS), "齐全记录数": len(记录), "记录": 前五}
 
 
-def 读取运行靶标(作业详情, 工作者列表):
+def 读取运行靶标(作业详情, 工作者列表, 查询分区=None):
     工作者索引 = {工作者["id"]: 工作者 for 工作者 in 工作者列表 if 工作者.get("ended") is None}
     记录列表 = []
     for 作业 in 作业详情:
@@ -57,10 +57,13 @@ def 读取运行靶标(作业详情, 工作者列表):
                 raise RuntimeError(f"运行任务 {作业['info']['id']} 的 worker 信息缺失，请重新查询")
             容量 = worker_capacity(工作者)
             记录列表.append({"节点": 工作者["configuration"]["hostname"], "每卡显存GiB": 容量.get("gpumem", 0) / max(1, 容量.get("gpus", 0)), "靶标": 靶标, "HQ作业号": 作业["info"]["id"], "任务名": 名称, "Slurm作业号": str((工作者.get("allocation") or {}).get("id", "未关联"))})
-    return sorted(记录列表, key=lambda 记录: (记录["节点"], 记录["HQ作业号"]))
+    分配分区 = (查询分区 or 读取分配分区)() if 记录列表 else {}
+    for 记录 in 记录列表:
+        记录["分区"] = 分配分区.get(记录["Slurm作业号"], "未关联" if 记录["Slurm作业号"] == "未关联" else "未知")
+    return sorted(记录列表, key=lambda 记录: (记录["分区"], 记录["HQ作业号"]))
 
 
-def 读取HQ快照(查询):
+def 读取HQ快照(查询, 查询分区=None):
     作业列表 = 查询("job", "list", "--all")
     活跃编号 = [作业["id"] for 作业 in 作业列表 if any((作业.get("task_stats") or {}).get(状态, 0) for 状态 in ("running", "waiting"))]
     详情 = 查询("job", "info", ",".join(map(str, 活跃编号))) if 活跃编号 else []
@@ -76,7 +79,7 @@ def 读取HQ快照(查询):
             return [作业 for 作业 in 详情 if 作业["info"]["id"] in 编号]
         raise ValueError(f"未支持的快照查询：{参数}")
 
-    return {"运行靶标": 读取运行靶标(详情, 工作者), "等待任务": HQ队列.读取等待任务(快照查询)}
+    return {"运行靶标": 读取运行靶标(详情, 工作者, 查询分区), "等待任务": HQ队列.读取等待任务(快照查询)}
 
 
 def 运行命令(参数):
@@ -84,6 +87,16 @@ def 运行命令(参数):
     if 结果.returncode:
         raise RuntimeError(f"{参数[0]} 查询失败：{结果.stderr.strip() or 结果.stdout.strip()}")
     return 结果.stdout.strip()
+
+
+def 读取分配分区(运行=运行命令):
+    输出 = 运行(["squeue", "-h", "-u", getpass.getuser(), "-o", "%i|%P"])
+    分配分区 = {}
+    for 行 in csv.reader(输出.splitlines(), delimiter="|"):
+        if len(行) != 2:
+            raise ValueError("Slurm 作业分区列数异常，无法准确显示运行分区")
+        分配分区[行[0]] = 行[1]
+    return 分配分区
 
 
 def 读取Slurm等待(运行=运行命令):
@@ -178,12 +191,12 @@ def 格式化汇总(汇总):
         文本.append("固定区：" + FIXED_A)
         数据行 = [[行["排名"], 行["序列"].removeprefix(FIXED_A), *[f"{行['分量'][靶标]:.2f}" for 靶标 in 前五["启用靶标"]], f"{行['乘积']:.6f}", 行["样本数"]] for 行 in 前五["记录"]]
         文本.append(表格文本(["排名", "可变区", *前五["启用靶标"], "乘积", "样本"], 数据行, "没有评分齐全的序列。"))
-    文本.extend(["", "二、计算中的靶标及节点"])
+    文本.extend(["", "二、计算中的靶标及分区"])
     if 汇总["运行靶标"] is None:
         文本.append("查询失败：" + 汇总["错误"]["HQ"])
     else:
-        数据行 = [[行["节点"], f"{行['每卡显存GiB']:g}", 行["靶标"], 行["HQ作业号"], 行["任务名"], 行["Slurm作业号"]] for 行 in 汇总["运行靶标"]]
-        文本.append(表格文本(["节点", "显存(GiB/卡)", "靶标", "HQ ID", "任务名", "Slurm ID"], 数据行, "当前没有运行中的 GPU 计算任务。"))
+        数据行 = [[行["分区"], f"{行['每卡显存GiB']:g}", 行["靶标"], 行["HQ作业号"], 行["任务名"], 行["Slurm作业号"]] for 行 in 汇总["运行靶标"]]
+        文本.append(表格文本(["分区", "显存(GiB/卡)", "靶标", "HQ ID", "任务名", "Slurm ID"], 数据行, "当前没有运行中的 GPU 计算任务。"))
     文本.extend(["", "三、Slurm 层等待分配"])
     if 汇总["Slurm等待"] is None:
         文本.append("查询失败：" + 汇总["错误"]["Slurm"])

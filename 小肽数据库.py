@@ -327,6 +327,7 @@ def load_database():
             "obj_max": _to_float(r["obj_max"]),
             "obj_alpha": _to_float(r["obj_alpha"]),
             "obj_beta": _to_float(r["obj_beta"]),
+            "obj_climb": _to_float(r["obj_climb"]),
         }
     return by_tag
 

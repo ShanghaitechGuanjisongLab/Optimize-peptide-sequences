@@ -534,12 +534,23 @@ def submit_candidates(seqs, active_targets):
     return n
 
 
+def 增量收割基础结果(exclude_jobs=None):
+    """单写者在等待轮询中只收割基础结果，不启动统计补采或爬山。"""
+    新增数, 跳过, 标签 = db.harvest_results(exclude_jobs=exclude_jobs)
+    if 新增数:
+        db.refresh_best(top_n=TOP_N_BEST)
+        print(f"  基础结果增量入库 {新增数} 条，统计与爬山留待原流程处理", flush=True)
+    return 新增数, 标签
+
+
 def harvest_and_report(active_targets, new_sample_fn=None, exclude_jobs=None):
     """收割新完成结果入库，序贯采样入库（β 统计量），刷新 BEST_TOP10，打印统计。返回（收割新增条数，新增 tags 集合）。
 
-    new_sample_fn 透传给数据库整理做补采（真跑 AF3 新 seed）；留 None 时整理只消费池内免费样本。"""
+    new_sample_fn 透传给数据库整理做补采（真跑 AF3 新 seed）；留 None 时整理只消费池内免费样本。返回的 tags 也包含已提前增量入库、但 obj_climb 尚未完成的记录，支持重启后继续首次爬山。"""
     n_new, skipped, new_tags = db.harvest_results(exclude_jobs=exclude_jobs)
     n_fit = seq_sample.ingest_new_records(new_sample_fn)
+    待爬山记录 = {标签 for 标签, 行 in db.load_database().items() if (行.get("obj_n") or 0) > 0 and 行.get("obj_climb") != 1 and all(行.get(f"iptm_{靶标.lower()}") is not None for 靶标 in active_targets)}
+    new_tags = set(new_tags) | 待爬山记录
     if n_fit:
         print(f"  🧮 序贯采样入库 {n_fit} 条（β 统计量已写入 obj_* 列）", flush=True)
     if n_new:

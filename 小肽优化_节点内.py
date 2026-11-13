@@ -186,6 +186,8 @@ class HqQueueRefiller:
         self.directory = os.path.join(db.db_root(), "queue_inputs")
 
     def refill(self, jobs):
+        活动任务 = {任务.get("name") for 任务 in jobs if (任务.get("task_stats") or {}).get("running") or (任务.get("task_stats") or {}).get("waiting")}
+        inf.增量收割基础结果(exclude_jobs=活动任务)
         if _STOP or time.time() >= self.deadline - SAFETY_MARGIN_SEC:
             return
         counts = self.adapter.waiting_target_counts(jobs, self.targets)

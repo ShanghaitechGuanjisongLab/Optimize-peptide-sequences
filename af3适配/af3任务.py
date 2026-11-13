@@ -30,6 +30,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # 任务控制.sh 在通用任务中间层（与本项目平级的 任务中间层/）；TASKCTL_HOME 可覆盖。本目录是 AF3 专属适配层，中间层本身不含任何任务适配。
 _MW = os.environ.get("TASKCTL_HOME") or os.path.join(HERE, "..", "..", "任务中间层")
 TASKCTL = os.path.join(_MW, "任务控制.sh")
+HQ程序 = os.path.join(_MW, "bin", "hq")
 MSA_CACHE = os.path.join(HERE, "msa缓存.py")
 
 
@@ -234,11 +235,49 @@ def submit_all(jsons, env: dict, task_root: str, priority: int = 0,
     return ids
 
 
+def 需要刷新队列(事件):
+    内容 = 事件.get("event")
+    if not isinstance(内容, dict):
+        raise ValueError("HQ 事件内容无效")
+    return 内容.get("type") in ("task-started", "task-finished", "task-failed", "task-canceled", "task-aborted", "worker-connected", "worker-lost", "server-stop")
+
+
+def 任务事件流():
+    环境 = dict(os.environ)
+    环境.setdefault("HQ_SERVER_DIR", os.path.join(环境.get("TASKCTL_STATE", os.path.join(_MW, "运行状态")), "server"))
+    环境["LD_LIBRARY_PATH"] = 环境.get("HQ_LIBSTDCPP", "/public_bme2/Share200T/管吉松/envs/af3/lib") + ":" + 环境.get("LD_LIBRARY_PATH", "")
+    进程 = subprocess.Popen([HQ程序, "journal", "stream"], env=环境, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
+    try:
+        for 行 in 进程.stdout:
+            事件 = json.loads(行)
+            if not isinstance(事件, dict):
+                raise ValueError("HQ 事件必须是 JSON 对象")
+            yield 事件
+        错误 = 进程.stderr.read().strip()
+        返回码 = 进程.wait()
+        raise RuntimeError(f"HQ 事件流中断（退出码 {返回码}）：{错误 or '连接已关闭'}")
+    finally:
+        进程.stdout.close()
+        if 进程.poll() is None:
+            进程.terminate()
+        try:
+            进程.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            进程.kill()
+            进程.wait(timeout=5)
+        进程.stderr.close()
+
+
 def wait(ids, on_poll=None, poll_seconds=15):
-    """等待全部成功，失败、取消或队列异常立即抛错；等待时可补充队列。"""
-    owned = set(ids)
-    while owned:
+    """阻塞订阅全局 HQ 状态事件，不定时轮询；on_poll 保留为状态事件后的兼容回调。"""
+    owned = {int(编号) for 编号 in ids}
+    if not owned:
+        return
+    已终态作业 = set()
+
+    def 校验与回调():
         jobs = queue_jobs()
+        已终态作业.update(任务["id"] for 任务 in jobs if not 任务.get("is_open", False) and not any((任务.get("task_stats") or {}).get(状态) for 状态 in ("running", "waiting")) and any((任务.get("task_stats") or {}).get(状态) for 状态 in ("finished", "failed", "canceled", "aborted")))
         tracked = {job["id"]: job for job in jobs if job["id"] in owned}
         if owned - tracked.keys():
             raise RuntimeError(f"HQ 队列缺少待等待任务：{sorted(owned - tracked.keys())}")
@@ -256,8 +295,28 @@ def wait(ids, on_poll=None, poll_seconds=15):
             if any(not (job.get("task_stats") or {}).get("finished")
                    for job in tracked.values()):
                 raise RuntimeError("HQ 任务既未运行也未成功完成，状态异常")
-            return
-        time.sleep(poll_seconds)
+            return True
+        return False
+
+    if 校验与回调():
+        return
+    事件流 = 任务事件流()
+    try:
+        for 事件 in 事件流:
+            if not 需要刷新队列(事件):
+                continue
+            内容 = 事件["event"]
+            if 内容.get("type") == "server-stop":
+                raise RuntimeError("HQ server 已停止，事件等待不能视为成功")
+            if 内容.get("job") in 已终态作业:
+                continue
+            if 校验与回调():
+                return
+        raise RuntimeError("HQ 事件流已结束，但待等待任务尚未全部成功")
+    finally:
+        关闭 = getattr(事件流, "close", None)
+        if 关闭 is not None:
+            关闭()
 
 
 def main():
