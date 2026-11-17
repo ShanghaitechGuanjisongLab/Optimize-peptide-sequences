@@ -215,6 +215,75 @@ class FourTargetTests(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         self.db.读取启用靶标(str(配置路径))
 
+    def test_同步补齐缺失样本统计且保留已有补采计数(self):
+        with tempfile.TemporaryDirectory() as 目录, patch.dict(os.environ, {"PEPOPT_DB_ROOT": 目录, "PEPOPT_RESULTS_DIR": str(Path(目录) / "af3_results")}):
+            self.db.paths(ensure=True)
+
+            def 写结果(标签, 靶标, 评分):
+                目录路径 = Path(self.db.canonical_dir(标签, 靶标))
+                目录路径.mkdir(parents=True, exist_ok=True)
+                (目录路径 / f"{标签}_{靶标.lower()}_summary_confidences.json").write_text(json.dumps({"iptm": 评分, "chain_pair_iptm": [[0.0, 评分, 评分, 评分]]}), encoding="utf-8")
+                for 编号 in range(5):
+                    样本目录 = 目录路径 / f"seed-1_sample-{编号}"
+                    样本目录.mkdir()
+                    (样本目录 / "summary_confidences.json").write_text(json.dumps({"iptm": 评分, "chain_pair_iptm": [[0.0, 评分, 评分, 评分]]}), encoding="utf-8")
+
+            self.db.register_sequence("new", self.common.ORIG_TAIL, self.common.SEQ_202)
+            写结果("new", "HTR1A", 0.5)
+            写结果("new", "ASIC1A", 0.35)
+            self.db.register_sequence("fixed", "SPVDAVCS", self.common.FIXED_A + "SPVDAVCS")
+            self.db.upsert_result("fixed", "HTR1A", 0.6)
+            self.db.upsert_result("fixed", "ASIC1A", 0.3)
+            self.db.register_sequence("old", "SPVDVVAS", self.common.FIXED_A + "SPVDVVAS")
+            self.db.upsert_result("old", "HTR1A", 0.7)
+            写结果("old", "HTR1A", 0.7)
+            写结果("old", "ASIC1A", 0.3)
+            from 小肽统计 import BetaFit
+            拟合 = BetaFit()
+            拟合.add_many([0.21] * 35)
+            拟合.extra_used = 25
+            拟合.climb_done = 1
+            self.db.save_obj_stats("old", 拟合)
+            with self.db.写锁():
+                self.db.upsert_result("old", "HTR1A", 0.7)
+            结果 = self.inf.seq_sample.同步缺失统计(exclude_jobs=set())
+            self.assertEqual(结果["新增基础结果"], 4)
+            self.assertEqual(结果["补齐统计"], 1)
+            当前 = self.db.load_database()
+            self.assertEqual(当前["new"]["obj_n"], 5)
+            self.assertEqual(当前["old"]["obj_n"], 35)
+            self.assertEqual(当前["old"]["obj_climb"], 1)
+            self.assertIsNone(当前["fixed"]["obj_n"])
+            self.assertEqual(self.inf.seq_sample.同步缺失统计(exclude_jobs=set())["补齐统计"], 0)
+            self.assertEqual(self.db.load_database()["old"]["obj_n"], 35)
+
+    def test_汇总先同步在途排除后读取且同步失败不显示旧计数(self):
+        import 信息汇总 as 汇总
+
+        前五 = {"数据库": "同步库", "启用靶标": ["HTR1A", "ASIC1A"], "齐全记录数": 0, "记录": []}
+        运行记录 = {"任务名": "running_asic1a", "分区": "bme_gpu", "每卡显存GiB": 32, "靶标": "ASIC1A", "HQ作业号": 1, "Slurm作业号": "100"}
+        等待记录 = {"作业号": 2, "任务名": "waiting_asic1a", "等待任务数": 1, "资源方案": 1, "GPU数": 1, "每卡显存下限GiB": 22, "每卡显存上限GiB": 44, "优先级": 1, "妥协优先级": 0}
+        快照 = {"运行靶标": [运行记录], "等待任务": [等待记录]}
+        调用 = []
+        with patch.object(汇总, "读取HQ快照", return_value=快照), patch.object(汇总, "读取Slurm等待", return_value=[]), patch.object(汇总, "读取前五", side_effect=lambda: 调用.append("读取排名") or 前五):
+            def 同步(exclude_jobs):
+                调用.append(("同步", exclude_jobs))
+                return {"新增基础结果": 1, "补齐统计": 1, "无随机样本因子": 0}
+            结果 = 汇总.生成汇总(同步=同步)
+            self.assertEqual(调用, [("同步", {"running_asic1a", "waiting_asic1a"}), "读取排名"])
+            self.assertIn("补齐统计 1 条", 汇总.格式化汇总(结果))
+        with patch.object(汇总, "读取HQ快照", side_effect=RuntimeError("HQ离线")):
+            同步 = Mock()
+            结果 = 汇总.生成汇总(同步=同步, 查询排名=Mock(), 查询无在途作业=lambda: False)
+            同步.assert_not_called()
+            self.assertIsNone(结果["前五"])
+            self.assertIn("HQ 状态未知", 结果["错误"]["前五"])
+        with patch.object(汇总, "读取HQ快照", side_effect=RuntimeError("HQ离线")), patch.object(汇总, "读取前五", return_value=前五):
+            同步 = Mock(return_value={"新增基础结果": 0, "补齐统计": 3, "无随机样本因子": 0})
+            结果 = 汇总.生成汇总(同步=同步, 查询无在途作业=lambda: True)
+            同步.assert_called_once_with(exclude_jobs=set())
+            self.assertEqual(结果["前五"], 前五)
+
     def test_切换口径备份旧统计并保留暂停靶标(self):
         with tempfile.TemporaryDirectory() as 目录, patch.dict(os.environ, {"PEPOPT_DB_ROOT": 目录, "PEPOPT_RESULTS_DIR": str(Path(目录) / "af3_results")}):
             for 靶标, 评分 in (("HTR1A", 0.9), ("ASIC1A", 0.6), ("BIN1", 0.8), ("UNC13C", 0.7)):

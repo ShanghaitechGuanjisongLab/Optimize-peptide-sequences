@@ -1,4 +1,4 @@
-"""只读汇总前五序列、计算中的靶标和分区、Slurm 等待分配及 HQ 等待任务。"""
+"""同步数据库后汇总前五、运行分区、Slurm 等待分配及 HQ 等待任务。"""
 
 import argparse
 import csv
@@ -36,7 +36,7 @@ def 表格文本(表头, 数据行, 空提示):
 
 def 读取前五():
     记录 = 排名.读取排名()
-    前五 = [{"排名": 编号, "标签": 标签, "序列": 行.get("peptide") or "", "分量": dict(zip(排名.TARGETS, 分量)), "乘积": 乘积, "样本数": int(行.get("obj_n") or 0)} for 编号, (乘积, 标签, 行, 分量) in enumerate(记录[:5], 1)]
+    前五 = [{"排名": 编号, "标签": 标签, "序列": 行.get("peptide") or "", "分量": dict(zip(排名.TARGETS, 分量)), "乘积": 乘积, "样本数": int(行["obj_n"]) if 行.get("obj_n") is not None else None} for 编号, (乘积, 标签, 行, 分量) in enumerate(记录[:5], 1)]
     return {"数据库": 排名.db.db_root(), "启用靶标": list(排名.TARGETS), "齐全记录数": len(记录), "记录": 前五}
 
 
@@ -97,6 +97,10 @@ def 读取分配分区(运行=运行命令):
             raise ValueError("Slurm 作业分区列数异常，无法准确显示运行分区")
         分配分区[行[0]] = 行[1]
     return 分配分区
+
+
+def 账号无在途作业(运行=运行命令):
+    return not 运行(["squeue", "-h", "-u", getpass.getuser(), "-o", "%i"])
 
 
 def 读取Slurm等待(运行=运行命令):
@@ -160,20 +164,31 @@ def 格式化Slurm等待(记录列表):
     return 表格文本(表头, 数据行, "当前没有 Slurm 排队作业。")
 
 
-def 生成汇总(查询HQ=None, 查询Slurm=None, 查询排名=None):
+def 生成汇总(查询HQ=None, 查询Slurm=None, 查询排名=None, 同步=None, 查询无在途作业=账号无在途作业):
     查询HQ = 查询HQ or HQ队列.查询HQ
     查询Slurm = 查询Slurm or 读取Slurm等待
     查询排名 = 查询排名 or 读取前五
-    结果 = {"查询时间": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "前五": None, "运行靶标": None, "Slurm等待": None, "HQ等待": None, "错误": {}}
-    try:
-        结果["前五"] = 查询排名()
-    except (OSError, ValueError, RuntimeError) as 错误:
-        结果["错误"]["前五"] = str(错误)
+    结果 = {"查询时间": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "同步": None, "前五": None, "运行靶标": None, "Slurm等待": None, "HQ等待": None, "错误": {}}
     try:
         快照 = 读取HQ快照(查询HQ)
         结果["运行靶标"], 结果["HQ等待"] = 快照["运行靶标"], 快照["等待任务"]
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as 错误:
+        快照 = None
         结果["错误"]["HQ"] = str(错误)
+    if 同步 is not None:
+        try:
+            if 快照 is None and not 查询无在途作业():
+                raise RuntimeError("HQ 状态未知或仍有在途作业，拒绝同步以避免移动活动结果")
+            活动名称 = {任务["任务名"] for 任务 in 结果["HQ等待"] or []} | {任务["任务名"] for 任务 in 结果["运行靶标"] or []}
+            结果["同步"] = 同步(exclude_jobs=活动名称)
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as 错误:
+            结果["错误"]["同步"] = str(错误)
+            结果["错误"]["前五"] = "同步未完成，不显示可能过期的样本数：" + str(错误)
+    if "前五" not in 结果["错误"]:
+        try:
+            结果["前五"] = 查询排名()
+        except (OSError, ValueError, RuntimeError) as 错误:
+            结果["错误"]["前五"] = str(错误)
     try:
         结果["Slurm等待"] = 查询Slurm()
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as 错误:
@@ -182,14 +197,19 @@ def 生成汇总(查询HQ=None, 查询Slurm=None, 查询排名=None):
 
 
 def 格式化汇总(汇总):
-    文本 = ["查询时间：" + 汇总["查询时间"], "", "一、当前前五"]
+    文本 = ["查询时间：" + 汇总["查询时间"]]
+    if 汇总.get("同步") is not None:
+        文本.append("同步：新增基础结果 {新增基础结果} 条；补齐统计 {补齐统计} 条".format(**汇总["同步"]))
+    elif "同步" in 汇总["错误"]:
+        文本.append("同步失败：" + 汇总["错误"]["同步"])
+    文本.extend(["", "一、当前前五"])
     前五 = 汇总["前五"]
     if 前五 is None:
         文本.append("查询失败：" + 汇总["错误"]["前五"])
     else:
         文本.append(f"数据库：{前五['数据库']} | 排序：{' × '.join(前五['启用靶标'])} | 齐全记录：{前五['齐全记录数']}")
         文本.append("固定区：" + FIXED_A)
-        数据行 = [[行["排名"], 行["序列"].removeprefix(FIXED_A), *[f"{行['分量'][靶标]:.2f}" for 靶标 in 前五["启用靶标"]], f"{行['乘积']:.6f}", 行["样本数"]] for 行 in 前五["记录"]]
+        数据行 = [[行["排名"], 行["序列"].removeprefix(FIXED_A), *[f"{行['分量'][靶标]:.2f}" for 靶标 in 前五["启用靶标"]], f"{行['乘积']:.6f}", "—" if 行["样本数"] is None else 行["样本数"]] for 行 in 前五["记录"]]
         文本.append(表格文本(["排名", "可变区", *前五["启用靶标"], "乘积", "样本"], 数据行, "没有评分齐全的序列。"))
     文本.extend(["", "二、计算中的靶标及分区"])
     if 汇总["运行靶标"] is None:
@@ -212,8 +232,10 @@ def 主程序():
     解析器 = argparse.ArgumentParser(description=__doc__)
     解析器.add_argument("--状态目录", type=Path, help="HQ 共享状态目录")
     解析器.add_argument("--json", dest="机器可读", action="store_true", help="输出结构化汇总")
+    解析器.add_argument("--仅查询", action="store_true", help="跳过数据库同步，仅读取当前快照")
     参数 = 解析器.parse_args()
-    汇总 = 生成汇总(查询HQ=lambda *查询参数: HQ队列.查询HQ(*查询参数, 状态目录=参数.状态目录))
+    同步 = None if 参数.仅查询 else __import__("小肽序贯采样").同步缺失统计
+    汇总 = 生成汇总(查询HQ=lambda *查询参数: HQ队列.查询HQ(*查询参数, 状态目录=参数.状态目录), 同步=同步)
     print(json.dumps(汇总, ensure_ascii=False, indent=2) if 参数.机器可读 else 格式化汇总(汇总))
     return 1 if 汇总["错误"] else 0
 

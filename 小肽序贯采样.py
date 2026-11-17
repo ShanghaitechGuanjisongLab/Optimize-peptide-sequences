@@ -137,6 +137,29 @@ def ingest_new_records(new_sample_fn=None):
     return n
 
 
+@db.写锁()
+def 同步缺失统计(exclude_jobs=None):
+    """收割基础结果并补齐可构造乘积样本的缺失统计，不重建或覆盖已有补采统计。"""
+    新增基础, _, _ = db.harvest_results(exclude_jobs=exclude_jobs)
+    补齐统计 = ingest_new_records()
+    无法构造 = []
+    仍未统计 = []
+    for 标签, 行 in db.load_database().items():
+        if (行.get("obj_n") or 0) > 0:
+            continue
+        乘积 = 行.get("objective_product")
+        if 乘积 is None or not math.isfinite(乘积):
+            continue
+        因子 = collect_product_factors(标签, 行)
+        if 因子 is None:
+            无法构造.append(标签)
+        elif 因子[0]:
+            仍未统计.append(标签)
+    if 无法构造 or 仍未统计:
+        raise RuntimeError(f"样本统计不完整：无法构造={无法构造[:8]}；未初始化={仍未统计[:8]}")
+    return {"新增基础结果": 新增基础, "补齐统计": 补齐统计, "无随机样本因子": sum(1 for 行 in db.load_database().values() if (行.get("obj_n") or 0) <= 0)}
+
+
 def rebuild_obj_stats(verbose=True, protect_extra=True):
     """按磁盘上的全部样本重算每条记录的 β 统计量与 iptm 回写（红正历史低估）。
 

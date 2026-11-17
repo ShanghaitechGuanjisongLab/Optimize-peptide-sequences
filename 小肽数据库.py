@@ -31,6 +31,9 @@ import shutil
 import zipfile
 import tempfile
 from datetime import datetime
+from contextlib import contextmanager
+import fcntl
+import threading
 
 # ---------------------------------------------------------------------
 # 路径与常量
@@ -89,6 +92,30 @@ def paths(ensure=False):
 
 def results_dir():
     return paths()["results"]
+
+
+_锁状态 = threading.local()
+
+
+@contextmanager
+def 写锁():
+    """跨进程串行数据库写入；同一编排进程可重入，避免嵌套写函数死锁。"""
+    if getattr(_锁状态, "深度", 0):
+        _锁状态.深度 += 1
+        try:
+            yield
+        finally:
+            _锁状态.深度 -= 1
+        return
+    目录 = paths(ensure=True)["root"]
+    with open(os.path.join(目录, "数据库写入.lock"), "a") as 锁:
+        fcntl.flock(锁, fcntl.LOCK_EX)
+        _锁状态.深度 = 1
+        try:
+            yield
+        finally:
+            _锁状态.深度 = 0
+            fcntl.flock(锁, fcntl.LOCK_UN)
 
 
 # ---------------------------------------------------------------------
@@ -240,6 +267,7 @@ def _now():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+@写锁()
 def _rewrite_master(rows):
     """原子重写主表（先写临时文件再 os.replace，NFS 上比追加更稳）。"""
     p = paths(ensure=True)
@@ -276,6 +304,7 @@ def load_sequence_registry():
     return reg
 
 
+@写锁()
 def register_sequence(tag, var_region, peptide):
     """把 tag→序列 写入注册表。已存在且一致返回 False；不一致（撞标签）抛错。"""
     p = paths(ensure=True)
@@ -364,6 +393,7 @@ def objective_product(row):
     return prod
 
 
+@写锁()
 def upsert_result(tag, target, iptm, ranking=None, peptide=None, var=None,
                   source="local", iptm_mean=None):
     """写入/更新某序列某靶标的 ipTM（行不存在则新建）。iptm/ranking 为 None 时对应字段留空。iptm_mean 供多聚体靶标存辅助均值（iptm_<t>_mean）。
@@ -496,6 +526,7 @@ _OBJ_COLS = ["obj_n", "obj_sum", "obj_sum2", "obj_max",
              "obj_alpha", "obj_beta", "obj_extra", "obj_pool", "obj_climb"]
 
 
+@写锁()
 def save_obj_stats(tag, fit, source="seq"):
     """把 BetaFit 的充分统计量写入主表（不写原始样本，符合“不存全数据”）。"""
     d = fit.stats_dict()
@@ -661,6 +692,7 @@ def pack_result_zip(result_dir, job_name):
     return zip_path
 
 
+@写锁()
 def harvest_results(results_root=None, exclude_jobs=None):
     """扫描结果目录，把**新完成**的 AF3 结果提取评分并入库（幂等，可反复调用）。
 
@@ -784,6 +816,7 @@ def import_archived(archive_csv, source="archived", dry_run=False):
 # 最佳结果维护：复制 top-N HTR1A 结构包
 # ---------------------------------------------------------------------
 
+@写锁()
 def refresh_best(top_n=10):
     """只按当前因子齐全的乘积降序；缺因子不回退 HTR1A 单目标。"""
     by_tag = load_database()
