@@ -110,13 +110,13 @@ class FourTargetTests(unittest.TestCase):
             self.assertNotIn(self.common.FIXED_A + 可变区, 文本)
         self.assertEqual(json.dumps(数据), 原数据)
 
-    def test_汇总关联GPU运行任务和节点且排除CPU监控(self):
+    def test_汇总运行表包含CPU任务且GPU任务保留显存(self):
         import 信息汇总 as 汇总
 
         def 作业(编号, 名称, GPU数, 状态):
             return {"info": {"id": 编号, "name": 名称, "task_stats": {状态: 1}}, "tasks": [{"id": 0, "state": 状态, "worker": 2}], "submits": [{"array": {"priority": 21, "resources": [{"resources": [{"resource": "gpus", "request": {"Compact": GPU数 * 10000}}, {"resource": "gpumem", "request": {"显存范围": [220000, 440000]}}] if GPU数 else [{"resource": "cpus", "request": {"Compact": 10000}}]}]}}]}
 
-        详情 = [作业(1, "taskctl-autoscale", 0, "running"), 作业(2, "s000_asic1a_s42", 1, "running"), 作业(3, "s001_asic1a", 1, "waiting")]
+        详情 = [作业(1, "sp61-C搜索", 0, "running"), 作业(2, "s000_asic1a_s42", 1, "running"), 作业(3, "s001_asic1a", 1, "waiting")]
         工作者 = [{"id": 2, "allocation": {"id": "slurm40"}, "configuration": {"hostname": "node40", "resources": {"resources": [{"name": "gpus", "kind": "list", "values": ["0"]}, {"name": "gpumem", "kind": "sum", "size": 400000}]}}}]
         调用 = []
 
@@ -125,9 +125,10 @@ class FourTargetTests(unittest.TestCase):
             return [项["info"] for 项 in 详情] if 参数[1] == "list" and 参数[0] == "job" else 工作者 if 参数[0] == "worker" else 详情
 
         快照 = 汇总.读取HQ快照(查询, 查询分区=lambda: {"slurm40": "bme_gpu"})
-        self.assertEqual(len(快照["运行靶标"]), 1)
-        self.assertEqual((快照["运行靶标"][0]["节点"], 快照["运行靶标"][0]["靶标"], 快照["运行靶标"][0]["每卡显存GiB"]), ("node40", "ASIC1A", 40))
-        self.assertEqual(快照["运行靶标"][0]["分区"], "bme_gpu")
+        self.assertEqual(len(快照["运行靶标"]), 2)
+        self.assertEqual((快照["运行靶标"][0]["靶标"], 快照["运行靶标"][0]["每卡显存GiB"]), ("CPU任务", None))
+        self.assertEqual((快照["运行靶标"][1]["节点"], 快照["运行靶标"][1]["靶标"], 快照["运行靶标"][1]["每卡显存GiB"]), ("node40", "ASIC1A", 40))
+        self.assertEqual(快照["运行靶标"][1]["分区"], "bme_gpu")
         self.assertEqual([项["作业号"] for 项 in 快照["等待任务"]], [3])
         self.assertEqual(调用, [("job", "list", "--all"), ("job", "info", "1,2,3"), ("worker", "list")])
 
@@ -588,8 +589,25 @@ class FourTargetTests(unittest.TestCase):
                         self.assertEqual(tasks.submit(str(path), {}, str(root)), 17)
                         arguments = submit.call_args.args[0]
                         self.assertEqual(arguments[arguments.index("--gpu-memory") + 1], memory)
+                        self.assertEqual(arguments[arguments.index("--cpus") + 1], "0.1")
                         下限, 上限 = tasks.显存需求范围(str(path), {})
                         self.assertEqual(下限 * 2, 上限)
+            path = root / "htr1a.json"
+            with patch.dict(os.environ, {"PEPOPT_AF3_CPUS": "2"}), \
+                    patch.object(tasks, "gen_task", return_value=str(root)), \
+                    patch.object(tasks.subprocess, "run") as submit:
+                submit.return_value.stdout = "ID=18"
+                submit.return_value.stderr = ""
+                submit.return_value.returncode = 0
+                self.assertEqual(tasks.submit(str(path), {}, str(root)), 18)
+                arguments = submit.call_args.args[0]
+                self.assertEqual(arguments[arguments.index("--cpus") + 1], "2")
+                tasks.submit(str(path), {}, str(root), cpus=4)
+                arguments = submit.call_args.args[0]
+                self.assertEqual(arguments[arguments.index("--cpus") + 1], "4")
+                tasks.submit(str(path), {}, str(root), cpus=0)
+                arguments = submit.call_args.args[0]
+                self.assertEqual(arguments[arguments.index("--cpus") + 1], "0.1")
             invalid = root / "invalid.json"
             invalid.write_text('{"sequences": []}')
             with self.assertRaises(ValueError):

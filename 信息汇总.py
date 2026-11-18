@@ -45,10 +45,8 @@ def 读取运行靶标(作业详情, 工作者列表, 查询分区=None):
     记录列表 = []
     for 作业 in 作业详情:
         GPU作业 = any(资源.get("resource") == "gpus" and resource_amount(资源) > 0 for 提交 in 作业.get("submits", []) for 方案 in (提交.get("array") or {}).get("resources", []) for 资源 in 方案.get("resources", []))
-        if not GPU作业:
-            continue
         名称 = 作业["info"]["name"]
-        靶标 = next((靶标 for 靶标 in 排名.db.TARGETS_ALL if re.search(rf"_{re.escape(靶标.lower())}(?:_s\d+)?$", 名称.lower())), "其他GPU任务")
+        靶标 = next((靶标 for 靶标 in 排名.db.TARGETS_ALL if re.search(rf"_{re.escape(靶标.lower())}(?:_s\d+)?$", 名称.lower())), "其他GPU任务" if GPU作业 else "CPU任务")
         for 任务 in 作业.get("tasks", []):
             if 任务.get("state") != "running":
                 continue
@@ -56,7 +54,7 @@ def 读取运行靶标(作业详情, 工作者列表, 查询分区=None):
             if 工作者 is None:
                 raise RuntimeError(f"运行任务 {作业['info']['id']} 的 worker 信息缺失，请重新查询")
             容量 = worker_capacity(工作者)
-            记录列表.append({"节点": 工作者["configuration"]["hostname"], "每卡显存GiB": 容量.get("gpumem", 0) / max(1, 容量.get("gpus", 0)), "靶标": 靶标, "HQ作业号": 作业["info"]["id"], "任务名": 名称, "Slurm作业号": str((工作者.get("allocation") or {}).get("id", "未关联"))})
+            记录列表.append({"节点": 工作者["configuration"]["hostname"], "每卡显存GiB": 容量.get("gpumem", 0) / max(1, 容量.get("gpus", 0)) if GPU作业 else None, "靶标": 靶标, "HQ作业号": 作业["info"]["id"], "任务名": 名称, "Slurm作业号": str((工作者.get("allocation") or {}).get("id", "未关联"))})
     分配分区 = (查询分区 or 读取分配分区)() if 记录列表 else {}
     for 记录 in 记录列表:
         记录["分区"] = 分配分区.get(记录["Slurm作业号"], "未关联" if 记录["Slurm作业号"] == "未关联" else "未知")
@@ -215,8 +213,8 @@ def 格式化汇总(汇总):
     if 汇总["运行靶标"] is None:
         文本.append("查询失败：" + 汇总["错误"]["HQ"])
     else:
-        数据行 = [[行["分区"], f"{行['每卡显存GiB']:g}", 行["靶标"], 行["HQ作业号"], 行["任务名"], 行["Slurm作业号"]] for 行 in 汇总["运行靶标"]]
-        文本.append(表格文本(["分区", "显存(GiB/卡)", "靶标", "HQ ID", "任务名", "Slurm ID"], 数据行, "当前没有运行中的 GPU 计算任务。"))
+        数据行 = [[行["分区"], "CPU" if 行["每卡显存GiB"] is None else f"{行['每卡显存GiB']:g}", 行["靶标"], 行["HQ作业号"], 行["任务名"], 行["Slurm作业号"]] for 行 in 汇总["运行靶标"]]
+        文本.append(表格文本(["分区", "显存(GiB/卡)", "靶标", "HQ ID", "任务名", "Slurm ID"], 数据行, "当前没有运行中的 HQ 计算任务。"))
     文本.extend(["", "三、Slurm 层等待分配"])
     if 汇总["Slurm等待"] is None:
         文本.append("查询失败：" + 汇总["错误"]["Slurm"])

@@ -204,11 +204,22 @@ def 显存需求范围(json_path, env=None):
     return 上限 / 2, 上限
 
 
+def 归一CPU数(值):
+    # HQ CLI 拒绝 cpus=0；0.1 是可调度最小请求，实际线程数不受此预约限制。
+    数量 = max(0.1, float(值))
+    return int(数量) if 数量.is_integer() else 数量
+
+
+def 默认CPU数():
+    return 归一CPU数(os.environ.get("PEPOPT_AF3_CPUS", "0.1"))
+
+
 def submit(json_path: str, env: dict, task_root: str, priority: int = 0,
-           gpus: int = 1, cpus: int = 6, name: str = None) -> int:
+           gpus: int = 1, cpus: int = None, name: str = None) -> int:
     """生成并提交单个 AF3 任务；返回 HQ job id。"""
     tdir = gen_task(json_path, env, task_root)
     name = name or os.path.splitext(os.path.basename(json_path))[0]
+    cpus = 默认CPU数() if cpus is None else 归一CPU数(cpus)
     下限, 上限 = 显存需求范围(json_path, env) if gpus else (0, 0)
     r = subprocess.run(
         ["bash", TASKCTL, "add",
@@ -224,7 +235,7 @@ def submit(json_path: str, env: dict, task_root: str, priority: int = 0,
 
 
 def submit_all(jsons, env: dict, task_root: str, priority: int = 0,
-               gpus: int = 1, cpus: int = 6):
+               gpus: int = 1, cpus: int = None):
     """批量提交；返回 job id 列表。
 
     按文件名排序，同序列的靶标相邻入队。首个错误立即抛出；已提交任务继续运行，禁止直跑回退。"""
