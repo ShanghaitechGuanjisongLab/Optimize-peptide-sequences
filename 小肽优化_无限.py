@@ -393,8 +393,11 @@ class ExhaustiveQueue:
 
     # ---- 取批 ----
     def next_batch(self, n, rows=None):
-        """取 n 条未派发序列（返回**全序列**形式，与 prepare_cycle 约定一致），保证批内互不重复且不与台账重复；剩余不足 n 时返回剩余全部（不伪造）。返回空列表 = 空间已穷尽。"""
+        """取 n 条未派发序列；预取台账也从未评估池中排除。"""
         P = self.pending()
+        预取排除 = getattr(self, "预取排除", set())
+        if 预取排除:
+            P = [var for var in P if var not in 预取排除]
         if n <= 0 or not P:
             return []
         if n >= len(P):

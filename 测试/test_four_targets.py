@@ -581,7 +581,8 @@ class FourTargetTests(unittest.TestCase):
                     path.write_text(json.dumps(self.common.create_af3_json(
                         self.common.SEQ_202, self.inf.TARGET_SEQS[target], target.lower(),
                         target_copies=self.inf.TARGET_COPIES.get(target, 1))))
-                    with patch.object(tasks, "gen_task", return_value=str(root)), \
+                    with patch.dict(os.environ, {"PEPOPT_MSA_PIPELINE": "0"}), \
+                            patch.object(tasks, "gen_task", return_value=str(root)), \
                             patch.object(tasks.subprocess, "run") as submit:
                         submit.return_value.stdout = "ID=17"
                         submit.return_value.stderr = ""
@@ -589,11 +590,11 @@ class FourTargetTests(unittest.TestCase):
                         self.assertEqual(tasks.submit(str(path), {}, str(root)), 17)
                         arguments = submit.call_args.args[0]
                         self.assertEqual(arguments[arguments.index("--gpu-memory") + 1], memory)
-                        self.assertEqual(arguments[arguments.index("--cpus") + 1], "0.1")
+                        self.assertEqual(arguments[arguments.index("--cpus") + 1], "1")
                         下限, 上限 = tasks.显存需求范围(str(path), {})
                         self.assertEqual(下限 * 2, 上限)
             path = root / "htr1a.json"
-            with patch.dict(os.environ, {"PEPOPT_AF3_CPUS": "2"}), \
+            with patch.dict(os.environ, {"PEPOPT_AF3_CPUS": "2", "PEPOPT_MSA_PIPELINE": "0"}), \
                     patch.object(tasks, "gen_task", return_value=str(root)), \
                     patch.object(tasks.subprocess, "run") as submit:
                 submit.return_value.stdout = "ID=18"
@@ -613,6 +614,119 @@ class FourTargetTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 tasks.minimum_gpu_memory(str(invalid))
 
+    def test_首次MSA为CPU任务且GPU等待完成事件(self):
+        tasks = self.node.load_hq_adapter()
+        import MSA预处理 as pipeline
+        workers = [{"id": 1, "ended": None, "configuration": {"resources": {"resources": [{"name": "cpus", "kind": "range", "start": 0, "end": 7}, {"name": "gpus", "kind": "list", "values": ["0"]}]}}},
+                   {"id": 2, "ended": None, "configuration": {"resources": {"resources": [{"name": "cpus", "kind": "range", "start": 0, "end": 7}, {"name": "gpus", "kind": "list", "values": ["0"]}]}}}]
+        jobs = [{"id": 90, "task_stats": {"running": 1}}]
+        details = [{"submits": [{"array": {"resources": [{"resources": [{"resource": "cpus", "request": {"Compact": 10000}}, {"resource": "gpus", "request": {"Compact": 10000}}]}]}}], "tasks": [{"state": "running", "worker": 2}]}]
+
+        def 查询(*参数, **kwargs):
+            return workers if 参数[0] == "worker" else jobs if 参数[1] == "list" else details
+
+        with patch.object(pipeline, "hq", side_effect=查询):
+            self.assertEqual(pipeline.free_cpu_capacity(), {1: 7, 2: 7})
+            self.assertEqual(pipeline.msa_cpu_count(), 7)
+
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"PEPOPT_DB_ROOT": directory, "TASKCTL_STATE": directory}):
+            root = Path(directory)
+            env = self.node.build_runner_env(str(root))
+            inputs = []
+            for target in ("HTR1A", "ASIC1A"):
+                path = root / f"snew_{target.lower()}.json"
+                path.write_text(json.dumps(self.common.create_af3_json(self.common.SEQ_202, self.inf.TARGET_SEQS[target], path.stem, **self.inf.target_af3_options(target))))
+                inputs.append(str(path))
+            msa_calls, gpu_calls = [], []
+            with patch.object(pipeline.cache, "load", return_value=None), \
+                    patch.object(pipeline, "msa_cpu_count", return_value=7), \
+                    patch.object(pipeline, "hq", side_effect=lambda *参数, **kw: [{"id": 500, "task_stats": {"waiting": 1}}] if 参数[0] == "job" else "500") as 提交:
+                ids = [tasks.submit(path, env, str(root)) for path in inputs]
+                self.assertEqual(ids, [500, 500])
+                self.assertEqual(len(提交.call_args_list), 1)
+                self.assertIn("7", 提交.call_args.args)
+                with patch.object(tasks.subprocess, "run", side_effect=AssertionError("MSA前不得提交GPU")):
+                    self.assertEqual(pipeline.resolve_ids([500]), [500])
+            with patch.object(pipeline.cache, "load", return_value={"unpairedMsa": "x", "pairedMsa": "x", "templates": []}), \
+                    patch.object(pipeline, "hq", return_value=[{"id": 500, "task_stats": {"finished": 1}}]), \
+                    patch.object(tasks, "gen_task", return_value=str(root)), \
+                    patch.object(tasks.subprocess, "run") as 提交:
+                提交.return_value = Mock(returncode=0, stdout="ID=501", stderr="")
+                self.assertEqual(pipeline.resolve_ids([500]), [501, 501])
+                self.assertEqual(len(提交.call_args_list), 2)
+                self.assertTrue(all(调用.args[0][调用.args[0].index("--cpus") + 1] == "1" for 调用 in 提交.call_args_list))
+            with patch.object(pipeline, "hq", return_value=[{"id": 500, "task_stats": {"failed": 1}}]):
+                状态 = pipeline.read_state(self.common.SEQ_202)
+                状态.pop("gpu_ids", None)
+                pipeline.write_state(self.common.SEQ_202, 状态)
+                with self.assertRaisesRegex(RuntimeError, "MSA 任务 500 未成功"):
+                    pipeline.advance_pending()
+
+    def test_MSA内部四个数据库搜索分摊预约CPU(self):
+        import MSA预处理 as pipeline
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"PEPOPT_MSA_CACHE": directory}):
+            def 模拟数据管线(*args, **kwargs):
+                数据 = Path(directory) / "out" / "peptide_msa" / "peptide_msa_data.json"
+                数据.parent.mkdir(parents=True)
+                数据.write_text(json.dumps({"sequences": [{"protein": {"sequence": "ACDEFGHIK", "unpairedMsa": "A", "pairedMsa": "A", "templates": []}}]}))
+                return Mock(returncode=0)
+            with patch.object(pipeline.subprocess, "run", side_effect=模拟数据管线) as 运行:
+                pipeline.prepare("ACDEFGHIK", Path(directory), 7)
+        命令 = 运行.call_args.args[0]
+        self.assertIn("--jackhmmer_n_cpu=1", 命令)
+        self.assertIn("--nhmmer_n_cpu=1", 命令)
+        self.assertIn("--norun_inference", 命令)
+        self.assertEqual(运行.call_args.kwargs["env"]["CUDA_VISIBLE_DEVICES"], "")
+
+    def test_MSA预取仅在无缓存就绪待GPU序列时提交(self):
+        import MSA预处理 as pipeline
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"TASKCTL_STATE": directory}), \
+                patch("小肽数据库.load_sequence_registry", return_value={}), \
+                patch("小肽数据库.load_database", return_value={}):
+            root = Path(directory)
+            def 模拟提交(sequence, *args):
+                pipeline.write_state(sequence, {"sequence": sequence, "msa_job": 800})
+                return 800
+            with patch.object(pipeline, "submit_msa", side_effect=模拟提交) as 提交, \
+                    patch.object(pipeline, "bind_prefetch_gpu", return_value=True):
+                结果 = pipeline.ensure_prefetch(jobs=[], picker=lambda n: [self.common.FIXED_A + "NEWPEPTIDE"])
+                self.assertEqual(结果["msa_job"], 800)
+                # MSA 尚在运行/等待时，无论多少事件都不得新增预取。
+                for _ in range(20):
+                    self.assertIsNone(pipeline.ensure_prefetch(jobs=[{"id": 800, "name": "msa_test", "task_stats": {"running": 1}}], picker=lambda n: [self.common.FIXED_A + "OTHERPEPTIDE"]))
+                self.assertEqual(提交.call_count, 1)
+                # 已取消的旧 MSA 不永久占位，可以恢复预取下一条。
+                pipeline.ensure_prefetch(jobs=[{"id": 800, "name": "msa_test", "task_stats": {"canceled": 1}}], picker=lambda n: [self.common.FIXED_A + "OTHERPEPTIDE"])
+                self.assertEqual(提交.call_count, 2)
+                with patch.object(pipeline, "needed", return_value=False):
+                    self.assertEqual(pipeline.ensure_prefetch(jobs=[{"id": 800, "task_stats": {"running": 1}}])["msa_job"], 800)
+                    self.assertEqual(提交.call_count, 2)
+
+    def test_MSA就绪预取必须绑定GPU且空请求不放行(self):
+        import MSA预处理 as pipeline
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"TASKCTL_STATE": directory}):
+            root = Path(directory)
+            sequence = self.common.SEQ_202
+            pipeline.write_state(sequence, {"sequence": sequence, "msa_job": 500})
+            with patch.object(pipeline.cache, "load", return_value=None), patch.object(pipeline, "needed", return_value=False):
+                def 准备(序列, 靶标, 目录):
+                    Path(目录).mkdir(parents=True, exist_ok=True)
+                    tag = self.db.resolve_tag(sequence[len(self.common.FIXED_A):])
+                    for target in 靶标:
+                        path = Path(目录) / f"{tag}_{target.lower()}.json"
+                        path.write_text(json.dumps(self.common.create_af3_json(sequence, self.inf.TARGET_SEQS[target], path.stem, **self.inf.target_af3_options(target))))
+                    return len(靶标), []
+                with patch("小肽优化_节点内.prepare_cycle", side_effect=准备), patch("小肽优化_节点内.build_runner_env", return_value={}):
+                    self.assertTrue(pipeline.bind_prefetch_gpu(sequence))
+            状态 = pipeline.read_state(sequence)
+            self.assertEqual(len(状态["gpu_pending"]), 2)
+            self.assertNotIn("gpu_ids", 状态)
+            状态.pop("gpu_pending")
+            pipeline.write_state(sequence, 状态)
+            with patch.object(pipeline, "hq", return_value=[{"id": 500, "task_stats": {"finished": 1}}]), patch.object(pipeline, "needed", return_value=False):
+                self.assertEqual(pipeline.advance_pending(), {})
+                self.assertNotIn("gpu_ids", pipeline.read_state(sequence))
+
     def test_已有长驻排队仍会调用逐档补齐入口(self):
         with patch.object(self.loc, "PREFLIGHT_OK", True), patch.object(self.loc, "loop_job_active", return_value=["old-large"]), patch.object(self.loc, "逐档启动循环", return_value={"plan": [{"gpu_memory": 40}]}) as 启动:
             self.assertEqual(self.loc.submit_loop_job(list(self.db.PRODUCT_TARGETS), 8), {"plan": [{"gpu_memory": 40}]})
@@ -622,6 +736,73 @@ class FourTargetTests(unittest.TestCase):
         with patch.object(self.loc.subprocess, "run", return_value=Mock(returncode=0)), patch.object(self.node, "drain_backlog") as 全量补齐:
             self.assertEqual(self.loc.逐档启动循环(list(self.db.PRODUCT_TARGETS), 8), {"主服务在线": True, "plan": []})
             全量补齐.assert_not_called()
+
+    def test_离线启动没有旧JSON时仍准备下一批搜索(self):
+        捕获 = {}
+
+        def 假执行(命令, **kwargs):
+            if 命令[-2:] == ["server", "info"]:
+                return Mock(returncode=1)
+            if 命令[0] == "squeue":
+                return Mock(stdout="")
+            raise AssertionError(命令)
+
+        def 准备(序列, 靶标, 目录):
+            捕获["序列"] = list(序列)
+            for 靶 in 靶标:
+                路径 = Path(目录) / f"snew_{靶.lower()}.json"
+                路径.write_text(json.dumps(self.common.create_af3_json(
+                    序列[0], self.inf.TARGET_SEQS[靶], 路径.stem,
+                    **self.inf.target_af3_options(靶))), encoding="utf-8")
+            return len(靶标), []
+
+        class 假控制器:
+            def __init__(self, **kwargs):
+                pass
+
+            def tick(self, apply):
+                捕获["请求"] = json.loads((Path(os.environ["TASKCTL_STATE"]) / "逐档启动.json").read_text())["请求"]
+                return {"plan": [{"gpu_memory": 80}]}
+
+        class 假加载器:
+            def create_module(self, spec):
+                return None
+
+            def exec_module(self, module):
+                module.Controller = 假控制器
+
+        class 假规范:
+            def __init__(self, name, path):
+                self.name = name
+                self.origin = str(path)
+                self.loader = 假加载器()
+                self.submodule_search_locations = None
+                self.has_location = False
+
+        原规范 = importlib.util.spec_from_file_location
+
+        def 构造规范(name, path):
+            if name == "逐档扩容入口":
+                return 假规范(name, path)
+            return 原规范(name, path)
+
+        with tempfile.TemporaryDirectory() as 临时库, \
+                patch.object(self.db, "db_root", return_value=临时库), \
+                patch.object(self.loc.subprocess, "run", side_effect=假执行), \
+                patch.object(self.db, "load_sequence_registry", return_value={}), \
+                patch.object(self.db, "load_database", return_value={}), \
+                patch.object(self.db, "find_summary", side_effect=lambda 路径: "已完成" if "sold_htr1a" in str(路径) else None), \
+                patch.object(self.inf, "sweep_pick", return_value=[self.common.SEQ_202]) as 取批, \
+                patch.object(self.node, "prepare_cycle", side_effect=准备), \
+                patch.object(self.loc, "build_loop_job_cmd", return_value=(["sbatch", "--export=ALL,PEPOPT_CYCLE_SEQS=2"], "118.0")), \
+                patch("importlib.util.spec_from_file_location", side_effect=构造规范):
+            旧输入 = Path(临时库) / "queue_inputs"
+            旧输入.mkdir()
+            旧输入.joinpath("sold_htr1a.json").write_text("{}", encoding="utf-8")
+            self.assertEqual(self.loc.逐档启动循环(list(self.db.PRODUCT_TARGETS), 2), {"plan": [{"gpu_memory": 80}]})
+        取批.assert_called_once_with(list(self.db.PRODUCT_TARGETS), 2)
+        self.assertEqual(捕获["序列"], [self.common.SEQ_202])
+        self.assertEqual(len(捕获["请求"]), 2)
 
     def test_af3_memory_estimate_tracks_size_not_gpu_models(self):
         spec = importlib.util.spec_from_file_location("af3_memory", ROOT / "af3适配" / "af3任务.py")
@@ -730,6 +911,7 @@ class FourTargetTests(unittest.TestCase):
         finished = [{"id": 7, "name": "s000_htr1a", "task_stats": {"finished": 1}}]
         with patch.object(adapter, "queue_jobs", side_effect=[running, finished]), \
                 patch.object(adapter, "任务事件流", return_value=iter([{"event": {"type": "task-finished", "job": 7, "task": 0}}])), \
+                patch("MSA预处理.ensure_prefetch", return_value=None), \
                 patch.object(adapter.time, "sleep") as sleep:
             adapter.wait([7], on_poll=callback, poll_seconds=1)
             self.assertEqual(callback.call_count, 2)
@@ -742,7 +924,7 @@ class FourTargetTests(unittest.TestCase):
         全部完成 = [{"id": 7, "task_stats": {"finished": 1}}, *其他完成[1:]]
         事件 = [{"event": {"type": "task-finished", "job": 2}}, {"event": {"type": "worker-overview"}}, {"event": {"type": "task-finished", "job": 9}}, {"event": {"type": "task-finished", "job": 9}}, {"event": {"type": "task-finished", "job": 7}}]
         回调 = Mock()
-        with patch.object(适配器, "queue_jobs", side_effect=[运行, 其他完成, 全部完成]) as 查询, patch.object(适配器, "任务事件流", return_value=iter(事件)), patch.object(适配器.time, "sleep") as 休眠:
+        with patch.object(适配器, "queue_jobs", side_effect=[运行, 其他完成, 全部完成]) as 查询, patch.object(适配器, "任务事件流", return_value=iter(事件)), patch("MSA预处理.ensure_prefetch", return_value=None), patch.object(适配器.time, "sleep") as 休眠:
             适配器.wait([7], on_poll=回调)
         self.assertEqual(查询.call_count, 3)
         self.assertEqual(回调.call_args_list[1].args[0], 其他完成)
@@ -751,7 +933,7 @@ class FourTargetTests(unittest.TestCase):
     def test_事件流断开或server停止均报错且不回退轮询(self):
         适配器 = self.node.load_hq_adapter()
         for 事件 in ([], [{"event": {"type": "server-stop"}}]):
-            with self.subTest(事件=事件), patch.object(适配器, "queue_jobs", return_value=[{"id": 7, "task_stats": {"running": 1}}]) as 查询, patch.object(适配器, "任务事件流", return_value=iter(事件)), patch.object(适配器.time, "sleep") as 休眠:
+            with self.subTest(事件=事件), patch.object(适配器, "queue_jobs", return_value=[{"id": 7, "task_stats": {"running": 1}}]) as 查询, patch.object(适配器, "任务事件流", return_value=iter(事件)), patch("MSA预处理.ensure_prefetch", return_value=None), patch.object(适配器.time, "sleep") as 休眠:
                 with self.assertRaisesRegex(RuntimeError, "事件流|server 已停止"):
                     适配器.wait([7])
                 self.assertEqual(查询.call_count, 1)
@@ -853,6 +1035,7 @@ class FourTargetTests(unittest.TestCase):
         spec.loader.exec_module(adapter)
         with patch.object(adapter, "queue_jobs", return_value=[
                 {"id": 7, "task_stats": {"running": 1}}]), \
+                patch("MSA预处理.ensure_prefetch", return_value=None), \
                 self.assertRaisesRegex(RuntimeError, "refill failed"):
             adapter.wait([7], on_poll=Mock(side_effect=RuntimeError("refill failed")))
 

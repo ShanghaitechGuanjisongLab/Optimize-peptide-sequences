@@ -32,6 +32,8 @@ _MW = os.environ.get("TASKCTL_HOME") or os.path.join(HERE, "..", "..", "任务�
 TASKCTL = os.path.join(_MW, "任务控制.sh")
 HQ程序 = os.path.join(_MW, "bin", "hq")
 MSA_CACHE = os.path.join(HERE, "msa缓存.py")
+sys.path.insert(0, HERE)
+sys.path.insert(0, os.path.abspath(_MW))
 
 
 def pause_at_batch_boundary():
@@ -211,14 +213,25 @@ def 归一CPU数(值):
 
 
 def 默认CPU数():
-    return 归一CPU数(os.environ.get("PEPOPT_AF3_CPUS", "0.1"))
+    return 归一CPU数(os.environ.get("PEPOPT_AF3_CPUS", "1"))
 
 
 def submit(json_path: str, env: dict, task_root: str, priority: int = 0,
-           gpus: int = 1, cpus: int = None, name: str = None) -> int:
-    """生成并提交单个 AF3 任务；返回 HQ job id。"""
-    tdir = gen_task(json_path, env, task_root)
+           gpus: int = 1, cpus: int = None, name: str = None, allow_msa: bool = True) -> int:
+    """首次小肽先完成 CPU MSA，再提交 GPU 推理；缓存齐全时直接推理。"""
     name = name or os.path.splitext(os.path.basename(json_path))[0]
+    msa_enabled = os.environ.get("PEPOPT_MSA_PIPELINE", "1").lower() not in ("0", "false", "off")
+    if gpus and allow_msa and msa_enabled:
+        import MSA预处理 as pipeline
+        if pipeline.needed(pipeline.peptide(json_path)) or pipeline.read_state(pipeline.peptide(json_path)).get("msa_job") is not None:
+            existing = pipeline.register_gpu(json_path, env, task_root, priority, gpus, name)
+            if existing is not None:
+                return existing
+    if gpus and allow_msa and msa_enabled:
+        import MSA预处理 as pipeline
+        if pipeline.needed(pipeline.peptide(json_path)):
+            raise RuntimeError(f"{name} 的小肽 MSA 尚未就绪，禁止占 GPU 现场搜索")
+    tdir = gen_task(json_path, env, task_root)
     cpus = 默认CPU数() if cpus is None else 归一CPU数(cpus)
     下限, 上限 = 显存需求范围(json_path, env) if gpus else (0, 0)
     r = subprocess.run(
@@ -280,13 +293,16 @@ def 任务事件流():
 
 
 def wait(ids, on_poll=None, poll_seconds=15):
-    """阻塞订阅全局 HQ 状态事件，不定时轮询；on_poll 保留为状态事件后的兼容回调。"""
+    """等待完整 AF3；CPU MSA 完成后替换成真实 GPU 任务，不提前返回成功。"""
+    import MSA预处理 as pipeline
     owned = {int(编号) for 编号 in ids}
     if not owned:
         return
     已终态作业 = set()
 
     def 校验与回调():
+        nonlocal owned
+        owned = set(pipeline.resolve_ids(owned))
         jobs = queue_jobs()
         已终态作业.update(任务["id"] for 任务 in jobs if not 任务.get("is_open", False) and not any((任务.get("task_stats") or {}).get(状态) for 状态 in ("running", "waiting")) and any((任务.get("task_stats") or {}).get(状态) for 状态 in ("finished", "failed", "canceled", "aborted")))
         tracked = {job["id"]: job for job in jobs if job["id"] in owned}
@@ -297,6 +313,7 @@ def wait(ids, on_poll=None, poll_seconds=15):
                          for state in ("failed", "canceled", "aborted"))}
         if failed:
             raise RuntimeError(f"AF3 HQ 任务未成功完成：{failed}")
+        pipeline.ensure_prefetch(jobs)
         if on_poll is not None:
             on_poll(jobs)
         active = {job_id for job_id, job in tracked.items()

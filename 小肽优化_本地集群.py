@@ -909,14 +909,22 @@ def 逐档启动循环(targets, cycle_seqs, max_hours=None):
     需求目录.mkdir(parents=True, exist_ok=True)
     优先级 = {}
     已准备 = {}
-    for 路径 in sorted((Path(数据库.db_root()) / "cycles").glob("*/*.json")) + sorted((Path(数据库.db_root()) / "queue_inputs").glob("*.json")):
-        if 路径.stem.rsplit("_", 1)[-1].upper() in targets and not 路径.name.startswith("_"):
+    for 路径 in sorted((Path(数据库.db_root()) / "cycles").glob("*/*.json")) + sorted((Path(数据库.db_root()) / "queue_inputs").glob("*.json")) + sorted(需求目录.glob("*.json")):
+        if 路径.stem.rsplit("_", 1)[-1].upper() not in targets or 路径.name.startswith("_"):
+            continue
+        标签, 靶标 = 路径.stem.rsplit("_", 1)
+        if not 数据库.find_summary(数据库.canonical_dir(标签, 靶标)):
             已准备[路径.stem] = 路径
     for 路径 in list(已准备.values())[:max(1, int(cycle_seqs)) * len(targets)]:
-        shutil.copyfile(路径, 需求目录 / 路径.name)
+        if 路径.parent != 需求目录:
+            shutil.copyfile(路径, 需求目录 / 路径.name)
     if not 已准备:
         注册表, 评分表 = 数据库.load_sequence_registry(), 数据库.load_database()
-        待补 = [项["peptide"] for 标签, 项 in 注册表.items() if 项.get("peptide") and any(评分表.get(标签, {}).get(f"iptm_{靶标.lower()}") is None for 靶标 in targets)][:max(1, int(cycle_seqs))]
+        数量 = max(1, int(cycle_seqs))
+        待补 = [项["peptide"] for 标签, 项 in 注册表.items() if 项.get("peptide") and any(评分表.get(标签, {}).get(f"iptm_{靶标.lower()}") is None for 靶标 in targets)][:数量]
+        if len(待补) < 数量:
+            # 主服务到期不能把“旧 JSON 已算完”误当成“没有下一批搜索需求”。
+            待补.extend(节点入口.inf.sweep_pick(targets, 数量 - len(待补)))
         节点入口.prepare_cycle(待补, targets, str(需求目录))
     输入列表 = [路径 for 路径 in sorted(需求目录.glob("*.json")) if 路径.stem.rsplit("_", 1)[-1].upper() in targets and not 数据库.find_summary(数据库.canonical_dir(路径.stem.rsplit("_", 1)[0], 路径.stem.rsplit("_", 1)[-1].upper()))]
     适配规范 = importlib.util.spec_from_file_location("逐档AF3需求", 项目 / "af3适配" / "af3任务.py")
@@ -925,7 +933,7 @@ def 逐档启动循环(targets, cycle_seqs, max_hours=None):
     请求列表 = []
     for 编号, 路径 in enumerate(输入列表, 1):
         下限, 上限 = 适配层.显存需求范围(str(路径))
-        请求列表.append({"job_id": 编号, "cpus": 6, "gpus": 1, "gpu_memory": 下限, "显存上限": 上限, "priority": 优先级.get(路径.stem, 0)})
+        请求列表.append({"job_id": 编号, "cpus": 适配层.默认CPU数(), "gpus": 1, "gpu_memory": 下限, "显存上限": 上限, "priority": 优先级.get(路径.stem, 0)})
     状态目录.mkdir(parents=True, exist_ok=True)
     配置路径 = 状态目录 / "逐档启动.json"
     旧配置 = json.loads(配置路径.read_text()) if 配置路径.exists() else {}
