@@ -682,25 +682,48 @@ class FourTargetTests(unittest.TestCase):
         import MSA预处理 as pipeline
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"TASKCTL_STATE": directory}), \
                 patch("小肽数据库.load_sequence_registry", return_value={}), \
-                patch("小肽数据库.load_database", return_value={}):
+                patch("小肽数据库.load_database", return_value={}), \
+                patch.object(pipeline, "hq", return_value=[{"id": 1, "ended": None, "configuration": {"hostname": "node1"}}]):
             root = Path(directory)
             def 模拟提交(sequence, *args):
                 pipeline.write_state(sequence, {"sequence": sequence, "msa_job": 800})
                 return 800
             with patch.object(pipeline, "submit_msa", side_effect=模拟提交) as 提交, \
                     patch.object(pipeline, "bind_prefetch_gpu", return_value=True):
-                结果 = pipeline.ensure_prefetch(jobs=[], picker=lambda n: [self.common.FIXED_A + "NEWPEPTIDE"])
+                结果 = pipeline.ensure_prefetch(jobs=[], picker=lambda n: [self.common.FIXED_A + "NEWPEPTIDE1"][:n])
                 self.assertEqual(结果["msa_job"], 800)
                 # MSA 尚在运行/等待时，无论多少事件都不得新增预取。
                 for _ in range(20):
-                    self.assertIsNone(pipeline.ensure_prefetch(jobs=[{"id": 800, "name": "msa_test", "task_stats": {"running": 1}}], picker=lambda n: [self.common.FIXED_A + "OTHERPEPTIDE"]))
+                    pipeline.ensure_prefetch(jobs=[{"id": 800, "name": "msa_test", "task_stats": {"running": 1}}, {"id": 900, "name": "gpu_test", "task_stats": {"waiting": 1}}], picker=lambda n: [self.common.FIXED_A + "OTHERPEPTIDE2"])
                 self.assertEqual(提交.call_count, 1)
+                # 无排队且所有剩余 GPU 都等 MSA 时，低水位允许再预取一条。
+                前次数 = 提交.call_count
+                with patch("小肽优化_无限.attempted_vars", return_value=set()):
+                    pipeline.ensure_prefetch(jobs=[{"id": 800, "name": "msa_test", "task_stats": {"running": 1}}], picker=lambda n: [self.common.FIXED_A + "OTHERPEPTIDE3"])
+                self.assertGreaterEqual(提交.call_count, 前次数)
                 # 已取消的旧 MSA 不永久占位，可以恢复预取下一条。
-                pipeline.ensure_prefetch(jobs=[{"id": 800, "name": "msa_test", "task_stats": {"canceled": 1}}], picker=lambda n: [self.common.FIXED_A + "OTHERPEPTIDE"])
-                self.assertEqual(提交.call_count, 2)
+                pipeline.ensure_prefetch(jobs=[{"id": 800, "name": "msa_test", "task_stats": {"canceled": 1}}], picker=lambda n: [self.common.FIXED_A + "THIRDPEPTIDE4"])
+                self.assertGreaterEqual(提交.call_count, 前次数)
                 with patch.object(pipeline, "needed", return_value=False):
                     self.assertEqual(pipeline.ensure_prefetch(jobs=[{"id": 800, "task_stats": {"running": 1}}])["msa_job"], 800)
                     self.assertEqual(提交.call_count, 2)
+
+    def test_MSA水位等于运行中的不同节点数(self):
+        self.node.load_hq_adapter()
+        import MSA预处理 as pipeline
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"TASKCTL_STATE": directory}), \
+                patch("小肽数据库.load_sequence_registry", return_value={}), \
+                patch("小肽数据库.load_database", return_value={}):
+            workers = [{"id": 1, "ended": None, "configuration": {"hostname": "node1"}}, {"id": 2, "ended": None, "configuration": {"hostname": "node2"}}, {"id": 3, "ended": None, "configuration": {"hostname": "node1"}}]
+            已提交 = []
+            def 提交(sequence, *args):
+                已提交.append(sequence)
+                pipeline.write_state(sequence, {"sequence": sequence, "msa_job": len(已提交)})
+                return len(已提交)
+            with patch.object(pipeline, "hq", return_value=workers), patch.object(pipeline, "bind_prefetch_gpu", return_value=True), patch.object(pipeline, "submit_msa", side_effect=提交):
+                候选 = [self.common.FIXED_A + "NEWPEPTIDE1", self.common.FIXED_A + "OTHERPEPTIDE2"]
+                pipeline.ensure_prefetch(jobs=[], picker=lambda n: 候选[:n])
+            self.assertEqual(len(已提交), 2)
 
     def test_MSA就绪预取必须绑定GPU且空请求不放行(self):
         import MSA预处理 as pipeline

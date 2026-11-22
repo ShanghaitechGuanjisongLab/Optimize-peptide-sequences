@@ -181,24 +181,27 @@ def bind_prefetch_gpu(sequence):
 
 
 def ensure_prefetch(jobs=None, picker=None):
-    """至少保留一条新小肽：MSA 已就绪、GPU 尚未启动。"""
+    """MSA 就绪、GPU 未启动的新小肽数量等于当前运行中的不同节点数。"""
     jobs = hq("job", "list", "--all") if jobs is None else jobs
+    在线 = [worker for worker in hq("worker", "list") if worker.get("ended") is None]
+    目标水位 = len({worker.get("configuration", {}).get("hostname") for worker in 在线})
     states = [json.loads(path.read_text()) for path in _state_root().glob("*.json")]
     索引 = {job["id"]: job for job in jobs}
+    可供应 = []
     for state in states:
         sequence = state.get("sequence")
         if not sequence or state.get("gpu_ids"):
             continue
         job = 索引.get(state.get("msa_job"))
         stats = (job or {}).get("task_stats") or {}
-        if not needed(sequence):
-            if bind_prefetch_gpu(sequence):
-                return state
-            continue
         if job is None or any(stats.get(key) for key in ("failed", "canceled", "aborted")):
             continue  # 已取消/失败的旧任务不永久占用预取水位
+        if not needed(sequence):
+            if bind_prefetch_gpu(sequence):
+                可供应.append(state)
+            continue
         if bind_prefetch_gpu(sequence):
-            return None  # 在途 MSA 已绑定 GPU，不能继续扩散
+            可供应.append(state)  # 在途 MSA 已绑定 GPU，不会重复新增
     sys.path.insert(0, str(HERE.parent))
     import 小肽数据库 as database
     import 小肽优化_无限 as search
@@ -212,14 +215,19 @@ def ensure_prefetch(jobs=None, picker=None):
         if any(row.get(f"iptm_{target.lower()}") is not None for target in database.PRODUCT_TARGETS):
             continue
         if bind_prefetch_gpu(peptide_sequence):
-            return {"sequence": peptide_sequence, "ready": True}
-    for peptide_sequence in (picker(1) if picker is not None else search.sweep_pick(search.PRODUCT_TARGETS, 1)):
-        if peptide_sequence[len(search.FIXED_A):] not in 已登记:
-            job_id = submit_msa(peptide_sequence, str(_state_root()), 0)
-            bind_prefetch_gpu(peptide_sequence)
-            print(f"预取下一条新小肽 MSA：{job_id}；GPU 请求已绑定，等待 MSA 完成", flush=True)
-            return read_state(peptide_sequence)
-    return None
+            可供应.append({"sequence": peptide_sequence, "ready": True})
+    if len(可供应) >= 目标水位:
+        return 可供应[0] if 可供应 else None
+    for peptide_sequence in (picker(目标水位 - len(可供应)) if picker is not None else search.sweep_pick(search.PRODUCT_TARGETS, 目标水位 - len(可供应))):
+        if peptide_sequence[len(search.FIXED_A):] in 已登记:
+            continue
+        job_id = submit_msa(peptide_sequence, str(_state_root()), 0)
+        bind_prefetch_gpu(peptide_sequence)
+        print(f"预取下一条新小肽 MSA：{job_id}；GPU 请求已绑定，等待 MSA 完成", flush=True)
+        可供应.append(read_state(peptide_sequence))
+        if len(可供应) >= 目标水位:
+            break
+    return 可供应[0] if 可供应 else None
 
 
 def advance_pending(only_ids=None):
