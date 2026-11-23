@@ -235,14 +235,25 @@ def advance_pending(only_ids=None):
     import af3任务 as adapter
     replacements = {}
     states = [json.loads(path.read_text()) for path in _state_root().glob("*.json")]
-    if not any(state.get("msa_job") is not None and not state.get("gpu_ids") for state in states):
+    待查 = [s["msa_job"] for s in states if s.get("msa_job") is not None and not s.get("gpu_ids")]
+    if not 待查:
         return replacements
-    jobs = hq("job", "list", "--all")
+    try:
+        详情 = hq("job", "info", ",".join(map(str, sorted(set(待查)))))
+        索引 = {}
+        for item in 详情:
+            信息 = item.get("info", item)
+            编号 = 信息.get("id", item.get("id"))
+            if 编号 is not None:
+                索引[编号] = 信息
+    except (RuntimeError, OSError, ValueError):
+        print("MSA 状态查询暂时失败，保持当前等待状态", flush=True)
+        return replacements
     for state in states:
         job_id = state.get("msa_job")
         if job_id is None or state.get("gpu_ids"):
             continue
-        job = next((item for item in jobs if item["id"] == job_id), None)
+        job = 索引.get(job_id)
         if job is None and needed(state["sequence"]):
             continue
         stats = (job or {}).get("task_stats") or {}
@@ -261,13 +272,6 @@ def advance_pending(only_ids=None):
         gpu_ids = []
         for request in state.get("gpu_pending", []):
             name = request.get("name") or os.path.splitext(os.path.basename(request["json_path"]))[0]
-            existing = next((job for job in jobs if job.get("name") == name), None)
-            if existing is not None:
-                stats = existing.get("task_stats") or {}
-                if any(stats.get(key) for key in ("failed", "canceled", "aborted")):
-                    raise RuntimeError(f"MSA 后 GPU 任务 {name} 未成功")
-                gpu_ids.append(existing["id"])
-                continue
             gpu_ids.append(adapter.submit(request["json_path"], request["env"], request["task_root"], priority=request["priority"], gpus=request.get("gpus", 1), cpus=1, name=request.get("name"), allow_msa=False))
         state["gpu_ids"] = gpu_ids
         write_state(state["sequence"], state)

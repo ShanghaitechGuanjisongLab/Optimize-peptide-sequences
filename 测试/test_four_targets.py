@@ -263,7 +263,7 @@ class FourTargetTests(unittest.TestCase):
 
         前五 = {"数据库": "同步库", "启用靶标": ["HTR1A", "ASIC1A"], "齐全记录数": 0, "记录": []}
         运行记录 = {"任务名": "running_asic1a", "分区": "bme_gpu", "每卡显存GiB": 32, "靶标": "ASIC1A", "HQ作业号": 1, "Slurm作业号": "100"}
-        等待记录 = {"作业号": 2, "任务名": "waiting_asic1a", "等待任务数": 1, "资源方案": 1, "GPU数": 1, "每卡显存下限GiB": 22, "每卡显存上限GiB": 44, "优先级": 1, "妥协优先级": 0}
+        等待记录 = {"作业号": 2, "任务名": "waiting_asic1a", "CPU数": 1, "等待任务数": 1, "资源方案": 1, "GPU数": 1, "每卡显存下限GiB": 22, "每卡显存上限GiB": 44, "优先级": 1, "妥协优先级": 0}
         快照 = {"运行靶标": [运行记录], "等待任务": [等待记录]}
         调用 = []
         with patch.object(汇总, "读取HQ快照", return_value=快照), patch.object(汇总, "读取Slurm等待", return_value=[]), patch.object(汇总, "读取前五", side_effect=lambda: 调用.append("读取排名") or 前五):
