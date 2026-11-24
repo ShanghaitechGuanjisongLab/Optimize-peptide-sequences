@@ -213,13 +213,21 @@ def 格式化汇总(汇总):
     if 汇总["运行靶标"] is None:
         文本.append("查询失败：" + 汇总["错误"]["HQ"])
     else:
-        数据行 = [[行["分区"], "CPU" if 行["每卡显存GiB"] is None else f"{行['每卡显存GiB']:g}", 行["靶标"], 行["HQ作业号"], 行["任务名"], 行["Slurm作业号"]] for 行 in 汇总["运行靶标"]]
-        文本.append(表格文本(["分区", "显存(GiB/卡)", "靶标", "HQ ID", "任务名", "Slurm ID"], 数据行, "当前没有运行中的 HQ 计算任务。"))
+        运行总数 = len(汇总["运行靶标"])
+        运行显示 = 汇总["运行靶标"][:5]
+        数据行 = [[行["分区"], "CPU" if 行["每卡显存GiB"] is None else f"{行['每卡显存GiB']:g}", 行["靶标"], 行["HQ作业号"], 行["任务名"], 行["Slurm作业号"]] for 行 in 运行显示]
+        尾注 = "" if 运行总数 <= 5 else f"（仅显示前 5 条，共 {运行总数} 条运行记录）"
+        文本.append(表格文本(["分区", "显存(GiB/卡)", "靶标", "HQ ID", "任务名", "Slurm ID"], 数据行, "当前没有运行中的 HQ 计算任务。") + 尾注)
     文本.extend(["", "三、Slurm 层等待分配"])
     if 汇总["Slurm等待"] is None:
         文本.append("查询失败：" + 汇总["错误"]["Slurm"])
     else:
-        文本.append(格式化Slurm等待(汇总["Slurm等待"]))
+        Slurm总数 = len(汇总["Slurm等待"])
+        Slurm显示 = 汇总["Slurm等待"][:5]
+        Slurm文本 = 格式化Slurm等待(Slurm显示)
+        if Slurm总数 > 5:
+            Slurm文本 += f"\n（仅显示前 5 条，共 {Slurm总数} 条 Slurm 等待记录）"
+        文本.append(Slurm文本)
         文本.append("候选节点尚未分配，仅按分区、GPU 型号和包含/排除约束筛选；预计开始时间不是保证。")
     文本.extend(["", "四、HQ 层等待任务"])
     文本.append("查询失败：" + 汇总["错误"]["HQ"] if 汇总["HQ等待"] is None else HQ队列.格式化队列(汇总["HQ等待"]))
