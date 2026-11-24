@@ -192,16 +192,22 @@ def ensure_prefetch(jobs=None, picker=None):
         sequence = state.get("sequence")
         if not sequence or state.get("gpu_ids"):
             continue
-        job = 索引.get(state.get("msa_job"))
-        stats = (job or {}).get("task_stats") or {}
-        if job is None or any(stats.get(key) for key in ("failed", "canceled", "aborted")):
-            continue  # 已取消/失败的旧任务不永久占用预取水位
+        job_id = state.get("msa_job")
+        if job_id is not None:
+            job = 索引.get(job_id)
+            stats = (job or {}).get("task_stats") or {}
+            if any(stats.get(key) for key in ("failed", "canceled", "aborted")):
+                continue  # 已取消/失败的旧任务不永久占用预取水位
+            if stats.get("running") or stats.get("waiting"):
+                if bind_prefetch_gpu(sequence):
+                    可供应.append(state)
+                continue
         if not needed(sequence):
             if bind_prefetch_gpu(sequence):
                 可供应.append(state)
-            continue
-        if bind_prefetch_gpu(sequence):
-            可供应.append(state)  # 在途 MSA 已绑定 GPU，不会重复新增
+        elif job_id is not None:
+            if bind_prefetch_gpu(sequence):
+                可供应.append(state)
     sys.path.insert(0, str(HERE.parent))
     import 小肽数据库 as database
     import 小肽优化_无限 as search
@@ -236,34 +242,39 @@ def advance_pending(only_ids=None):
     replacements = {}
     states = [json.loads(path.read_text()) for path in _state_root().glob("*.json")]
     待查 = [s["msa_job"] for s in states if s.get("msa_job") is not None and not s.get("gpu_ids")]
-    if not 待查:
+    无需查 = [s for s in states if s.get("msa_job") is None and not s.get("gpu_ids")]
+    if not 待查 and not 无需查:
         return replacements
-    try:
-        详情 = hq("job", "info", ",".join(map(str, sorted(set(待查)))))
-        索引 = {}
-        for item in 详情:
-            信息 = item.get("info", item)
-            编号 = 信息.get("id", item.get("id"))
-            if 编号 is not None:
-                索引[编号] = 信息
-    except (RuntimeError, OSError, ValueError):
-        print("MSA 状态查询暂时失败，保持当前等待状态", flush=True)
-        return replacements
+    索引 = {}
+    if 待查:
+        try:
+            详情 = hq("job", "info", ",".join(map(str, sorted(set(待查)))))
+            for item in 详情:
+                信息 = item.get("info", item)
+                编号 = 信息.get("id", item.get("id"))
+                if 编号 is not None:
+                    索引[编号] = 信息
+        except (RuntimeError, OSError, ValueError):
+            print("MSA 状态查询暂时失败，保持当前等待状态", flush=True)
+            return replacements
     for state in states:
         job_id = state.get("msa_job")
-        if job_id is None or state.get("gpu_ids"):
+        if state.get("gpu_ids"):
             continue
-        job = 索引.get(job_id)
-        if job is None and needed(state["sequence"]):
-            continue
-        stats = (job or {}).get("task_stats") or {}
-        if any(stats.get(key) for key in ("failed", "canceled", "aborted")):
-            if only_ids is None or job_id in only_ids:
-                raise RuntimeError(f"MSA 任务 {job_id} 未成功，拒绝放行 GPU 推理")
-            continue
-        if stats.get("running") or stats.get("waiting"):
-            continue
-        if not stats.get("finished") and needed(state["sequence"]):
+        if job_id is not None:
+            job = 索引.get(job_id)
+            if job is None and needed(state["sequence"]):
+                continue
+            stats = (job or {}).get("task_stats") or {}
+            if any(stats.get(key) for key in ("failed", "canceled", "aborted")):
+                if only_ids is None or job_id in only_ids:
+                    raise RuntimeError(f"MSA 任务 {job_id} 未成功，拒绝放行 GPU 推理")
+                continue
+            if stats.get("running") or stats.get("waiting"):
+                continue
+            if not stats.get("finished") and needed(state["sequence"]):
+                continue
+        if needed(state["sequence"]):
             continue
         if needed(state["sequence"]):
             continue
