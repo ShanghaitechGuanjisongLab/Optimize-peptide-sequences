@@ -85,14 +85,35 @@ class FourTargetTests(unittest.TestCase):
     def test_独立前五只输出序列和靶标分量不输出乘积样本列(self):
         import 查看前五 as 排名
 
-        排名记录 = [(0.56, "s000", {"peptide": "SEQ", "obj_n": 999}, [0.7, 0.8])]
-        with patch.object(排名, "读取排名", return_value=排名记录) as 读取, patch.object(排名, "TARGETS", ("HTR1A", "ASIC1A")), patch("sys.argv", ["查看前五.py"]), patch("builtins.print") as 打印:
+        乘积记录 = [(0.56, "s000", {"peptide": "SEQ", "obj_n": 999}, [0.7, 0.8])]
+        靶标记录 = {"HTR1A": [(0.9, "sH", {"peptide": "SEQH"}, [0.9, None])],
+                    "ASIC1A": [(0.8, "s000", {"peptide": "SEQ"}, [0.7, 0.8])]}
+        with patch.object(排名, "读取排名", return_value=乘积记录) as 读取, \
+                patch.object(排名, "读取靶标排名", side_effect=lambda 靶标: 靶标记录[靶标]), \
+                patch.object(排名, "TARGETS", ("HTR1A", "ASIC1A")), patch("sys.argv", ["查看前五.py"]), patch("builtins.print") as 打印:
             排名.main()
         输出行 = [调用.args[0].strip() for 调用 in 打印.call_args_list]
-        表头 = next(行 for 行 in 输出行 if 行.startswith("排名"))
-        self.assertEqual(表头.split(), ["排名", "序列", "HTR1A", "ASIC1A"])
+        表头列表 = [行 for 行 in 输出行 if 行.startswith("排名")]
+        self.assertEqual(len(表头列表), 3)
+        for 表头 in 表头列表:
+            self.assertEqual(表头.split(), ["排名", "序列", "HTR1A", "ASIC1A"])
+        排序行 = [行 for 行 in 输出行 if 行.startswith("排序：")]
+        self.assertEqual(len(排序行), 3)
+        self.assertIn("HTR1A × ASIC1A 乘积", 排序行[0])
+        self.assertIn("HTR1A ipTM", 排序行[1])
+        self.assertIn("ASIC1A ipTM", 排序行[2])
+        self.assertIn("SEQH", "\n".join(输出行))
+        self.assertIn("-", next(行 for 行 in 输出行 if "SEQH" in 行))
         self.assertEqual(输出行[-1].split(), ["1", "SEQ", "0.70", "0.80"])
-        读取.assert_called_once_with(False)
+        读取.assert_called_once_with()
+
+    def test_单靶标榜纳入其他靶标缺分的记录(self):
+        import 查看前五 as 排名
+
+        评分表 = {"s1": {"iptm_htr1a": 0.9}, "s2": {"iptm_htr1a": 0.7, "iptm_asic1a": 0.8}, "invalid": {"iptm_htr1a": float("nan")}}
+        with patch.object(self.db, "load_database", return_value=评分表), patch.object(排名, "TARGETS", ("HTR1A", "ASIC1A")):
+            self.assertEqual([项[1] for 项 in 排名.读取靶标排名("HTR1A")], ["s1", "s2"])
+            self.assertEqual([项[1] for 项 in 排名.读取靶标排名("ASIC1A")], ["s2"])
 
     def test_汇总前五固定区仅输出一次且表中只显示可变区(self):
         import 信息汇总 as 汇总
@@ -154,22 +175,25 @@ class FourTargetTests(unittest.TestCase):
             if 参数[0] == "squeue":
                 return "100|elastic|gpu|gpu:1|8|32G|5-00:00:00|QOSMaxJobsPerUserLimit|N/A\n101|cky|gpu|gpu:A10040GB:1|8|64G|8:00:00|Priority|2026-11-13T01:00:00"
             if 参数[-1] == "100":
-                return "JobId=100 ReqNodeList=(null) ExcNodeList=small"
+                return "JobId=100 ReqNodeList=(null) ExcNodeList=small SchedNodeList=large"
             if 参数[-1] == "101":
                 return "JobId=101 ReqNodeList=(null) ExcNodeList=(null)"
             if 参数[1:3] == ["show", "hostnames"]:
-                return "small"
-            return "NodeName=small Partitions=gpu Gres=gpu:V10032GB:4\nNodeName=large Partitions=gpu Gres=gpu:A10080GB:4\nNodeName=medium Partitions=gpu Gres=gpu:A10040GB:4\nNodeName=other Partitions=other Gres=gpu:A10080GB:4"
+                return {"small": "small", "large": "large"}[参数[-1]]
+            return "NodeName=small Partitions=gpu Gres=gpu:V10032GB:4 State=IDLE\nNodeName=large Partitions=gpu Gres=gpu:A10080GB:4 State=MIXED\nNodeName=medium Partitions=gpu Gres=gpu:A10040GB:4 State=MIXED\nNodeName=drained Partitions=gpu Gres=gpu:A10040GB:4 State=IDLE+DRAIN\nNodeName=other Partitions=other Gres=gpu:A10080GB:4 State=IDLE"
 
         记录 = 汇总.读取Slurm等待(运行)
         self.assertEqual(记录[0]["候选节点"], ["large", "medium"])
         self.assertEqual(记录[0]["每卡显存档位GiB"], [40, 80])
+        self.assertEqual(记录[0]["调度锁定"], ["large"])
         self.assertEqual(记录[0]["预计开始"], "未知")
         self.assertEqual(记录[1]["候选节点"], ["medium"])
         self.assertEqual(记录[1]["每卡显存档位GiB"], [40])
         文本 = 汇总.格式化Slurm等待(记录)
         self.assertIn("申请显存(GiB/卡)", 文本)
         self.assertIn("40/80(未限定单档)", 文本)
+        self.assertIn("锁定:large", 文本)
+        self.assertNotIn("drained", 文本)
         self.assertNotIn("GPU数", 文本.splitlines()[0])
         self.assertNotIn("GPU请求", 文本.splitlines()[0])
 

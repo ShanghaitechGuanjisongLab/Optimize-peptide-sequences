@@ -127,6 +127,9 @@ def 读取Slurm等待(运行=运行命令):
             节点名 = 节点.get("NodeName")
             if not 节点名 or not set(分区.split(",")).intersection(节点.get("Partitions", "").split(",")) or 节点名 in 排除节点 or (包含节点 and 节点名 not in 包含节点):
                 continue
+            状态 = 节点.get("State", "")
+            if 状态 and (not any(状态.startswith(前缀) for 前缀 in ("IDLE", "MIXED", "ALLOCATED")) or any(标志 in 状态 for 标志 in ("DRAIN", "DOWN", "FAIL", "RESERVED", "NO_RESPOND"))):
+                continue  # drain/down 节点不可调度，不得混入候选档位
             显卡 = re.findall(r"(?:^|,)gpu:([^:,()]+):(\d+)", 节点.get("Gres", ""))
             if 数量 and sum(int(张数) for 类型, 张数 in 显卡 if 型号 is None or 类型 == 型号.group(1)) < 数量:
                 continue
@@ -143,7 +146,7 @@ def 读取Slurm等待(运行=运行命令):
         if 型号 is not None and gpu_memory(型号.group(1)) is not None:
             显存档位 = {gpu_memory(型号.group(1))}
             显存未知 = False
-        记录列表.append({"Slurm作业号": 编号, "作业名": 名称, "分区": 分区, "GPU请求": GPU请求 if 数量 else "CPU", "GPU数": 数量, "每卡显存档位GiB": sorted(显存档位), "显存档位未知": 显存未知 or (数量 > 0 and not 显存档位), "CPU": CPU, "主机内存": 主机内存, "时限": 时限, "候选节点": sorted(候选节点), "预计开始": 预计开始 if 预计开始 not in ("N/A", "Unknown", "None") else "未知", "等待原因": 原因})
+        记录列表.append({"Slurm作业号": 编号, "作业名": 名称, "分区": 分区, "GPU请求": GPU请求 if 数量 else "CPU", "GPU数": 数量, "每卡显存档位GiB": sorted(显存档位), "显存档位未知": 显存未知 or (数量 > 0 and not 显存档位), "CPU": CPU, "主机内存": 主机内存, "时限": 时限, "候选节点": sorted(候选节点), "调度锁定": sorted(展开节点(明细.get("SchedNodeList"))), "预计开始": 预计开始 if 预计开始 not in ("N/A", "Unknown", "None") else "未知", "等待原因": 原因})
     return 记录列表
 
 
@@ -158,7 +161,10 @@ def 格式化Slurm等待(记录列表):
         显存文本 = "/".join(档位) if 记录["GPU数"] else "CPU"
         if len(档位) > 1:
             显存文本 += "(未限定单档)"
-        数据行.append([记录["Slurm作业号"], 记录["作业名"], 记录["分区"], *([记录["GPU数"]] if 显示GPU数 else []), 显存文本, ",".join(记录["候选节点"]) or "未确定", 记录["预计开始"], 记录["等待原因"]])
+        节点文本 = ",".join(记录["候选节点"]) or "未确定"
+        if 记录.get("调度锁定"):
+            节点文本 = "锁定:" + ",".join(记录["调度锁定"]) + "（候选:" + 节点文本 + "）"
+        数据行.append([记录["Slurm作业号"], 记录["作业名"], 记录["分区"], *([记录["GPU数"]] if 显示GPU数 else []), 显存文本, 节点文本, 记录["预计开始"], 记录["等待原因"]])
     return 表格文本(表头, 数据行, "当前没有 Slurm 排队作业。")
 
 
