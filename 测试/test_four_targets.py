@@ -667,8 +667,9 @@ class FourTargetTests(unittest.TestCase):
                     patch.object(pipeline, "hq", side_effect=lambda *参数, **kw: [{"id": 500, "task_stats": {"waiting": 1}}] if 参数[0] == "job" else "500") as 提交:
                 ids = [tasks.submit(path, env, str(root)) for path in inputs]
                 self.assertEqual(ids, [500, 500])
-                self.assertEqual(len(提交.call_args_list), 1)
-                self.assertIn("7", 提交.call_args.args)
+                提交调用 = [调用 for 调用 in 提交.call_args_list if 调用.args[0] == "submit"]
+                self.assertEqual(len(提交调用), 1)
+                self.assertIn("7", 提交调用[0].args)
                 with patch.object(tasks.subprocess, "run", side_effect=AssertionError("MSA前不得提交GPU")):
                     self.assertEqual(pipeline.resolve_ids([500]), [500])
             with patch.object(pipeline.cache, "load", return_value={"unpairedMsa": "x", "pairedMsa": "x", "templates": []}), \
@@ -742,6 +743,30 @@ class FourTargetTests(unittest.TestCase):
                 self.assertEqual(pipeline.submit_msa(self.common.SEQ_202, directory, 0), 600)
             参数 = 提交.call_args.args
             self.assertEqual(参数[参数.index("--cpus") + 1], "4")
+
+    def test_陈旧MSA号不得盲信须核实或重提(self):
+        import MSA预处理 as pipeline
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"TASKCTL_STATE": directory}):
+            seq = self.common.SEQ_202
+            pipeline.write_state(seq, {"sequence": seq, "msa_job": 208})
+            def 假hq(*参数, **关键字):
+                if 参数[:2] == ("job", "info"):
+                    return [{"info": {"id": 208, "name": "别人的任务", "task_stats": {"running": 1}}}]
+                return "600"
+            with patch.object(pipeline.cache, "load", return_value=None), \
+                    patch.object(pipeline, "msa_cpu_count", return_value=4), \
+                    patch.object(pipeline, "hq", side_effect=假hq):
+                self.assertEqual(pipeline.submit_msa(seq, directory, 0), 600)
+            self.assertEqual(pipeline.read_state(seq)["msa_job"], 600)
+            # 号在队且名字匹配 → 复用不重提
+            pipeline.write_state(seq, {"sequence": seq, "msa_job": 600})
+            def 真号(*参数, **关键字):
+                if 参数[:2] == ("job", "info"):
+                    return [{"info": {"id": 600, "name": pipeline._msa_name(seq), "task_stats": {"waiting": 1}}}]
+                raise AssertionError("不应重提")
+            with patch.object(pipeline.cache, "load", return_value=None), \
+                    patch.object(pipeline, "hq", side_effect=真号):
+                self.assertEqual(pipeline.submit_msa(seq, directory, 0), 600)
 
     def test_MSA水位等于运行中的不同节点数(self):
         self.node.load_hq_adapter()
@@ -1190,6 +1215,46 @@ class FourTargetTests(unittest.TestCase):
                     refiller.deadline = 0
                     refiller.refill([])
                     self.assertEqual(adapter.submit.call_count, previous)
+
+    def test_账本重置丢失任务按名接管或重提而非崩溃(self):
+        适配器 = self.node.load_hq_adapter()
+        with tempfile.TemporaryDirectory() as directory:
+            bundle = Path(directory)
+            (bundle / "s000_asic1a.json").write_text("{}")
+            (bundle / "s000_htr1a_s42.json").write_text("{}")
+            初始队列 = [{"id": 7, "name": "s000_asic1a", "task_stats": {"running": 1}},
+                        {"id": 8, "name": "s000_htr1a_s42", "task_stats": {"waiting": 1}}]
+            重置后队列 = [{"id": 3, "name": "s000_asic1a", "task_stats": {"running": 1}}]
+            提交记录 = []
+            def 假提交(path, env, task_root, priority=0, **kwargs):
+                提交记录.append(Path(path).stem)
+                return 9
+            with patch.object(self.node, "load_hq_adapter", return_value=适配器), \
+                    patch.object(适配器, "queue_jobs", side_effect=[初始队列, 重置后队列]), \
+                    patch.object(适配器, "submit", side_effect=假提交), \
+                    patch.object(适配器, "wait", side_effect=[适配器.任务丢失([7, 8]), None]) as 等待, \
+                    patch.object(self.db, "find_summary", return_value=False), \
+                    patch.object(self.node, "_HQ_REFILL", None), \
+                    patch.object(self.node, "build_runner_env", return_value={}):
+                self.assertEqual(self.node.run_af3_cycle_hq(str(bundle)), 0)
+            self.assertEqual(提交记录, ["s000_htr1a_s42"])  # 普通预测接管新号3，补采种子重提
+            self.assertEqual(等待.call_args_list[1].args[0], [3, 9])
+
+    def test_账本重置且结果已在盘上则不重提(self):
+        适配器 = self.node.load_hq_adapter()
+        with tempfile.TemporaryDirectory() as directory:
+            bundle = Path(directory)
+            (bundle / "s000_asic1a.json").write_text("{}")
+            队列 = [{"id": 7, "name": "s000_asic1a", "task_stats": {"running": 1}}]
+            with patch.object(self.node, "load_hq_adapter", return_value=适配器), \
+                    patch.object(适配器, "queue_jobs", side_effect=[队列, []]), \
+                    patch.object(适配器, "submit") as 提交, \
+                    patch.object(适配器, "wait", side_effect=[适配器.任务丢失([7]), None]), \
+                    patch.object(self.db, "find_summary", return_value=True), \
+                    patch.object(self.node, "_HQ_REFILL", None), \
+                    patch.object(self.node, "build_runner_env", return_value={}):
+                self.assertEqual(self.node.run_af3_cycle_hq(str(bundle)), 0)
+            提交.assert_not_called()
 
     def test_HQ事件仅在任务或worker状态变化时刷新队列(self):
         适配器 = self.node.load_hq_adapter()

@@ -302,7 +302,45 @@ def run_af3_cycle_hq(bundle_dir, out_dir=None, priority=0):
           f"（可随时 add/cancel）：{ids}"
           + (f"\n     ♻️ 其中 {len(adopted)} 个为接管重启前仍在队列的任务，未重复提交"
              if adopted else ""), flush=True)
-    mod.wait(ids, on_poll=_HQ_REFILL)
+    id2stem = dict(zip(ids, (os.path.splitext(n)[0] for n in names)))
+    stem2file = {os.path.splitext(n)[0]: n for n in names}
+    for attempt in range(4):
+        try:
+            mod.wait(ids, on_poll=_HQ_REFILL)
+            break
+        except mod.任务丢失 as error:
+            # HQ 账本重置（server 重启）：按名接管新队列里的同名任务，
+            # 真丢失的按需重提（普通预测已有 summary 则跳过，补采种子必须重跑）。
+            if attempt == 3:
+                raise
+            lost_stems = [id2stem[编号] for 编号 in error.missing if 编号 in id2stem]
+            print(f"  ⚠️ HQ 账本重置，丢失任务 {error.missing}；按名接管/重提：{lost_stems}", flush=True)
+            active = {job["name"]: job["id"] for job in mod.queue_jobs()
+                      if (job.get("task_stats") or {}).get("running")
+                      or (job.get("task_stats") or {}).get("waiting")}
+            rebuilt = []
+            for 编号 in ids:
+                stem = id2stem.get(编号)
+                if 编号 not in error.missing:
+                    rebuilt.append(编号)
+                    continue
+                if stem in active:
+                    rebuilt.append(active[stem])
+                    continue
+                if stem and not re.search(r"_s\d+$", stem):
+                    tag, _, target = stem.rpartition("_")
+                    if db.find_summary(db.canonical_dir(tag, target.upper())):
+                        continue  # 结果已在盘上，无需重跑
+                if stem not in stem2file:
+                    raise
+                new_id = mod.submit(os.path.join(bundle_dir, stem2file[stem]),
+                                    env, task_root,
+                                    priority=job_priority(stem2file[stem]))
+                id2stem[new_id] = stem
+                rebuilt.append(new_id)
+            if not rebuilt:
+                break  # 丢失的任务全部已有结果
+            ids = rebuilt
     print("  ✅ 本周期全部 AF3 任务已到终态", flush=True)
     return 0
 

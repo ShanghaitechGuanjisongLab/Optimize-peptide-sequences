@@ -292,6 +292,14 @@ def 任务事件流():
         进程.stderr.close()
 
 
+class 任务丢失(RuntimeError):
+    """HQ 账本重置（server 重启）导致待等待任务号消失；携带丢失号供上游按名接管/重提。"""
+
+    def __init__(self, missing):
+        self.missing = sorted(int(编号) for 编号 in missing)
+        super().__init__(f"HQ 队列缺少待等待任务：{self.missing}")
+
+
 def wait(ids, on_poll=None, poll_seconds=15):
     """等待完整 AF3；CPU MSA 完成后替换成真实 GPU 任务，不提前返回成功。"""
     import MSA预处理 as pipeline
@@ -307,7 +315,7 @@ def wait(ids, on_poll=None, poll_seconds=15):
         已终态作业.update(任务["id"] for 任务 in jobs if not 任务.get("is_open", False) and not any((任务.get("task_stats") or {}).get(状态) for 状态 in ("running", "waiting")) and any((任务.get("task_stats") or {}).get(状态) for 状态 in ("finished", "failed", "canceled", "aborted")))
         tracked = {job["id"]: job for job in jobs if job["id"] in owned}
         if owned - tracked.keys():
-            raise RuntimeError(f"HQ 队列缺少待等待任务：{sorted(owned - tracked.keys())}")
+            raise 任务丢失(owned - tracked.keys())
         failed = {job_id: job.get("task_stats") for job_id, job in tracked.items()
                   if any((job.get("task_stats") or {}).get(state)
                          for state in ("failed", "canceled", "aborted"))}

@@ -154,7 +154,19 @@ def submit_msa(sequence, task_root, priority=0):
         return None
     job_id = state.get("msa_job")
     if job_id is not None:
-        return int(job_id)
+        # 陈旧号盲信是 10 连崩根因：server 重置后旧号消失/撞新任务，
+        # 必须核实号在队且名字匹配才复用，否则清掉重提。
+        try:
+            详情 = hq("job", "info", str(job_id))
+            信息 = (详情[0].get("info", 详情[0]) if 详情 else {})
+            stats = 信息.get("task_stats") or {}
+            名字 = 信息.get("name")
+            if 信息.get("id") == int(job_id) and (名字 is None or 名字 == _msa_name(sequence)) and not any(stats.get(k) for k in ("failed", "canceled", "aborted")):
+                return int(job_id)
+        except (RuntimeError, OSError, ValueError, IndexError):
+            pass  # 号不存在/查询异常：视为丢失重提
+        state["msa_job"] = None
+        write_state(sequence, state)
     if state.get("gpu_ids"):
         raise RuntimeError("小肽 MSA 已放行 GPU，不应重复提交预处理")
     # 数据管线固定并行 4 个数据库搜索，至少预约 4 核；容量不足时宁可排队也不超订
