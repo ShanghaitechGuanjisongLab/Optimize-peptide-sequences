@@ -692,21 +692,32 @@ class FourTargetTests(unittest.TestCase):
                     patch.object(pipeline, "bind_prefetch_gpu", return_value=True):
                 结果 = pipeline.ensure_prefetch(jobs=[], picker=lambda n: [self.common.FIXED_A + "NEWPEPTIDE1"][:n])
                 self.assertEqual(结果["msa_job"], 800)
+                真名 = pipeline._msa_name(self.common.FIXED_A + "NEWPEPTIDE1")
                 # MSA 尚在运行/等待时，无论多少事件都不得新增预取。
                 for _ in range(20):
-                    pipeline.ensure_prefetch(jobs=[{"id": 800, "name": "msa_test", "task_stats": {"running": 1}}, {"id": 900, "name": "gpu_test", "task_stats": {"waiting": 1}}], picker=lambda n: [self.common.FIXED_A + "OTHERPEPTIDE2"])
+                    pipeline.ensure_prefetch(jobs=[{"id": 800, "name": 真名, "task_stats": {"running": 1}}, {"id": 900, "name": "gpu_test", "task_stats": {"waiting": 1}}], picker=lambda n: [self.common.FIXED_A + "OTHERPEPTIDE2"])
                 self.assertEqual(提交.call_count, 1)
                 # 无排队且所有剩余 GPU 都等 MSA 时，低水位允许再预取一条。
                 前次数 = 提交.call_count
                 with patch("小肽优化_无限.attempted_vars", return_value=set()):
-                    pipeline.ensure_prefetch(jobs=[{"id": 800, "name": "msa_test", "task_stats": {"running": 1}}], picker=lambda n: [self.common.FIXED_A + "OTHERPEPTIDE3"])
+                    pipeline.ensure_prefetch(jobs=[{"id": 800, "name": 真名, "task_stats": {"running": 1}}], picker=lambda n: [self.common.FIXED_A + "OTHERPEPTIDE3"])
                 self.assertGreaterEqual(提交.call_count, 前次数)
                 # 已取消的旧 MSA 不永久占位，可以恢复预取下一条。
-                pipeline.ensure_prefetch(jobs=[{"id": 800, "name": "msa_test", "task_stats": {"canceled": 1}}], picker=lambda n: [self.common.FIXED_A + "THIRDPEPTIDE4"])
+                pipeline.ensure_prefetch(jobs=[{"id": 800, "name": 真名, "task_stats": {"canceled": 1}}], picker=lambda n: [self.common.FIXED_A + "THIRDPEPTIDE4"])
                 self.assertGreaterEqual(提交.call_count, 前次数)
                 with patch.object(pipeline, "needed", return_value=False):
                     self.assertEqual(pipeline.ensure_prefetch(jobs=[{"id": 800, "task_stats": {"running": 1}}])["msa_job"], 800)
                     self.assertEqual(提交.call_count, 2)
+
+    def test_MSA至少预约四核防超订(self):
+        import MSA预处理 as pipeline
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"TASKCTL_STATE": directory}):
+            with patch.object(pipeline.cache, "load", return_value=None), \
+                    patch.object(pipeline, "msa_cpu_count", return_value=1), \
+                    patch.object(pipeline, "hq", return_value="600") as 提交:
+                self.assertEqual(pipeline.submit_msa(self.common.SEQ_202, directory, 0), 600)
+            参数 = 提交.call_args.args
+            self.assertEqual(参数[参数.index("--cpus") + 1], "4")
 
     def test_MSA水位等于运行中的不同节点数(self):
         self.node.load_hq_adapter()
@@ -749,6 +760,246 @@ class FourTargetTests(unittest.TestCase):
             with patch.object(pipeline, "hq", return_value=[{"id": 500, "task_stats": {"finished": 1}}]), patch.object(pipeline, "needed", return_value=False):
                 self.assertEqual(pipeline.advance_pending(), {})
                 self.assertNotIn("gpu_ids", pipeline.read_state(sequence))
+
+    def test_预取GPU优先级与补采缺口同口径(self):
+        import MSA预处理 as pipeline
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"TASKCTL_STATE": directory}):
+            sequence = self.common.SEQ_202
+            tag = self.db.resolve_tag(sequence[len(self.common.FIXED_A):])
+            pipeline.write_state(sequence, {"sequence": sequence, "msa_job": 500})
+            def 准备(序列, 靶标, 目录):
+                Path(目录).mkdir(parents=True, exist_ok=True)
+                for target in 靶标:
+                    path = Path(目录) / f"{tag}_{target.lower()}.json"
+                    path.write_text(json.dumps(self.common.create_af3_json(sequence, self.inf.TARGET_SEQS[target], path.stem, **self.inf.target_af3_options(target))))
+                return len(靶标), []
+            with patch.object(pipeline.cache, "load", return_value=None), patch.object(pipeline, "needed", return_value=False), \
+                    patch("小肽数据库.load_database", return_value={tag: {"iptm_asic1a": 0.5}}), \
+                    patch("小肽数据库.load_sequence_registry", return_value={tag: {"var": sequence[len(self.common.FIXED_A):], "peptide": sequence}}), \
+                    patch("小肽优化_节点内.prepare_cycle", side_effect=准备), \
+                    patch("小肽优化_节点内.build_runner_env", return_value={}), \
+                    patch.object(pipeline, "submit_msa", return_value=None) as 提交MSA:
+                self.assertTrue(pipeline.bind_prefetch_gpu(sequence))
+            状态 = pipeline.read_state(sequence)
+            优先级 = {请求["name"]: 请求["priority"] for 请求 in 状态["gpu_pending"]}
+            self.assertEqual(优先级, {f"{tag}_htr1a": self.node.RESAMPLE_PRIORITY + 1})
+            self.assertEqual(提交MSA.call_args_list[0].args[2], self.node.RESAMPLE_PRIORITY + 1)
+
+    def test_预取全新探索候选与refill同口径用零优先级(self):
+        import MSA预处理 as pipeline
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"TASKCTL_STATE": directory}):
+            sequence = self.common.FIXED_A + "BRANDNEWPEP"
+            tag = self.db.resolve_tag("BRANDNEWPEP")
+            def 准备(序列, 靶标, 目录):
+                Path(目录).mkdir(parents=True, exist_ok=True)
+                for target in 靶标:
+                    path = Path(目录) / f"{tag}_{target.lower()}.json"
+                    path.write_text(json.dumps(self.common.create_af3_json(sequence, self.inf.TARGET_SEQS[target], path.stem, **self.inf.target_af3_options(target))))
+                return len(靶标), []
+            with patch.object(pipeline.cache, "load", return_value=None), patch.object(pipeline, "needed", return_value=False), \
+                    patch("小肽数据库.load_database", return_value={}), \
+                    patch("小肽数据库.load_sequence_registry", return_value={}), \
+                    patch("小肽优化_节点内.prepare_cycle", side_effect=准备), \
+                    patch("小肽优化_节点内.build_runner_env", return_value={}), \
+                    patch.object(pipeline, "submit_msa", return_value=None) as 提交MSA:
+                self.assertTrue(pipeline.bind_prefetch_gpu(sequence, fresh=True))
+            状态 = pipeline.read_state(sequence)
+            self.assertEqual({请求["priority"] for 请求 in 状态["gpu_pending"]}, {0})
+            self.assertEqual(len(状态["gpu_pending"]), len(self.db.PRODUCT_TARGETS))
+            self.assertEqual(提交MSA.call_args_list[0].args[2], 0)
+
+    def test_register_gpu跨目录同名去重取高优先级(self):
+        import MSA预处理 as pipeline
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"TASKCTL_STATE": directory}):
+            sequence = self.common.SEQ_202
+            tag = self.db.resolve_tag(sequence[len(self.common.FIXED_A):])
+            name = f"{tag}_htr1a"
+            内容 = json.dumps(self.common.create_af3_json(sequence, self.inf.TARGET_SEQS["HTR1A"], name, **self.inf.target_af3_options("HTR1A")))
+            p1 = Path(directory) / "inputs" / f"{name}.json"; p1.parent.mkdir(parents=True); p1.write_text(内容)
+            p2 = Path(directory) / "queue_inputs" / f"{name}.json"; p2.parent.mkdir(parents=True); p2.write_text(内容)
+            with patch.object(pipeline, "submit_msa", return_value=500):
+                pipeline.register_gpu(str(p1), {}, str(Path(directory) / "t"), 0, 1, name)
+                pipeline.register_gpu(str(p2), {}, str(Path(directory) / "t"), 24, 1, name)
+            pending = pipeline.read_state(sequence)["gpu_pending"]
+            self.assertEqual(len(pending), 1)
+            self.assertEqual(pending[0]["priority"], 24)
+
+    def test_advance_pending同名去重并接管已在队任务(self):
+        import MSA预处理 as pipeline
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"TASKCTL_STATE": directory}):
+            sequence = self.common.SEQ_202
+            tag = self.db.resolve_tag(sequence[len(self.common.FIXED_A):])
+            name = f"{tag}_htr1a"
+            内容 = json.dumps(self.common.create_af3_json(sequence, self.inf.TARGET_SEQS["HTR1A"], name, **self.inf.target_af3_options("HTR1A")))
+            p1 = Path(directory) / "inputs" / f"{name}.json"; p1.parent.mkdir(parents=True); p1.write_text(内容)
+            p2 = Path(directory) / "queue_inputs" / f"{name}.json"; p2.parent.mkdir(parents=True); p2.write_text(内容)
+            req1 = {"json_path": str(p1), "env": {}, "task_root": str(Path(directory) / "t"), "priority": 0, "gpus": 1, "name": name}
+            req2 = dict(req1, json_path=str(p2), priority=23)
+            pipeline.write_state(sequence, {"sequence": sequence, "msa_job": 500, "gpu_pending": [req1, req2]})
+            with patch.object(pipeline, "needed", return_value=False), \
+                    patch.object(pipeline, "hq", return_value=[{"id": 77, "name": name, "task_stats": {"running": 1}}]), \
+                    patch("af3任务.submit") as 提交:
+                pipeline.advance_pending()
+            提交.assert_not_called()
+            状态 = pipeline.read_state(sequence)
+            self.assertEqual(状态["gpu_ids"], [77])
+            self.assertEqual(len(状态["gpu_pending"]), 1)
+
+    def test_advance_pending已有分靶标不重复提交(self):
+        import MSA预处理 as pipeline
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"TASKCTL_STATE": directory}):
+            sequence = self.common.SEQ_202
+            tag = self.db.resolve_tag(sequence[len(self.common.FIXED_A):])
+            name = f"{tag}_htr1a"
+            内容 = json.dumps(self.common.create_af3_json(sequence, self.inf.TARGET_SEQS["HTR1A"], name, **self.inf.target_af3_options("HTR1A")))
+            p1 = Path(directory) / "inputs" / f"{name}.json"; p1.parent.mkdir(parents=True); p1.write_text(内容)
+            req = {"json_path": str(p1), "env": {}, "task_root": str(Path(directory) / "t"), "priority": 23, "gpus": 1, "name": name}
+            pipeline.write_state(sequence, {"sequence": sequence, "msa_job": 500, "gpu_pending": [req]})
+            with patch.object(pipeline, "needed", return_value=False), \
+                    patch.object(pipeline, "hq", return_value=[]), \
+                    patch("小肽数据库.load_database", return_value={tag: {"iptm_htr1a": 0.6}}), \
+                    patch("af3任务.submit") as 提交:
+                pipeline.advance_pending()
+            提交.assert_not_called()
+            self.assertEqual(pipeline.read_state(sequence)["gpu_ids"], [])
+
+    def test_纯等待GPU任务按缺口重提且旧号无缝替换(self):
+        import MSA预处理 as pipeline
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"TASKCTL_STATE": directory}):
+            sequence = self.common.SEQ_202
+            tag = self.db.resolve_tag(sequence[len(self.common.FIXED_A):])
+            请求 = {"json_path": f"/tmp/{tag}_htr1a.json", "env": {}, "task_root": "/tmp/tasks", "priority": 0, "gpus": 1, "name": f"{tag}_htr1a"}
+            pipeline.write_state(sequence, {"sequence": sequence, "msa_job": 500, "gpu_pending": [dict(请求)], "gpu_ids": [700]})
+            运行序列 = self.common.FIXED_A + "RUNNINGPEP"
+            运行tag = self.db.resolve_tag("RUNNINGPEP")
+            pipeline.write_state(运行序列, {"sequence": 运行序列, "msa_job": 501, "gpu_pending": [dict(请求, name=f"{运行tag}_htr1a")], "gpu_ids": [701]})
+            调用 = []
+            def 假hq(*参数, **关键字):
+                调用.append(参数)
+                if 参数[:2] == ("job", "info"):
+                    return [{"info": {"id": int(编号), "task_stats": {"waiting" if 编号 == "700" else "running": 1}}} for 编号 in 参数[2].split(",")]
+                return ""
+            with patch.object(pipeline, "needed", return_value=False), \
+                    patch.object(pipeline, "各靶标优先级", return_value=(tag, {"HTR1A": self.node.RESAMPLE_PRIORITY + 1, "ASIC1A": 0})), \
+                    patch.object(pipeline, "hq", side_effect=假hq), \
+                    patch("af3任务.submit", return_value=900) as 提交:
+                替换 = pipeline.reprioritize_waiting()
+            self.assertEqual(替换, {700: 900})
+            self.assertEqual(提交.call_count, 1)
+            self.assertEqual(提交.call_args.kwargs["priority"], self.node.RESAMPLE_PRIORITY + 1)
+            self.assertIn(("job", "cancel", "700"), 调用)
+            self.assertNotIn(("job", "cancel", "701"), 调用)
+            状态 = pipeline.read_state(sequence)
+            self.assertEqual(状态["gpu_ids"], [900])
+            self.assertEqual(状态["gpu_replaced"], {"700": 900})
+            self.assertEqual(状态["gpu_pending"][0]["priority"], self.node.RESAMPLE_PRIORITY + 1)
+            self.assertEqual(pipeline.read_state(运行序列)["gpu_ids"], [701])
+            with patch.object(pipeline, "advance_pending", return_value={}):
+                self.assertEqual(pipeline.resolve_ids([700]), [900])
+                状态["gpu_replaced"]["900"] = 950
+                pipeline.write_state(sequence, 状态)
+                self.assertEqual(pipeline.resolve_ids([700]), [950])
+
+    def test_重复任务号去重查询且只重提一次(self):
+        import MSA预处理 as pipeline
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"TASKCTL_STATE": directory}):
+            sequence = self.common.SEQ_202
+            tag = self.db.resolve_tag(sequence[len(self.common.FIXED_A):])
+            请求 = {"json_path": f"/tmp/{tag}_htr1a.json", "env": {}, "task_root": "/tmp/tasks", "priority": 0, "gpus": 1, "name": f"{tag}_htr1a"}
+            pipeline.write_state(sequence, {"sequence": sequence, "msa_job": 500, "gpu_pending": [dict(请求), dict(请求)], "gpu_ids": [700, 700]})
+            调用 = []
+            def 假hq(*参数, **关键字):
+                调用.append(参数)
+                if 参数[:2] == ("job", "info"):
+                    self.assertEqual(参数[2], "700")
+                    return [{"info": {"id": 700, "task_stats": {"waiting": 1}}}]
+                return ""
+            with patch.object(pipeline, "needed", return_value=False), \
+                    patch.object(pipeline, "各靶标优先级", return_value=(tag, {"HTR1A": self.node.RESAMPLE_PRIORITY + 1, "ASIC1A": 0})), \
+                    patch.object(pipeline, "hq", side_effect=假hq), \
+                    patch("af3任务.submit", return_value=900) as 提交:
+                替换 = pipeline.reprioritize_waiting()
+            self.assertEqual(替换, {700: 900})
+            self.assertEqual(提交.call_count, 1)
+            self.assertEqual(调用.count(("job", "cancel", "700")), 1)
+            状态 = pipeline.read_state(sequence)
+            self.assertEqual(状态["gpu_ids"], [900, 900])
+            self.assertTrue(all(请求["priority"] == self.node.RESAMPLE_PRIORITY + 1 for 请求 in 状态["gpu_pending"][:1]))
+
+    def test_HQ日志重置后丢失任务重新放行且已有分不重算(self):
+        import MSA预处理 as pipeline
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"TASKCTL_STATE": directory}):
+            sequence = self.common.SEQ_202
+            tag = self.db.resolve_tag(sequence[len(self.common.FIXED_A):])
+            htr_path = Path(directory) / f"{tag}_htr1a.json"
+            htr_path.write_text("{}")
+            htr = {"json_path": str(htr_path), "env": {}, "task_root": "/tmp/t", "priority": 0, "gpus": 1, "name": f"{tag}_htr1a"}
+            asic = dict(htr, json_path=str(Path(directory) / f"{tag}_asic1a.json"), name=f"{tag}_asic1a")
+            失效 = dict(htr, json_path=str(Path(directory) / "已清理.json"), name=f"{tag}_htr1a_s9")
+            补采 = dict(htr, priority=21, name=f"{tag}_asic1a_s42")
+            pipeline.write_state(sequence, {"sequence": sequence, "msa_job": 500, "gpu_pending": [htr, asic, 失效, 补采], "gpu_ids": [900, 901, 902, 903], "gpu_replaced": {"800": 900}})
+            with patch.object(pipeline, "hq", return_value=[{"id": 2, "task_stats": {"running": 1}}]), \
+                    patch("小肽数据库.load_database", return_value={tag: {"iptm_asic1a": 0.5}}), \
+                    patch("小肽数据库.load_sequence_registry", return_value={tag: {"var": sequence[len(self.common.FIXED_A):], "peptide": sequence}}), \
+                    patch("小肽数据库.find_summary", return_value=False):
+                released = pipeline.requeue_lost()
+            self.assertEqual(released, 1)
+            状态 = pipeline.read_state(sequence)
+            self.assertNotIn("gpu_ids", 状态)
+            self.assertNotIn("gpu_replaced", 状态)
+            self.assertEqual([请求["name"] for 请求 in 状态["gpu_pending"]], [f"{tag}_htr1a", f"{tag}_asic1a_s42"])
+            self.assertEqual(状态["gpu_pending"][0]["priority"], self.node.RESAMPLE_PRIORITY + 1)
+            self.assertEqual(状态["gpu_pending"][1]["priority"], 21)
+
+    def test_MSA丢失置休眠不得一次性全部重提(self):
+        import MSA预处理 as pipeline
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"TASKCTL_STATE": directory}):
+            for i in range(5):
+                seq = self.common.FIXED_A + f"DORMANT{i}"
+                pipeline.write_state(seq, {"sequence": seq, "msa_job": 900 + i, "gpu_pending": [{"json_path": "/tmp/x.json", "env": {}, "task_root": "/tmp/t", "priority": 118, "gpus": 1, "name": f"s{i}_htr1a"}]})
+            with patch.object(pipeline.cache, "load", return_value=None), \
+                    patch.object(pipeline, "hq", return_value=[]), \
+                    patch.object(pipeline, "submit_msa") as 提交:
+                self.assertEqual(pipeline.advance_pending(), {})
+            提交.assert_not_called()
+            for i in range(5):
+                self.assertIsNone(pipeline.read_state(self.common.FIXED_A + f"DORMANT{i}")["msa_job"])
+
+    def test_休眠MSA按节点水位逐条恢复(self):
+        import MSA预处理 as pipeline
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"TASKCTL_STATE": directory}):
+            for i in range(5):
+                seq = self.common.FIXED_A + f"DORMANT{i}"
+                pipeline.write_state(seq, {"sequence": seq, "msa_job": None, "gpu_pending": [{"json_path": "/tmp/x.json", "env": {}, "task_root": "/tmp/t", "priority": 118, "gpus": 1, "name": f"s{i}_htr1a"}]})
+            workers = [{"id": 1, "ended": None, "configuration": {"hostname": "node1"}}, {"id": 2, "ended": None, "configuration": {"hostname": "node2"}}]
+            已提交 = []
+            def 提交(seq, *args):
+                已提交.append(seq)
+                state = pipeline.read_state(seq)
+                state["msa_job"] = 700 + len(已提交)
+                pipeline.write_state(seq, state)
+                return state["msa_job"]
+            with patch.object(pipeline.cache, "load", return_value=None), \
+                    patch.object(pipeline, "hq", return_value=workers), \
+                    patch.object(pipeline, "submit_msa", side_effect=提交), \
+                    patch("小肽数据库.load_sequence_registry", return_value={}), \
+                    patch("小肽数据库.load_database", return_value={}), \
+                    patch("小肽优化_无限.attempted_vars", return_value=set()):
+                pipeline.ensure_prefetch(jobs=[], picker=lambda n: [])
+            self.assertEqual(len(已提交), 2)
+
+    def test_MSA旧号撞新任务按名字识别不误认(self):
+        import MSA预处理 as pipeline
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"TASKCTL_STATE": directory}):
+            seq = self.common.SEQ_202
+            pipeline.write_state(seq, {"sequence": seq, "msa_job": 3, "gpu_pending": [{"json_path": "/tmp/x.json", "env": {}, "task_root": "/tmp/t", "priority": 118, "gpus": 1, "name": "s_htr1a"}]})
+            撞号 = [{"info": {"id": 3, "name": "s49339db8_asic1a_s7016", "task_stats": {"running": 1}}}]
+            with patch.object(pipeline.cache, "load", return_value=None), \
+                    patch.object(pipeline, "hq", return_value=撞号), \
+                    patch.object(pipeline, "submit_msa") as 提交:
+                pipeline.advance_pending()
+            提交.assert_not_called()
+            self.assertIsNone(pipeline.read_state(seq)["msa_job"])
 
     def test_已有长驻排队仍会调用逐档补齐入口(self):
         with patch.object(self.loc, "PREFLIGHT_OK", True), patch.object(self.loc, "loop_job_active", return_value=["old-large"]), patch.object(self.loc, "逐档启动循环", return_value={"plan": [{"gpu_memory": 40}]}) as 启动:
